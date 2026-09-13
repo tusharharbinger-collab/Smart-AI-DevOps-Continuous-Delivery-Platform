@@ -28,3 +28,20 @@ Thumbs.db
 bin/*.exe
 bin/kind
 bin/opa
+
+# Reference-only scratch: a Stitch-generated mockup (React 19/Tailwind 4,
+# different tech stack entirely) mined for its visual design language during
+# Phase 1b (see docs/roadmap/01b-autonoma-visual-refresh.md) and not part of
+# the shipped product. The extraction is complete; kept locally for anyone
+# who wants to re-check the original, but not part of the project's history.
+autonoma-devops/
+# A duplicate copy of that same mockup that ended up at the repo root
+# (index.html/package.json/src/tsconfig.json/vite.config.ts/metadata.json)
+# — redundant with autonoma-devops/ above, not the real frontend (that's
+# frontend/), excluded for the same reason.
+/index.html
+/package.json
+/metadata.json
+/src/
+/tsconfig.json
+/vite.config.ts
