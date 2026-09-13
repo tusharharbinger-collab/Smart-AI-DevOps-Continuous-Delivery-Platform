@@ -53,7 +53,16 @@ Verify: `curl localhost:8001/readyz` should report `"kubernetes": "ok"`. From he
 
 ### Using the UI
 
-Open `localhost:3000` and log in with the seeded demo account: `demo@acme-corp.test` / `acme-demo-2026` (a second tenant is seeded too: `demo@other-corp.test` / `other-demo-2026`, to see tenant isolation for yourself — it has no pipelines, so it should show an empty state, never the first tenant's data). Pick a pipeline and run from the dropdowns in the header (no more pasting IDs), click **Trigger New Rollout**, then check the **Verification Inspector** tab for the resulting verdict and evidence.
+Open `localhost:3000` and log in with the seeded demo account: `demo@acme-corp.test` / `acme-demo-2026` (a second tenant is seeded too: `demo@other-corp.test` / `other-demo-2026`, to see tenant isolation for yourself — it has no projects, so it should show an empty state, never the first tenant's data).
+
+Login lands on the **Projects Overview** (`/projects`) — a card per onboarded service. Click **New Service** to walk through the 3-step wizard (connect a repository or an existing image, configure build/test/networking, set the canary policy) and create a new one, or open an existing card to enter its **project workspace** (`/projects/:id`), scoped to that one service:
+
+- **Pipeline View** — live stage execution, the canary traffic ramp, and a streaming log tail for the selected run.
+- **Verification Inspector** — the baseline-vs-canary comparison, verdict, confidence, and evidence behind it.
+- **Policy & Gates** — the pipeline's declarative guardrails as editable YAML.
+- **Audit Ledger** — every autonomous decision made for this project, with a SOC 2 CSV export.
+
+A run selector in the workspace header switches between this project's runs (auto-selecting the latest); click **Trigger New Rollout** to start a new one, then check **Verification Inspector** for the resulting verdict and evidence. (The classic dropdown-driven single-page console this replaced no longer exists — `/app/*` links redirect here.)
 
 ### Running the test suites
 
@@ -69,9 +78,12 @@ opa test policies/ -v          # bin/opa.exe on Windows
 
 # Cross-service adversarial tests (forged verdicts, freeze-window bypass, etc.)
 python -m pytest tests/adversarial/ -v
+
+# Frontend e2e (requires the full stack up via docker compose)
+cd frontend && npm run test:e2e
 ```
 
-All of the above are green as of this build (89+ unit/integration tests — including OPA-unreachable-failsafe and signing-key-rotation coverage — 4/4 OPA tests, 24/24 adversarial tests — including live RBAC/rate-limiting/refresh-token attacks against a running api-gateway, and a static + live check that verification-engine still has no path to Kubernetes — plus a real crash-recovery test against real Redis+Postgres).
+All of the above are green as of this build (89+ unit/integration tests — including OPA-unreachable-failsafe and signing-key-rotation coverage — 4/4 OPA tests, 24/24 adversarial tests — including live RBAC/rate-limiting/refresh-token attacks against a running api-gateway, and a static + live check that verification-engine still has no path to Kubernetes — plus a real crash-recovery test against real Redis+Postgres). The Playwright e2e suite (8 tests across `golden-path.spec.ts` and `onboarding.spec.ts`) passes end-to-end against the real running stack, not a mock.
 
 ## Architecture
 
@@ -98,4 +110,5 @@ Being direct about where this currently falls short of "production," in priority
 3. ~~Auth is not production-grade~~ — **fixed and hardened.** Login (`POST /api/v1/auth/login`) checks a bcrypt-hashed password and issues a real HS256-signed 15-minute access token plus a revocable 7-day refresh token; `auth/middleware.py` verifies the access token's signature and now also checks its `role` claim (`src/auth/rbac.py`) before letting a `developer` pause/rollback a pipeline or onboard a service — those require `lead-sre`+. Five failed logins in a row locks the account out for 5 minutes (Redis-backed), and every login/refresh/logout is recorded in a queryable `auth_events` table. Still not "enterprise-grade": no password-reset flow and no SSO (explicitly out of scope for this assignment); TLS termination and moving off a plaintext `.env` are deferred to Phase 7 (deployment-target-dependent — see `docs/roadmap/04-security-hardening.md`).
 4. ~~`pipeline-worker` doesn't use Celery... won't scale to concurrent pipeline execution across multiple workers~~ — **the scaling gap is fixed.** It still doesn't use Celery (stages still run as plain synchronous function calls), but triggering now goes through a Redis Streams consumer group instead of bare pub/sub — verified live running 3 replicas each of `pipeline-worker`/`policy-controller` and firing 10 concurrent rollouts across 2 services with zero duplicate processing and zero dropped triggers (see `docs/roadmap/05-reliability-scale.md`). Crash recovery is also now real: a pipeline-worker killed mid-rollout has its interrupted run resumed by another replica, verified by a real test, not just by reading `reconciler.py`.
 5. **MinIO is running but unused** — no service currently writes artifacts to it.
-6. **No `tests/e2e/` suite or `scripts/demo/*.sh`** — the phased build plan in `MASTER_BUILD_SPEC.md` §15 calls for these; adversarial and per-service tests exist and pass, but there's no scripted "trigger a healthy rollout end-to-end" / "trigger a failing one and watch it roll back" demo script yet.
+6. **No `scripts/demo/*.sh`** — the phased build plan in `MASTER_BUILD_SPEC.md` §15 calls for a scripted "trigger a healthy rollout" / "trigger a failing one and watch it roll back" demo; that doesn't exist yet. A real Playwright e2e suite does exist (`frontend/e2e/`, `npm run test:e2e`) and passes end-to-end against the live docker-compose stack: login, triggering a rollout and inspecting its verdict, the policy/audit screens, logout/route-guarding, and the New Service wizard.
+7. **Cost tracking is real but partial.** `policy-controller/src/cost_tracker.py` reads the live baseline/canary Deployments' actual replica count and CPU/memory requests straight from Kubernetes and computes a genuine compute-cost delta — this is what `cost_analysis.delta_percent` actually gates against `maxPermittedCostDeltaPercent` in `policies/delivery_guardrails.rego`, and what the per-deployment verification report and delivery-health digest read (both were permanently empty/zero before this, since nothing ever called the cost formula outside its own unit test). Right-sizing recommendations (`compute_rightsizing_recommendation`) are deliberately **not** wired up: they need observed p95 CPU/memory utilization, and no Prometheus query for that exists yet (only error_rate/latency/saturation/business_metric verification metrics do) — fabricating a recommendation from unmeasured numbers would be worse than not having one, so `rightsizing_rec` stays `null` until that telemetry is real.
