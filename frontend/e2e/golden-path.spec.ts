@@ -59,9 +59,18 @@ test.describe("golden path: login → trigger rollout → see verdict → see it
     await openFirstProject(page);
 
     await page.getByRole("button", { name: /trigger new rollout/i }).click();
-    // The demo pipeline's verification completes in well under a second;
-    // poll for the run selector to settle rather than sleeping.
-    await expect(page).toHaveURL(/[?&]run=/, { timeout: 15_000 });
+    // Real race found live: ProjectWorkspace.tsx already auto-selects the
+    // most recent existing run in the URL's `run=` param the moment the
+    // runs list loads — BEFORE this click's own POST resolves. Waiting for
+    // `/[?&]run=/` alone is satisfied by that pre-existing value, so the
+    // test would click into Verification Inspector for the WRONG (stale)
+    // run, which then gets silently swapped out from under it moments
+    // later when handleTrigger's own setSearchParams call actually lands.
+    // handleTrigger's toast fires only after that call already ran, so
+    // waiting for it guarantees the URL now names the real freshly
+    // triggered run before we navigate anywhere.
+    await expect(page.getByText(/rollout triggered/i)).toBeVisible({ timeout: 15_000 });
+    await expect(page).toHaveURL(/[?&]run=/, { timeout: 5_000 });
 
     await page.getByRole("link", { name: /verification inspector/i }).click();
     await expect(page).toHaveURL(/\/verification/);

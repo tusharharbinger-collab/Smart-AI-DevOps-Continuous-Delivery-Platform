@@ -362,12 +362,13 @@ export function NewProject() {
               {sourceTab === "image" ? (
                 <div className="space-y-4">
                   <div className="space-y-1">
-                    <Label>Image URL</Label>
+                    <Label htmlFor="new-project-image-url">Image URL</Label>
                     <p className="text-[11px] text-muted-foreground">Deploy an image from a Docker registry.</p>
                     <div className="flex gap-2">
                       <div className="relative flex-1">
                         <Container className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                         <Input
+                          id="new-project-image-url"
                           value={imageUrl}
                           onChange={(e) => setImageUrl(e.target.value)}
                           placeholder="docker.io/library/nginx:latest"
@@ -569,9 +570,10 @@ export function NewProject() {
                 )
               ) : (
                 <div className="space-y-1">
-                  <Label>Public Git repository URL</Label>
+                  <Label htmlFor="new-project-manual-repo-url">Public Git repository URL</Label>
                   <div className="flex gap-2">
                     <Input
+                      id="new-project-manual-repo-url"
                       value={manualUrl}
                       onChange={(e) => setManualUrl(e.target.value)}
                       placeholder="https://github.com/org/repo"
@@ -606,12 +608,16 @@ export function NewProject() {
           {step === 1 && (
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-1">
-                <Label>Service name</Label>
-                <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+                <Label htmlFor="new-project-service-name">Service name</Label>
+                <Input
+                  id="new-project-service-name"
+                  value={form.name}
+                  onChange={(e) => setForm({ ...form, name: e.target.value })}
+                />
               </div>
               <div className="space-y-1">
-                <Label>Environment</Label>
-                <Input value="Docker / OCI Container" disabled />
+                <Label htmlFor="new-project-environment">Environment</Label>
+                <Input id="new-project-environment" value="Docker / OCI Container" disabled />
               </div>
               {isImageSource && (
                 <div className="space-y-1 sm:col-span-2">
@@ -623,9 +629,10 @@ export function NewProject() {
               )}
               {!isImageSource && (
                 <div className="space-y-1">
-                  <Label>Branch</Label>
+                  <Label htmlFor="new-project-branch">Branch</Label>
                   {branches.length > 0 ? (
                     <select
+                      id="new-project-branch"
                       value={form.branch}
                       onChange={(e) => setForm({ ...form, branch: e.target.value })}
                       className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
@@ -635,14 +642,19 @@ export function NewProject() {
                       ))}
                     </select>
                   ) : (
-                    <Input value={form.branch} onChange={(e) => setForm({ ...form, branch: e.target.value })} />
+                    <Input
+                      id="new-project-branch"
+                      value={form.branch}
+                      onChange={(e) => setForm({ ...form, branch: e.target.value })}
+                    />
                   )}
                 </div>
               )}
               {!isImageSource && (
                 <div className="space-y-1">
-                  <Label>Root directory</Label>
+                  <Label htmlFor="new-project-root-directory">Root directory</Label>
                   <Input
+                    id="new-project-root-directory"
                     value={form.root_directory}
                     onChange={(e) => setForm({ ...form, root_directory: e.target.value })}
                   />
@@ -650,8 +662,9 @@ export function NewProject() {
               )}
               {!isImageSource && (
                 <div className="space-y-1">
-                  <Label>Dockerfile path</Label>
+                  <Label htmlFor="new-project-dockerfile-path">Dockerfile path</Label>
                   <Input
+                    id="new-project-dockerfile-path"
                     value={form.dockerfile_path}
                     onChange={(e) => setForm({ ...form, dockerfile_path: e.target.value })}
                   />
@@ -659,8 +672,9 @@ export function NewProject() {
               )}
               {!isImageSource && (
                 <div className="space-y-1">
-                  <Label>Pre-flight test command</Label>
+                  <Label htmlFor="new-project-test-command">Pre-flight test command</Label>
                   <Input
+                    id="new-project-test-command"
                     value={form.test_command}
                     onChange={(e) => setForm({ ...form, test_command: e.target.value })}
                     placeholder="pytest tests/  ·  npm test"
@@ -668,23 +682,29 @@ export function NewProject() {
                 </div>
               )}
               <div className="space-y-1 sm:col-span-2">
-                <Label>Container image registry</Label>
+                <Label htmlFor="new-project-container-image">Container image registry</Label>
                 <Input
+                  id="new-project-container-image"
                   value={form.container_image}
                   onChange={(e) => setForm({ ...form, container_image: e.target.value })}
                   placeholder="registry.internal/checkout-service"
                 />
               </div>
               <div className="space-y-1">
-                <Label>Baseline tag</Label>
+                <Label htmlFor="new-project-baseline-tag">Baseline tag</Label>
                 <Input
+                  id="new-project-baseline-tag"
                   value={form.active_production_tag}
                   onChange={(e) => setForm({ ...form, active_production_tag: e.target.value })}
                 />
               </div>
               <div className="space-y-1">
-                <Label>Canary tag</Label>
-                <Input value={form.canary_tag} onChange={(e) => setForm({ ...form, canary_tag: e.target.value })} />
+                <Label htmlFor="new-project-canary-tag">Canary tag</Label>
+                <Input
+                  id="new-project-canary-tag"
+                  value={form.canary_tag}
+                  onChange={(e) => setForm({ ...form, canary_tag: e.target.value })}
+                />
               </div>
 
               <div className="space-y-1 sm:col-span-2">
@@ -694,23 +714,26 @@ export function NewProject() {
                 </p>
               </div>
               <div className="space-y-1">
-                <Label>Container port</Label>
+                <Label htmlFor="new-project-port">Container port</Label>
                 <Input
+                  id="new-project-port"
                   type="number"
                   value={form.port}
                   onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
                 />
               </div>
               <div className="space-y-1">
-                <Label>Health-check path</Label>
+                <Label htmlFor="new-project-health-check-path">Health-check path</Label>
                 <Input
+                  id="new-project-health-check-path"
                   value={form.health_check_path}
                   onChange={(e) => setForm({ ...form, health_check_path: e.target.value })}
                 />
               </div>
               <div className="space-y-1 sm:col-span-2">
-                <Label>Traffic path prefix (routed through the Gateway)</Label>
+                <Label htmlFor="new-project-path-prefix">Traffic path prefix (routed through the Gateway)</Label>
                 <Input
+                  id="new-project-path-prefix"
                   value={form.path_prefix}
                   onChange={(e) => setForm({ ...form, path_prefix: e.target.value })}
                   placeholder={form.name ? `/api/v1/${form.name}` : "/api/v1/your-service"}
@@ -761,8 +784,9 @@ export function NewProject() {
 
               <div className="grid gap-4 sm:grid-cols-3">
                 <div className="space-y-1">
-                  <Label>Confidence floor: {confidenceFloor.toFixed(2)}</Label>
+                  <Label htmlFor="new-project-confidence-floor">Confidence floor: {confidenceFloor.toFixed(2)}</Label>
                   <input
+                    id="new-project-confidence-floor"
                     type="range"
                     min={0.5}
                     max={0.99}
@@ -773,8 +797,9 @@ export function NewProject() {
                   />
                 </div>
                 <div className="space-y-1">
-                  <Label>Min sample size</Label>
+                  <Label htmlFor="new-project-min-sample-size">Min sample size</Label>
                   <Input
+                    id="new-project-min-sample-size"
                     type="number"
                     min={1}
                     value={minSampleSize}
@@ -782,8 +807,9 @@ export function NewProject() {
                   />
                 </div>
                 <div className="space-y-1">
-                  <Label>Max cost delta: +{maxCostDelta}%</Label>
+                  <Label htmlFor="new-project-max-cost-delta">Max cost delta: +{maxCostDelta}%</Label>
                   <input
+                    id="new-project-max-cost-delta"
                     type="range"
                     min={0}
                     max={50}
