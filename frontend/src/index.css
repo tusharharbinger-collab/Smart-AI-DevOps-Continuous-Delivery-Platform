@@ -1,0 +1,124 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Autonoma-derived light palette: same hues as the dark theme below,
+       lifted to light surfaces so ThemeToggle stays meaningful in both
+       directions (the mockup this was extracted from is dark-only). */
+    --background: 222 47% 98%;
+    --foreground: 222 45% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 45% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 45% 12%;
+
+    --primary: 221 100% 61%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 30% 94%;
+    --secondary-foreground: 222 45% 12%;
+
+    --muted: 220 30% 94%;
+    --muted-foreground: 220 10% 42%;
+
+    --accent: 220 30% 91%;
+    --accent-foreground: 222 45% 12%;
+
+    --destructive: 5 100% 65%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 160 100% 33%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 35 100% 46%;
+    --warning-foreground: 30 100% 9%;
+
+    --border: 220 25% 88%;
+    --input: 220 25% 88%;
+    --ring: 221 100% 61%;
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    /* Autonoma dark navy palette, mapped onto the existing shadcn-style
+       token names. See docs/roadmap/01b-autonoma-visual-refresh.md. */
+    --background: 224 51% 10%;
+    --foreground: 227 68% 90%;
+
+    --card: 226 40% 13%;
+    --card-foreground: 227 68% 90%;
+
+    --popover: 227 45% 8%;
+    --popover-foreground: 227 68% 90%;
+
+    --primary: 221 100% 82%;
+    --primary-foreground: 220 100% 20%;
+
+    --secondary: 225 30% 20%;
+    --secondary-foreground: 227 68% 90%;
+
+    --muted: 225 30% 20%;
+    --muted-foreground: 226 15% 65%;
+
+    --accent: 225 25% 24%;
+    --accent-foreground: 227 68% 90%;
+
+    --destructive: 5 100% 84%;
+    --destructive-foreground: 355 100% 21%;
+
+    --success: 156 71% 65%;
+    --success-foreground: 156 100% 11%;
+
+    --warning: 34 100% 69%;
+    --warning-foreground: 30 100% 14%;
+
+    --border: 224 22% 27%;
+    --input: 224 22% 27%;
+    --ring: 221 100% 82%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+@layer utilities {
+  /* Autonoma-style dense mono readouts for stat numbers, hashes, and
+     code-like labels — reuses the existing font stack (no new font
+     dependency), see docs/roadmap/01b-autonoma-visual-refresh.md. */
+  .text-stat {
+    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+    letter-spacing: -0.02em;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .text-code {
+    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.4);
+}
