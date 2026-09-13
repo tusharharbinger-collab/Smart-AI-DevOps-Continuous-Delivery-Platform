@@ -25,12 +25,32 @@ from src.actuation_executor import (
     DEFAULT_NAMESPACE,
     DEFAULT_CANARY_DEPLOYMENT,
 )
-from src.alert_dispatcher import send_alert, alert_rollback
+from src.alert_dispatcher import send_alert, alert_rollback, alert_verification_timeout
 from src.rca_trigger import trigger_rca_async
 
 logger = structlog.get_logger(__name__)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+
+def _extract_sample_counts(verdict: dict, policy: dict) -> tuple[int, int]:
+    """
+    Best-effort (samples_collected, samples_required) for the verification-
+    timeout alert. Evidence is nested per-metric (`{"metric_name": {...}}`),
+    not a flat dict, so this sums whatever request-count-shaped field each
+    metric actually carries (`total_requests` for error_rate/Wald-SPRT
+    metrics, `n_canary` for latency's Mann-Whitney/KS metrics) rather than
+    assuming one fixed key across every metric category.
+    """
+    evidence = verdict.get("evidence") or {}
+    collected = 0
+    for metric_result in evidence.values():
+        if not isinstance(metric_result, dict):
+            continue
+        collected += metric_result.get("total_requests", 0) or 0
+        collected += (metric_result.get("mann_whitney") or {}).get("n_canary", 0) or 0
+    required = policy.get("guardrails", {}).get("minSampleSize", 100)
+    return collected, required
 
 
 async def _get_actuation_target(redis_client, pipeline_run_id: str) -> dict:
@@ -106,6 +126,31 @@ async def handle_incoming_verdict(
             "maxPermittedCostDeltaPercent": 15.0,
         },
     }
+
+    if verdict.get("status") == "UNVERIFIABLE":
+        # Real gap found live: an UNVERIFIABLE verdict (verification-engine
+        # unreachable, or no confident HEALTHY/FAILED call could be made in
+        # the allotted window) has no real action to request — asking OPA
+        # "can I PROMOTE_STEP?" for it is a category error, and the
+        # policy's own "promotion requires HEALTHY" rule would reject it as
+        # a generic BLOCKED action anyway, so this never reached the
+        # status-based branches below at all. alert_verification_timeout
+        # existed in alert_dispatcher.py since Phase 6 but was never once
+        # called anywhere — the assignment explicitly requires notifying
+        # someone "the moment ... verification can't reach a confident
+        # verdict in the allotted time". Deliberately no actuation here —
+        # never auto-promote OR auto-rollback on inconclusive evidence, only
+        # notify; a human decides what happens next.
+        collected, required = _extract_sample_counts(verdict, policy)
+        await alert_verification_timeout(pipeline_run_id, samples_collected=collected, samples_required=required)
+        logger.warning(
+            "verdict_unverifiable",
+            pipeline_run_id=pipeline_run_id,
+            samples_collected=collected,
+            samples_required=required,
+            note=verdict.get("note"),
+        )
+        return
 
     opa_input = {
         "requested_action": "ROLLBACK" if verdict.get("status") == "FAILED" else "PROMOTE_STEP",
