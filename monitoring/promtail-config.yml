@@ -1,0 +1,45 @@
+# monitoring/promtail-config.yml
+#
+# Phase 6 (§06-observability-platform-ops.md, deliverable 6.1) — ships every
+# container's stdout (all 5 backend services already emit structured JSON
+# via shared/logging_config.py) to Loki. Discovers containers via the Docker
+# socket rather than a static target list, so it picks up scaled replicas
+# (Phase 5's `--scale pipeline-worker=3`) automatically.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # __meta_docker_container_name is "/<name>" — strip the leading slash.
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: "container"
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: "stream"
+    pipeline_stages:
+      # Every log line from the 5 backend services is JSON
+      # (shared/logging_config.py) — parse it so `service`/`level` become
+      # queryable labels and `trace_id` becomes filterable in LogQL
+      # (`| json | trace_id="..."`) without becoming an INDEXED label
+      # (trace_id is unique per request; indexing it would blow up
+      # cardinality for no benefit — LogQL can filter on parsed fields
+      # without them being labels).
+      - json:
+          expressions:
+            level: level
+            service: service
+            event: event
+      - labels:
+          level:
+          service:

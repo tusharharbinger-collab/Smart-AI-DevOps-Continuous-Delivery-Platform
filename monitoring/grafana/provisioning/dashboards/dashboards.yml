@@ -1,0 +1,14 @@
+# monitoring/grafana/provisioning/dashboards/dashboards.yml
+#
+# Auto-loads every dashboard JSON in this directory on Grafana startup.
+apiVersion: 1
+
+providers:
+  - name: platform-dashboards
+    orgId: 1
+    folder: "Smart CD Platform"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

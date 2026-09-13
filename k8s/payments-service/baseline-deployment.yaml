@@ -1,0 +1,71 @@
+# k8s/payments-service/baseline-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service-baseline
+  namespace: production
+  labels:
+    app: payments-service
+    deployment_cohort: baseline
+    delivery.devops.ai/managed-by: autonomous-controller
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payments-service
+      deployment_cohort: baseline
+  template:
+    metadata:
+      labels:
+        app: payments-service
+        deployment_cohort: baseline
+    spec:
+      containers:
+        - name: payments
+          image: localhost:5001/payments:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DEPLOYMENT_COHORT
+              value: baseline
+            - name: APP_VERSION
+              value: v1.0.0
+            - name: INJECT_ERRORS
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service-baseline
+  namespace: production
+  labels:
+    app: payments-service
+    deployment_cohort: baseline
+spec:
+  selector:
+    app: payments-service
+    deployment_cohort: baseline
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

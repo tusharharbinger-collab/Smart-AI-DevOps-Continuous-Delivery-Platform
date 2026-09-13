@@ -1,0 +1,96 @@
+# pipelines/payments-service-policy.yaml
+apiVersion: delivery.devops.ai/v1alpha1
+kind: Pipeline
+metadata:
+  name: payments-service-rollout
+  tenantId: "acme-corp"                 # REQUIRED — used for RLS + Redis lock key
+  namespace: production
+
+spec:
+  # ---- STAGE DEFINITIONS (executed in this exact order) ----
+  stages:
+    - name: build
+      type: build
+      config:
+        dockerfilePath: sample-app/v1.1.0/Dockerfile
+        registryRef: localhost:5001
+        imageTag: "{{ .TargetVersion }}"
+
+    - name: test
+      type: test
+      config:
+        command: "pytest sample-app/v1.1.0/tests/ -v"
+        failPipelineOnError: true
+
+    - name: canary_deploy
+      type: deploy
+      dependsOn: [build, test]
+      config:
+        clusterContext: kind-smartcd-local
+        deployment: payment-service-canary
+        initialReplicas: 1
+        deploymentCohortLabel: canary
+
+    - name: progressive_verify
+      type: canary_loop            # repeats verify->promote for each traffic step
+      dependsOn: [canary_deploy]
+      config:
+        gatewayRef: local-edge-gateway
+        service: payments-service
+        routeName: payment-service-route
+        steps:
+          - trafficWeight: 10
+            minDuration: 120s
+            minSampleSize: 100        # matches assignment N>=100
+          - trafficWeight: 25
+            minDuration: 300s
+            minSampleSize: 300
+          - trafficWeight: 50
+            minDuration: 600s
+            minSampleSize: 600
+          - trafficWeight: 100
+            minDuration: 0s
+            minSampleSize: 0
+            requiresManualApproval: true
+
+  # ---- GATES (consumed by OPA, see §8.4) ----
+  gates:
+    blockedDeployWindows:
+      - days: [Friday, Saturday, Sunday]
+        startTime: "16:00"
+        endTime: "23:59"
+        timezone: "UTC"
+    manualApprovalRequired:
+      beforeStages: [step_100_promotion]
+      approverRoles: ["lead-sre", "platform-admin"]
+
+  guardrails:
+    autoRollbackOnVerdict: ["FAILED"]
+    requireMinimumConfidence: 0.80
+    minSampleSize: 100                 # global floor, assignment-mandated N>=100
+    maxPermittedCostDeltaPercent: 15.0
+
+  verificationConfig:
+    minEvaluationWindowSeconds: 120
+    metrics:
+      - name: http_error_rate
+        category: error_rate           # ➔ routes to SPRT, §6.1
+        tier: critical
+        alpha: 0.01
+        p0: 0.005
+        p1: 0.020
+      - name: p95_latency_seconds
+        category: latency               # ➔ routes to Mann-Whitney + KS, §6.2
+        tier: important
+        alpha: 0.05
+        weight: 2.5
+      - name: cpu_saturation
+        category: saturation             # ➔ routes to CUSUM + BOCPD, §6.3
+        tier: important
+      - name: memory_saturation
+        category: saturation
+        tier: important
+      - name: checkout_success_rate
+        category: business_metric        # ➔ routes to Fisher/Chi-square, §6.4 (NEW)
+        tier: business
+        alpha: 0.05

@@ -1,0 +1,25 @@
+# k8s/gateway/gateway-class.yaml
+# Envoy Gateway GatewayClass — references the Envoy Gateway controller
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+# k8s/gateway/gateway.yaml
+# The Gateway object — binds to the GatewayClass and creates an Envoy instance
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: local-edge-gateway
+  namespace: production
+spec:
+  gatewayClassName: envoy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -1,0 +1,26 @@
+# k8s/gateway/httproute-payments.yaml
+# §5.1 — Exact HTTPRoute for payments-service traffic splitting
+# Initial state: 100% baseline, 0% canary.
+# The policy-controller patches weights via JSON PATCH (RFC 6902) — no pod restarts.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: payment-service-route
+  namespace: production
+  labels:
+    delivery.devops.ai/managed-by: autonomous-controller
+spec:
+  parentRefs:
+    - name: local-edge-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/payments
+      backendRefs:
+        - name: payment-service-baseline
+          port: 8080
+          weight: 100     # initial state: 100% baseline, 0% canary
+        - name: payment-service-canary
+          port: 8080
+          weight: 0

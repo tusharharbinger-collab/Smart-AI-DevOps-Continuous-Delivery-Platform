@@ -1,0 +1,20 @@
+# monitoring/grafana/provisioning/datasources/datasources.yml
+#
+# Phase 6 (§06-observability-platform-ops.md) — auto-provisioned so a fresh
+# `docker compose up` gives a working Grafana with both datasources wired,
+# no manual click-through setup.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false

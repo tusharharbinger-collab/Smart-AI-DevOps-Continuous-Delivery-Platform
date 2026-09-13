@@ -1,0 +1,46 @@
+# monitoring/prometheus.yml
+#
+# Static scrape config for local docker-compose testing (Phase 2 — Real
+# Telemetry). Scrapes the baseline and canary sample-app instances directly
+# by their compose service names — no service discovery needed since both
+# targets are known and fixed for this local demo pair. On the real Kind
+# cluster (see k8s/), the equivalent targets are the payment-service-baseline
+# / payment-service-canary pods; wiring Kubernetes SD there is a follow-up,
+# not required for the docker-compose path this file serves.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: payments-baseline
+    static_configs:
+      - targets: ["sample-app-baseline:8080"]
+        labels:
+          cohort: baseline
+
+  - job_name: payments-canary
+    static_configs:
+      - targets: ["sample-app-canary:8080"]
+        labels:
+          cohort: canary
+
+  # ─── Platform's own metrics (Phase 6 — Platform Observability) ──
+  # Each of the 5 backend services exposes RED metrics + service-specific
+  # gauges/counters at /metrics via prometheus-fastapi-instrumentator.
+  - job_name: platform-services
+    static_configs:
+      - targets: ["api-gateway:8000"]
+        labels:
+          service: api-gateway
+      - targets: ["pipeline-worker:8001"]
+        labels:
+          service: pipeline-worker
+      - targets: ["verification-engine:8002"]
+        labels:
+          service: verification-engine
+      - targets: ["policy-controller:8003"]
+        labels:
+          service: policy-controller
+      - targets: ["explainability-service:8004"]
+        labels:
+          service: explainability-service

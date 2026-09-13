@@ -1,0 +1,21 @@
+# docker-compose.scale-test.yml
+#
+# Phase 5 (§05-reliability-scale.md, deliverable 5.3) — override applied ON
+# TOP OF docker-compose.yml to run more than one replica of pipeline-worker
+# and policy-controller. Both declare a fixed host port mapping in the base
+# file (8001/8003) for normal single-replica local development; Compose
+# cannot bind the same host port for a second replica, so this override
+# drops the port mapping entirely for the duration of a scale test — reads
+# and writes still go through Redis/Postgres, and manual HTTP access to a
+# specific replica isn't needed for what this test verifies (exactly-once
+# message processing across replicas).
+#
+# Usage:
+#   make scale-test-up      # scales both to 3 replicas
+#   ...trigger concurrent rollouts...
+#   make scale-test-down    # back to 1 replica each, ports restored
+services:
+  pipeline-worker:
+    ports: !reset []
+  policy-controller:
+    ports: !reset []

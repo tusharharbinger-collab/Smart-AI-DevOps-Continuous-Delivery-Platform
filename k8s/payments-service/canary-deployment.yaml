@@ -1,0 +1,71 @@
+# k8s/payments-service/canary-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service-canary
+  namespace: production
+  labels:
+    app: payments-service
+    deployment_cohort: canary
+    delivery.devops.ai/managed-by: autonomous-controller
+spec:
+  replicas: 1   # starts at 1; scaled by deploy_task.py
+  selector:
+    matchLabels:
+      app: payments-service
+      deployment_cohort: canary
+  template:
+    metadata:
+      labels:
+        app: payments-service
+        deployment_cohort: canary
+    spec:
+      containers:
+        - name: payments
+          image: localhost:5001/payments:v1.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DEPLOYMENT_COHORT
+              value: canary
+            - name: APP_VERSION
+              value: v1.1.0
+            - name: INJECT_ERRORS    # toggle in demo_failed_rollout.sh
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service-canary
+  namespace: production
+  labels:
+    app: payments-service
+    deployment_cohort: canary
+spec:
+  selector:
+    app: payments-service
+    deployment_cohort: canary
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

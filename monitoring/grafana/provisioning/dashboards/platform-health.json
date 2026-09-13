@@ -1,0 +1,100 @@
+{
+  "title": "Platform Health (Phase 6)",
+  "uid": "platform-health",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Task queue depth (pipeline:start)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "pipeline_queue_depth", "legendFormat": "depth (total entries)" },
+        { "expr": "pipeline_queue_pending", "legendFormat": "pending (delivered, not acked)" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Verdict queue depth (stream:verdicts)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "verdict_queue_depth", "legendFormat": "depth (total entries)" },
+        { "expr": "verdict_queue_pending", "legendFormat": "pending (delivered, not acked)" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Request latency p50/p95/p99 (api-gateway)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{job=\"platform-services\", service=\"api-gateway\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"platform-services\", service=\"api-gateway\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=\"platform-services\", service=\"api-gateway\"}[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Request rate + error rate, all services",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{job=\"platform-services\"}[5m])) by (service)",
+          "legendFormat": "{{service}} — total req/s"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{job=\"platform-services\", status=~\"5..\"}[5m])) by (service)",
+          "legendFormat": "{{service}} — 5xx/s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Verdict outcome distribution (last 24h)",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "sum(increase(verification_verdicts_total[24h])) by (status)", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Verdict rate by outcome",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "sum(rate(verification_verdicts_total[5m])) by (status)", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Service readiness (1 = ready)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        { "expr": "up{job=\"platform-services\"}", "legendFormat": "{{service}}" }
+      ]
+    }
+  ]
+}
