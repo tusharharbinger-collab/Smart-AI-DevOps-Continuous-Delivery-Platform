@@ -19,6 +19,7 @@ api-gateway's middleware uses (see that module's docstring) and the same
 per-write pattern pipeline-worker's `db.py` already established for
 `execution_state`.
 """
+import json
 import os
 
 import asyncpg
@@ -81,6 +82,38 @@ class PolicyControllerDB:
                     hmac_signature,
                     canary_weight,
                     baseline_weight,
+                )
+
+    async def record_cost_analysis(
+        self,
+        tenant_id: str,
+        pipeline_run_id: str,
+        baseline_cost: float,
+        canary_cost: float,
+        delta_percent: float,
+        rightsizing_rec: dict | None = None,
+    ) -> None:
+        """
+        See cost_tracker.py's module docstring — this table has had 0 rows
+        since day one because nothing ever called this. `rightsizing_rec`
+        stays NULL until real observed-utilization telemetry exists to base
+        a recommendation on (see cost_tracker.py for why it's not faked).
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.active_tenant_id', $1, true)", tenant_id)
+                await conn.execute(
+                    """
+                    INSERT INTO cost_analysis
+                        (tenant_id, pipeline_run_id, baseline_cost, canary_cost, delta_percent, rightsizing_rec)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    tenant_id,
+                    pipeline_run_id,
+                    baseline_cost,
+                    canary_cost,
+                    delta_percent,
+                    json.dumps(rightsizing_rec) if rightsizing_rec is not None else None,
                 )
 
     async def update_rca_summary(self, tenant_id: str, verdict_id: str, rca_summary: str) -> None:

@@ -79,10 +79,18 @@ class PipelineOrchestrator:
         canary_deployment_name = (
             deploy_cfg.get("deployment") or canary_loop_cfg.get("canaryDeployment") or f"{spec.name}-canary"
         )
+        # Mirrors canary_deployment_name's own resolution — needed by
+        # policy-controller's cost_tracker.py to read the LIVE baseline
+        # Deployment's replica/resource footprint for a real cost delta
+        # (previously always hardcoded to 0.0; see cost_tracker.py).
+        baseline_deployment_name = (
+            deploy_cfg.get("baselineDeployment") or canary_loop_cfg.get("baselineDeployment") or f"{spec.name}-baseline"
+        )
         target = {
             "route_name": route_name,
             "namespace": spec.namespace,
             "canary_deployment_name": canary_deployment_name,
+            "baseline_deployment_name": baseline_deployment_name,
             # Real bug found live (a user noticed an empty Audit Ledger):
             # policy-controller's audit_ledger INSERT needs a tenant_id (RLS
             # NOT NULL column) but had no way to know it — this is the one

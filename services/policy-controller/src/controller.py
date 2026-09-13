@@ -24,9 +24,11 @@ from src.actuation_executor import (
     DEFAULT_ROUTE_NAME,
     DEFAULT_NAMESPACE,
     DEFAULT_CANARY_DEPLOYMENT,
+    DEFAULT_BASELINE_DEPLOYMENT,
 )
 from src.alert_dispatcher import send_alert, alert_rollback, alert_verification_timeout
 from src.rca_trigger import trigger_rca_async
+from src.cost_tracker import compute_and_record_cost
 
 logger = structlog.get_logger(__name__)
 
@@ -69,10 +71,21 @@ async def _get_actuation_target(redis_client, pipeline_run_id: str) -> dict:
             "route_name": DEFAULT_ROUTE_NAME,
             "namespace": DEFAULT_NAMESPACE,
             "canary_deployment_name": DEFAULT_CANARY_DEPLOYMENT,
+            "baseline_deployment_name": DEFAULT_BASELINE_DEPLOYMENT,
             "tenant_id": None,
         }
     target = json.loads(raw)
     target.setdefault("tenant_id", None)
+    # A run registered before baseline_deployment_name existed (see
+    # worker.py::_register_actuation_target) — re-derive it from the
+    # canary name using manifest_generator.py's own naming convention
+    # (f"{service_name}-canary" / f"{service_name}-baseline") rather than
+    # falling back to the single-service DEFAULT_*, which would silently
+    # point cost_tracker.py at the wrong service's Deployment.
+    target.setdefault(
+        "baseline_deployment_name",
+        target["canary_deployment_name"].replace("-canary", "-baseline"),
+    )
     return target
 
 
@@ -152,6 +165,25 @@ async def handle_incoming_verdict(
         )
         return
 
+    # Resolved up front (not just before actuation) because RULE 7 in
+    # policies/delivery_guardrails.rego needs a REAL cost_analysis.delta_percent
+    # to gate PROMOTE_STEP on — a hardcoded 0.0 here meant that guardrail could
+    # never fire regardless of how much a canary rollout actually cost (see
+    # cost_tracker.py's module docstring). compute_and_record_cost reads the
+    # live baseline/canary Deployments' actual replica+resource footprint and
+    # is fail-soft (returns None, never raises) so a demo/no-cluster pipeline
+    # still runs — it just never gets cost-gated or a real cost_analysis row.
+    target = await _get_actuation_target(redis_client, pipeline_run_id)
+    cost_result = await compute_and_record_cost(
+        pipeline_run_id=pipeline_run_id,
+        tenant_id=target.get("tenant_id"),
+        namespace=target["namespace"],
+        baseline_deployment_name=target["baseline_deployment_name"],
+        canary_deployment_name=target["canary_deployment_name"],
+        db=db,
+        max_permitted_delta_percent=policy.get("guardrails", {}).get("maxPermittedCostDeltaPercent", 15.0),
+    )
+
     opa_input = {
         "requested_action": "ROLLBACK" if verdict.get("status") == "FAILED" else "PROMOTE_STEP",
         "verification_verdict": verdict,
@@ -162,7 +194,7 @@ async def handle_incoming_verdict(
         "current_step": {"minSampleSize": 100, "minDuration": "120s"},
         "target_stage": "step_promote",
         "approved_signatures": [],
-        "cost_analysis": {"delta_percent": 0.0},
+        "cost_analysis": {"delta_percent": cost_result["delta_percent"] if cost_result else 0.0},
     }
 
     opa_result = await evaluate_policy_async(opa_input)  # Structural gate #2 (OPA)
@@ -185,8 +217,6 @@ async def handle_incoming_verdict(
         await send_alert(
             "SECURITY", f"OPA unreachable — rolling back {pipeline_run_id} via fail-safe override, not blocking it"
         )
-
-    target = await _get_actuation_target(redis_client, pipeline_run_id)
 
     if verdict.get("status") == "FAILED":
         await emergency_rollback(

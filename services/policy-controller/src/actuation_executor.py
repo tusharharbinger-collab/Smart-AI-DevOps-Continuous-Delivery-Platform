@@ -23,6 +23,7 @@ PLURAL = "httproutes"
 DEFAULT_NAMESPACE = "production"
 DEFAULT_ROUTE_NAME = "payment-service-route"
 DEFAULT_CANARY_DEPLOYMENT = "payment-service-canary"
+DEFAULT_BASELINE_DEPLOYMENT = "payment-service-baseline"
 
 
 def _load_kube():
