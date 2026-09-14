@@ -24,6 +24,7 @@ from src.tasks.build_task import run_build_task, run_test_task
 from src.tasks.deploy_task import deploy_canary_task
 from src.tasks.verification_task import run_verification_task
 from src.tasks.rollout_task import run_rollout_task
+from src.schemas import parse_duration_seconds
 
 logger = structlog.get_logger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -58,7 +59,9 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.warning("log_append_failed", run_id=run_id, error=str(e))
 
-    def _register_actuation_target(self, run_id: str, spec: PipelineSpec, tenant_id: str) -> None:
+    def _register_actuation_target(
+        self, run_id: str, spec: PipelineSpec, tenant_id: str, target_version: str | None = None
+    ) -> None:
         """
         Tells policy-controller WHICH service's Kubernetes objects this run's
         verdicts should actuate against. This is the only place the pipeline's
@@ -67,6 +70,20 @@ class PipelineOrchestrator:
         signature -> ask OPA -> actuate" loop keyed only by pipeline_run_id.
         Keeping this a plain Redis key (mirroring execution_state's pattern)
         avoids adding a new DB round-trip to the verdict-handling hot path.
+
+        Also registers `rollout_state:{run_id}` (see policy-controller's
+        `rollout_scheduler.py`) — real gap found live: every promotion always
+        jumped straight to a hardcoded 25% canary weight and the pipeline
+        ended after exactly one verification cycle, regardless of the
+        `steps` (10% -> 25% -> 50% -> 100%) a pipeline actually declares.
+        Registering the real step schedule here is what lets
+        policy-controller autonomously walk through it for real: real
+        per-step target weight, real minSampleSize/minDuration gating (not
+        a flat 150 requests / 300 seconds), and a real hand-off back to
+        this service's new `/pipelines/{run_id}/reverify` endpoint to
+        produce the next step's verdict — continuing until either a FAILED
+        verdict rolls back, or a step flagged `requiresManualApproval`
+        pauses for a human (see `alert_approval_required`).
         """
         stage_map = {s["name"]: s for s in spec.stages}
         deploy_cfg = next(
@@ -102,6 +119,43 @@ class PipelineOrchestrator:
         self.redis.set(f"actuation_target:{run_id}", json.dumps(target), ex=86400)
         logger.info("actuation_target_registered", pipeline_run_id=run_id, **target)
 
+        raw_steps = canary_loop_cfg.get("steps", [])
+        if raw_steps:
+            parsed_steps = [
+                {
+                    "trafficWeight": s["trafficWeight"],
+                    "minDurationSeconds": parse_duration_seconds(s.get("minDuration", "0s")),
+                    "minSampleSize": s.get("minSampleSize", 0),
+                    "requiresManualApproval": s.get("requiresManualApproval", False),
+                }
+                for s in raw_steps
+            ]
+            rollout_state = {
+                "steps": parsed_steps,
+                "current_step_index": 0,
+                "step_started_at": datetime.now(timezone.utc).isoformat(),
+                "verification_config": spec.verificationConfig,
+                "status": "RUNNING",
+                # Carried through to graduate() once the final step
+                # promotes — this is what becomes the new baseline version.
+                "target_version": target_version,
+                # Real gap found live: handle_incoming_verdict's
+                # `pipeline_policy` parameter was NEVER supplied by its only
+                # real caller (_handle_stream_payload), so every verdict —
+                # for every pipeline, regardless of what its own YAML
+                # actually declared — was evaluated against a generic
+                # hardcoded default (confidence 0.80, minSampleSize 100,
+                # cost ceiling 15%, and critically `manualApprovalRequired.
+                # beforeStages: []` — meaning a step flagged
+                # requiresManualApproval could never actually be gated,
+                # since OPA's Rule 4 only fires when target_stage appears in
+                # THAT list). Carrying the pipeline's real gates/guardrails
+                # here is what lets policy-controller enforce what a
+                # pipeline actually asked for instead of a generic default.
+                "pipeline_policy": {"gates": spec.gates, "guardrails": spec.guardrails},
+            }
+            self.redis.set(f"rollout_state:{run_id}", json.dumps(rollout_state), ex=86400)
+
     def start_pipeline(
         self,
         manifest_path: str,
@@ -110,6 +164,7 @@ class PipelineOrchestrator:
         tenant_id: str | None = None,
         resume_from_stage: str | None = None,
         trace_id: str | None = None,
+        target_version: str | None = None,
     ) -> dict:
         """
         `trace_id` (Phase 6, §06-observability-platform-ops.md): the trace
@@ -141,13 +196,26 @@ class PipelineOrchestrator:
         RE-RUN (not skipped past), since it may not have finished; every
         stage type here is already idempotent by design (build/deploy use
         create-or-patch, verify/rollout just recompute from live state).
+
+        `target_version`: real bug found live — a pipeline's stored YAML
+        bakes in a fixed `imageTag` at project-creation time (or, for the
+        original demo pipeline, a literal `{{ .TargetVersion }}` placeholder
+        that got replaced with the hardcoded string `"v1.1.0"` no matter
+        what version was actually requested). Every rebuild therefore
+        produced the exact same tag regardless of what changed in the repo.
+        When the caller supplies a real per-run version (api-gateway's
+        `trigger_project_rollout` already resolves and persists one to
+        `pipeline_executions.target_version`), it overrides the manifest's
+        static `imageTag` for the build stage of THIS run only — the stored
+        pipeline YAML itself is untouched, so a run with no override keeps
+        behaving exactly as before.
         """
         spec: PipelineSpec = load_pipeline(manifest_path)
         run_id = pipeline_run_id or str(uuid.uuid4())
         resolved_tenant_id = tenant_id or spec.tenant_id
         service_name = spec.name
 
-        self._register_actuation_target(run_id, spec, resolved_tenant_id)
+        self._register_actuation_target(run_id, spec, resolved_tenant_id, target_version)
 
         # 1. Tenant concurrency isolation lock (§4.3) — skipped on resume:
         # the crashed worker's own lock (TTL up to 1h) would otherwise block
@@ -208,7 +276,15 @@ class PipelineOrchestrator:
 
                 if stage_type == "build":
                     dockerfile = config.get("dockerfilePath", "sample-app/v1.1.0/Dockerfile")
-                    tag = config.get("imageTag", "v1.1.0").replace("{{ .TargetVersion }}", "v1.1.0")
+                    # target_version (a real per-run override) always wins;
+                    # otherwise resolve the manifest's own imageTag, honoring
+                    # a literal `{{ .TargetVersion }}` placeholder if present
+                    # (the original demo pipeline's convention) by falling
+                    # back to "v1.1.0" only when no real version was ever
+                    # supplied at all — never hardcoding over a real one.
+                    tag = target_version or config.get("imageTag", "v1.1.0").replace(
+                        "{{ .TargetVersion }}", target_version or "v1.1.0"
+                    )
                     # Phase 2 hardening: a build stage that declares `repoUrl`
                     # gets its own repo cloned into an isolated workspace
                     # instead of building from a fixed local path — see

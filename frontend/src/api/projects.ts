@@ -166,3 +166,20 @@ export const triggerRollout = (
 
 export const rollbackRun = (projectId: string, runId: string) =>
   apiClient.post<{ status: string }>(`/api/v1/projects/${projectId}/runs/${runId}/rollback`);
+
+export interface RolloutState {
+  has_rollout_state: boolean;
+  status?: string;
+  current_step_index?: number;
+  total_steps?: number;
+  current_step_weight?: number | null;
+  awaiting_approval?: boolean;
+}
+
+export const getRunRolloutState = (projectId: string, runId: string) =>
+  apiClient.get<RolloutState>(`/api/v1/projects/${projectId}/runs/${runId}/rollout`);
+
+export const approveRun = (projectId: string, runId: string) =>
+  apiClient.post<{ status: string; canary_weight?: number; reasons?: string[] }>(
+    `/api/v1/projects/${projectId}/runs/${runId}/approve`
+  );

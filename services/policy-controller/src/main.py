@@ -23,7 +23,15 @@ from shared.logging_config import configure_logging
 configure_logging("policy-controller")
 
 from shared import redis_streams as streams
-from src.controller import run_policy_controller_loop, STREAM_VERDICTS, GROUP_POLICY_CONTROLLERS
+from src.controller import (
+    run_policy_controller_loop,
+    handle_approval,
+    _get_actuation_target,
+    STREAM_VERDICTS,
+    GROUP_POLICY_CONTROLLERS,
+)
+from src.actuation_executor import emergency_rollback
+from src.alert_dispatcher import alert_rollback
 from src.db import PolicyControllerDB
 from src.health_router import router as health_router
 from src.platform_health_monitor import platform_health_monitor_loop
@@ -81,3 +89,52 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Policy Controller", version="1.0.0", lifespan=lifespan)
 app.include_router(health_router, tags=["health"])
 Instrumentator().instrument(app).expose(app, include_in_schema=False)
+
+
+@app.post("/internal/approvals/{run_id}")
+async def approve_pending_promotion(run_id: str, body: dict):
+    """
+    Called by api-gateway's `POST /api/v1/projects/{id}/runs/{run_id}/approve`
+    (itself RBAC-gated to lead-sre/platform-admin) once a human clicks
+    "Approve" on a promotion paused at a `requiresManualApproval` step.
+    Unauthenticated at this layer like every other internal service-to-
+    service call in this platform (see that endpoint's docstring) — the
+    real authorization check already happened in api-gateway before this
+    was ever called.
+    """
+    result = await handle_approval(
+        pipeline_run_id=run_id,
+        approver_role=body.get("approver_role", "lead-sre"),
+        approver_user=body.get("approver_user"),
+        redis_client=app.state.redis,
+        db=app.state.db,
+    )
+    return result
+
+
+@app.post("/internal/manual-rollback/{run_id}")
+async def manual_rollback(run_id: str, body: dict):
+    """
+    Real gap found live: projects_router.py's "Emergency Rollback" button
+    used to only publish to a `pipeline:manual_rollback` Redis channel that
+    NOTHING in this codebase ever subscribed to — clicking it updated a UI
+    status label and never touched Kubernetes at all. This calls the exact
+    same `emergency_rollback` an autonomous FAILED-verdict rollback calls,
+    so a manual rollback is genuinely real: canary traffic to 0%, canary
+    Deployment scaled down, a real signed audit_ledger row.
+    """
+    tenant_id = body.get("tenant_id")
+    requested_by = body.get("requested_by", "operator")
+    target = await _get_actuation_target(app.state.redis, run_id)
+
+    await emergency_rollback(
+        run_id,
+        authorized_by=f"MANUAL:{requested_by}",
+        route_name=target["route_name"],
+        namespace=target["namespace"],
+        canary_deployment_name=target["canary_deployment_name"],
+        tenant_id=tenant_id or target.get("tenant_id"),
+        db=app.state.db,
+    )
+    await alert_rollback(run_id, reason=f"Manual rollback requested by {requested_by}")
+    return {"status": "ROLLED_BACK", "pipeline_run_id": run_id}

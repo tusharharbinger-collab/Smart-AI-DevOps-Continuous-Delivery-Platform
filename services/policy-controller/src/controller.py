@@ -26,9 +26,10 @@ from src.actuation_executor import (
     DEFAULT_CANARY_DEPLOYMENT,
     DEFAULT_BASELINE_DEPLOYMENT,
 )
-from src.alert_dispatcher import send_alert, alert_rollback, alert_verification_timeout
+from src.alert_dispatcher import send_alert, alert_rollback, alert_verification_timeout, alert_approval_required
 from src.rca_trigger import trigger_rca_async
 from src.cost_tracker import compute_and_record_cost
+from src import rollout_scheduler
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +54,63 @@ def _extract_sample_counts(verdict: dict, policy: dict) -> tuple[int, int]:
         collected += (metric_result.get("mann_whitney") or {}).get("n_canary", 0) or 0
     required = policy.get("guardrails", {}).get("minSampleSize", 100)
     return collected, required
+
+
+def _build_promotion_opa_input(
+    verdict: dict, policy: dict, rollout_state: dict | None, cost_delta_percent: float, approved_signatures: list
+) -> tuple[dict, dict | None]:
+    """
+    Real gap found live: this used to hand OPA a completely made-up picture
+    of the active step — `active_step_sample_count` defaulted to a flat
+    150, `active_step_duration_seconds` was a hardcoded 300, `current_step`
+    was always `{"minSampleSize": 100, "minDuration": "120s"}`, and
+    `target_stage` was the same fixed string `"step_promote"` for every
+    promotion regardless of which real step (10%? 100%?) was actually being
+    evaluated. That made the sample-size/duration/manual-approval gates in
+    delivery_guardrails.rego structurally unable to ever see real evidence.
+
+    When `rollout_state` exists (see worker.py's `_register_actuation_target`
+    and rollout_scheduler.py), this builds the real picture instead: the
+    actual step being promoted to, real elapsed time at that step, and a
+    `target_stage` derived from its real traffic weight so the manual-
+    approval gate (`beforeStages: [step_100_promotion]`) can genuinely
+    match. Falls back to the old flat defaults when no rollout_state is
+    registered (a pre-Phase-9 or manually-invoked run), so nothing that
+    worked before this regresses.
+    """
+    collected, _ = _extract_sample_counts(verdict, policy)
+
+    if rollout_state is None:
+        return (
+            {
+                "active_step_sample_count": verdict.get("evidence", {}).get("total_requests", 150),
+                "active_step_duration_seconds": 300,
+                "current_step": {"minSampleSize": 100, "minDuration": "120s"},
+                "target_stage": "step_promote",
+                "approved_signatures": approved_signatures,
+                "cost_analysis": {"delta_percent": cost_delta_percent},
+            },
+            None,
+        )
+
+    steps = rollout_state["steps"]
+    idx = rollout_state["current_step_index"]
+    active_step = steps[idx]
+    elapsed = rollout_scheduler.step_elapsed_seconds(rollout_state)
+    return (
+        {
+            "active_step_sample_count": collected or verdict.get("evidence", {}).get("total_requests", 0),
+            "active_step_duration_seconds": elapsed,
+            "current_step": {
+                "minSampleSize": active_step["minSampleSize"],
+                "minDuration": f"{active_step['minDurationSeconds']}s",
+            },
+            "target_stage": f"step_{active_step['trafficWeight']}_promotion",
+            "approved_signatures": approved_signatures,
+            "cost_analysis": {"delta_percent": cost_delta_percent},
+        },
+        active_step,
+    )
 
 
 async def _get_actuation_target(redis_client, pipeline_run_id: str) -> dict:
@@ -129,16 +187,33 @@ async def handle_incoming_verdict(
         await send_alert("SECURITY", f"Rejected unverified verdict for {pipeline_run_id}: {e}")
         return  # STOP — never reaches OPA, never reaches Kubernetes
 
-    # Default policy if not explicitly passed
-    policy = pipeline_policy or {
-        "gates": {"blockedDeployWindows": [], "manualApprovalRequired": {"beforeStages": [], "approverRoles": []}},
-        "guardrails": {
-            "autoRollbackOnVerdict": ["FAILED"],
-            "requireMinimumConfidence": 0.80,
-            "minSampleSize": 100,
-            "maxPermittedCostDeltaPercent": 15.0,
-        },
-    }
+    # Real gap found live: this parameter was NEVER supplied by
+    # _handle_stream_payload (the only real caller in the actual verdict-
+    # processing loop) — every verdict, for every pipeline, was evaluated
+    # against this generic hardcoded default regardless of what the
+    # pipeline's own YAML actually declared. Most damagingly,
+    # `manualApprovalRequired.beforeStages` defaulting to `[]` meant a step
+    # flagged `requiresManualApproval` could never actually be gated (OPA's
+    # Rule 4 only fires when target_stage appears in that list) — the
+    # approval-pause this module implements would have silently never
+    # triggered for a single real pipeline. rollout_state (registered by
+    # worker.py at pipeline start) now carries the pipeline's REAL
+    # gates/guardrails, so that's checked first; the hardcoded default
+    # remains only for a legacy run with no rollout_state registered.
+    rollout_state = await rollout_scheduler.get_rollout_state(redis_client, pipeline_run_id)
+    policy = (
+        pipeline_policy
+        or (rollout_state.get("pipeline_policy") if rollout_state else None)
+        or {
+            "gates": {"blockedDeployWindows": [], "manualApprovalRequired": {"beforeStages": [], "approverRoles": []}},
+            "guardrails": {
+                "autoRollbackOnVerdict": ["FAILED"],
+                "requireMinimumConfidence": 0.80,
+                "minSampleSize": 100,
+                "maxPermittedCostDeltaPercent": 15.0,
+            },
+        }
+    )
 
     if verdict.get("status") == "UNVERIFIABLE":
         # Real gap found live: an UNVERIFIABLE verdict (verification-engine
@@ -184,17 +259,15 @@ async def handle_incoming_verdict(
         max_permitted_delta_percent=policy.get("guardrails", {}).get("maxPermittedCostDeltaPercent", 15.0),
     )
 
+    promotion_fields, active_step = _build_promotion_opa_input(
+        verdict, policy, rollout_state, cost_result["delta_percent"] if cost_result else 0.0, approved_signatures=[]
+    )
     opa_input = {
         "requested_action": "ROLLBACK" if verdict.get("status") == "FAILED" else "PROMOTE_STEP",
         "verification_verdict": verdict,
         "pipeline_policy": policy,
         "runtime_context": {"cluster_maintenance_lock": False},
-        "active_step_sample_count": verdict.get("evidence", {}).get("total_requests", 150),
-        "active_step_duration_seconds": 300,
-        "current_step": {"minSampleSize": 100, "minDuration": "120s"},
-        "target_stage": "step_promote",
-        "approved_signatures": [],
-        "cost_analysis": {"delta_percent": cost_result["delta_percent"] if cost_result else 0.0},
+        **promotion_fields,
     }
 
     opa_result = await evaluate_policy_async(opa_input)  # Structural gate #2 (OPA)
@@ -204,6 +277,29 @@ async def handle_incoming_verdict(
     )
 
     if not opa_result["allow_action"] and not failsafe_rollback_override:
+        if verdict.get("status") == "HEALTHY" and active_step and active_step.get("requiresManualApproval"):
+            # Real gap found live: a step flagged requiresManualApproval in
+            # the pipeline's own declared schedule (the final 100% cutover,
+            # by default) always fell into the generic BLOCKED alert below
+            # with no way for a human to ever actually unblock it —
+            # approved_signatures had nothing real behind it anywhere in
+            # this codebase (policy_router.py's default OPA input hardcodes
+            # it empty too). alert_approval_required existed since Phase 6
+            # but was never called. Persisting the verdict that already
+            # proved HEALTHY here means a real approval (handle_approval,
+            # below) can re-evaluate this exact decision instead of
+            # demanding a brand new verification cycle for evidence that's
+            # already in hand.
+            rollout_state["status"] = "AWAITING_APPROVAL"
+            rollout_state["pending_verdict"] = verdict
+            rollout_state["pending_policy"] = policy
+            await rollout_scheduler.save_rollout_state(redis_client, pipeline_run_id, rollout_state)
+            roles = policy.get("gates", {}).get("manualApprovalRequired", {}).get("approverRoles", [])
+            await alert_approval_required(pipeline_run_id, stage=opa_input["target_stage"], roles=roles)
+            logger.info(
+                "promotion_awaiting_approval", pipeline_run_id=pipeline_run_id, stage=opa_input["target_stage"]
+            )
+            return
         await send_alert("BLOCKED", f"Action blocked: {opa_result.get('rejection_reasons')}")
         return
 
@@ -232,9 +328,15 @@ async def handle_incoming_verdict(
         )
         await alert_rollback(pipeline_run_id, reason="Statistical failure detected by verification engine")
         await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="ROLLBACK")
+        if rollout_state is not None:
+            rollout_state["status"] = "ROLLED_BACK"
+            await rollout_scheduler.save_rollout_state(redis_client, pipeline_run_id, rollout_state)
     elif verdict.get("status") == "HEALTHY":
-        # Progress weight
-        canary_weight = verdict.get("recommended_weight", 25)
+        # Real per-step weight when the pipeline declared a real ramp
+        # (10% -> 25% -> 50% -> 100%, each independently verified) —
+        # falls back to the old flat-25% default only for a legacy run
+        # with no registered rollout_state (see _build_promotion_opa_input).
+        canary_weight = active_step["trafficWeight"] if active_step else verdict.get("recommended_weight", 25)
         baseline_weight = 100 - canary_weight
         await update_traffic_weights(
             pipeline_run_id,
@@ -249,6 +351,107 @@ async def handle_incoming_verdict(
             confidence=verdict.get("confidence"),
         )
         await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="PROMOTE_STEP")
+        await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None)
+
+
+async def _advance_or_graduate(
+    pipeline_run_id: str, target: dict, rollout_state: dict | None, redis_client, trace_id: str | None
+) -> None:
+    """
+    After a successful PROMOTE_STEP actuation: continues the automated ramp
+    to the next declared step, leaves the run alone if the next step
+    requires manual approval (handle_incoming_verdict's own HEALTHY-verdict
+    pass at that step is what actually pauses and alerts — this only avoids
+    skipping past the gate), or — once the final step is reached —
+    graduates the canary into the new baseline so the NEXT rollout starts
+    from what was just proven healthy instead of comparing against a
+    permanently stale version forever.
+    """
+    if rollout_state is None:
+        return  # legacy/no-schedule run — nothing further to automate
+
+    steps = rollout_state["steps"]
+    next_index = rollout_state["current_step_index"] + 1
+
+    if next_index >= len(steps):
+        await rollout_scheduler.graduate(pipeline_run_id, target.get("tenant_id"), rollout_state.get("target_version"))
+        rollout_state["status"] = "GRADUATED"
+        await rollout_scheduler.save_rollout_state(redis_client, pipeline_run_id, rollout_state)
+        return
+
+    if steps[next_index].get("requiresManualApproval"):
+        return
+
+    await rollout_scheduler.advance_to_next_step(
+        redis_client, pipeline_run_id, target.get("tenant_id"), rollout_state, next_index, trace_id
+    )
+
+
+async def handle_approval(
+    pipeline_run_id: str, approver_role: str, approver_user: str | None, redis_client, db=None
+) -> dict:
+    """
+    Real gap found live: `alert_approval_required` fired (once wired up
+    above) but there was no way for a human to actually UNBLOCK a paused
+    promotion anywhere in this codebase — `approved_signatures` was
+    permanently `[]` (policy_router.py's default OPA input hardcodes it
+    empty too). Re-evaluates the SAME already-HEALTHY verdict that
+    triggered the pause, this time with a real approval signature, rather
+    than demanding a brand new verification cycle for evidence that
+    already exists — and, if OPA now allows it, actuates the final
+    promotion and continues (or completes) the ramp exactly like a normal
+    autonomous promotion would.
+    """
+    rollout_state = await rollout_scheduler.get_rollout_state(redis_client, pipeline_run_id)
+    if rollout_state is None or rollout_state.get("status") != "AWAITING_APPROVAL":
+        return {"status": "NO_PENDING_APPROVAL"}
+
+    verdict = rollout_state["pending_verdict"]
+    policy = rollout_state["pending_policy"]
+    target = await _get_actuation_target(redis_client, pipeline_run_id)
+    approved_signatures = [{"role": approver_role, "user": approver_user}]
+
+    cost_result = await compute_and_record_cost(
+        pipeline_run_id=pipeline_run_id,
+        tenant_id=target.get("tenant_id"),
+        namespace=target["namespace"],
+        baseline_deployment_name=target["baseline_deployment_name"],
+        canary_deployment_name=target["canary_deployment_name"],
+        db=db,
+        max_permitted_delta_percent=policy.get("guardrails", {}).get("maxPermittedCostDeltaPercent", 15.0),
+    )
+    promotion_fields, active_step = _build_promotion_opa_input(
+        verdict, policy, rollout_state, cost_result["delta_percent"] if cost_result else 0.0, approved_signatures
+    )
+    opa_input = {
+        "requested_action": "PROMOTE_STEP",
+        "verification_verdict": verdict,
+        "pipeline_policy": policy,
+        "runtime_context": {"cluster_maintenance_lock": False},
+        **promotion_fields,
+    }
+    opa_result = await evaluate_policy_async(opa_input)
+    if not opa_result["allow_action"]:
+        await send_alert("BLOCKED", f"Approved promotion still blocked: {opa_result.get('rejection_reasons')}")
+        return {"status": "STILL_BLOCKED", "reasons": opa_result.get("rejection_reasons")}
+
+    canary_weight = active_step["trafficWeight"] if active_step else 100
+    baseline_weight = 100 - canary_weight
+    await update_traffic_weights(
+        pipeline_run_id,
+        canary_weight=canary_weight,
+        baseline_weight=baseline_weight,
+        authorized_by=f"APPROVED:{approver_role}",
+        route_name=target["route_name"],
+        namespace=target["namespace"],
+        tenant_id=target.get("tenant_id"),
+        db=db,
+        verdict_status=verdict.get("status"),
+        confidence=verdict.get("confidence"),
+    )
+    await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="PROMOTE_STEP")
+    await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None)
+    return {"status": "PROMOTED", "canary_weight": canary_weight}
 
 
 STREAM_VERDICTS = "stream:verdicts"

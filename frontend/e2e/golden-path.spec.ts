@@ -58,7 +58,12 @@ test.describe("golden path: login → trigger rollout → see verdict → see it
     await login(page);
     await openFirstProject(page);
 
+    // "Trigger New Rollout" now opens a confirmation dialog with a version
+    // input (Phase 9 — real per-run version targeting) instead of firing
+    // immediately; the default version (the project's current canary tag)
+    // is preserved on a plain confirm.
     await page.getByRole("button", { name: /trigger new rollout/i }).click();
+    await page.getByRole("button", { name: /^trigger rollout$/i }).click();
     // Real race found live: ProjectWorkspace.tsx already auto-selects the
     // most recent existing run in the URL's `run=` param the moment the
     // runs list loads — BEFORE this click's own POST resolves. Waiting for

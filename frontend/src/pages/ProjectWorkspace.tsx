@@ -10,21 +10,23 @@
  * a project wrapping an existing pipeline rather than duplicating one (see
  * docs/roadmap/08-project-workspaces.md).
  */
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  AlertTriangle, ArrowLeft, ExternalLink, GitBranch, FolderGit2, Pause, Play, Rocket,
+  AlertTriangle, ArrowLeft, CheckCircle2, ExternalLink, GitBranch, FolderGit2, Pause, Play, Rocket,
 } from "lucide-react";
 import {
-  getProject, getRunStages, listProjectRuns, rollbackRun, triggerRollout,
+  approveRun, getProject, getRunRolloutState, getRunStages, listProjectRuns, rollbackRun, triggerRollout,
 } from "@/api/projects";
 import { pausePipeline, resumePipeline } from "@/api/pipeline";
 import { useAuthStore } from "@/lib/auth-store";
 import type { AppContext } from "@/types/app-context";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
@@ -127,9 +129,29 @@ export function ProjectWorkspace() {
     setSearchParams(next, { replace: true });
   }, [runs, selectedRunId, searchParams, setSearchParams]);
 
-  async function handleTrigger() {
+  // Real gap found live: every rollout always rebuilt/deployed the exact
+  // same fixed canary_tag set once at project creation — there was no way
+  // to actually test a new code change through the UI. Defaults to the
+  // project's current canary tag so a plain click keeps the old behavior.
+  const [targetVersion, setTargetVersion] = useState("");
+  useEffect(() => {
+    if (project?.canary_tag) setTargetVersion(project.canary_tag);
+  }, [project?.canary_tag]);
+
+  // Real gap found live: a promotion paused at a step flagged
+  // requiresManualApproval (the final 100% cutover, by default) had no way
+  // to ever actually be unblocked — polling this is what lets a real
+  // "Approve" action appear instead of the ramp silently stalling.
+  const { data: rolloutState } = useQuery({
+    queryKey: ["project-run-rollout", projectId, selectedRunId],
+    queryFn: () => getRunRolloutState(projectId, selectedRunId),
+    refetchInterval: 5000,
+    enabled: Boolean(selectedRunId),
+  });
+
+  async function handleTrigger(version?: string) {
     try {
-      const res = await triggerRollout(projectId);
+      const res = await triggerRollout(projectId, version ? { target_version: version } : {});
       const next = new URLSearchParams(searchParams);
       next.set("run", res.pipeline_run_id);
       setSearchParams(next, { replace: true });
@@ -137,6 +159,21 @@ export function ProjectWorkspace() {
       toast.success("Rollout triggered", { description: res.pipeline_run_id });
     } catch (err) {
       toast.error("Trigger failed", { description: (err as Error).message });
+    }
+  }
+
+  async function handleApprove() {
+    try {
+      const res = await approveRun(projectId, selectedRunId);
+      if (res.status === "PROMOTED") {
+        toast.success("Promotion approved", { description: `Canary now at ${res.canary_weight}%` });
+      } else {
+        toast.error("Still blocked", { description: res.reasons?.join("; ") ?? res.status });
+      }
+      queryClient.invalidateQueries({ queryKey: ["project-run-rollout", projectId, selectedRunId] });
+      queryClient.invalidateQueries({ queryKey: ["project-runs", projectId] });
+    } catch (err) {
+      toast.error("Approval failed", { description: (err as Error).message });
     }
   }
 
@@ -213,9 +250,74 @@ export function ProjectWorkspace() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" variant="success" onClick={handleTrigger}>
-              <Rocket className="h-3.5 w-3.5" /> Trigger New Rollout
-            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button size="sm" variant="success">
+                  <Rocket className="h-3.5 w-3.5" /> Trigger New Rollout
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Trigger a rollout for {project.name}</AlertDialogTitle>
+                  <AlertDialogDescription asChild>
+                    <div className="space-y-2">
+                      <p>
+                        The version below is what gets built and deployed as the new canary. Leave it
+                        unchanged to re-test the current canary tag, or enter a new one to test a real code
+                        change.
+                      </p>
+                      <div className="space-y-1">
+                        <Label htmlFor="rollout-target-version">Version / image tag</Label>
+                        <Input
+                          id="rollout-target-version"
+                          value={targetVersion}
+                          onChange={(e) => setTargetVersion(e.target.value)}
+                          placeholder="v1.2.0"
+                        />
+                      </div>
+                    </div>
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-success text-success-foreground hover:bg-success/90"
+                    onClick={() => handleTrigger(targetVersion.trim() || undefined)}
+                  >
+                    Trigger rollout
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+            {rolloutState?.awaiting_approval && (
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button size="sm" variant="success">
+                    <CheckCircle2 className="h-3.5 w-3.5" /> Approve Promotion to 100%
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Approve full cutover for {project.name}?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This run's canary already passed verification at every earlier step and is paused only
+                      because the final 100% cutover requires a human sign-off. Approving re-evaluates that
+                      same verdict — no new verification cycle is needed — and, if still allowed by policy,
+                      shifts all traffic to the canary and makes it the new baseline for future rollouts.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction
+                      className="bg-success text-success-foreground hover:bg-success/90"
+                      onClick={handleApprove}
+                    >
+                      Approve
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            )}
             <Button size="sm" variant="outline" onClick={handlePause} disabled={!selectedRunId}>
               <Pause className="h-3.5 w-3.5" /> Pause
             </Button>

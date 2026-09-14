@@ -44,6 +44,7 @@ configure_logging("pipeline-worker")
 from shared import redis_streams as streams
 from src.health_router import router as health_router
 from src.worker import PipelineOrchestrator
+from src.tasks.verification_task import run_verification_task
 from src.db import PipelineWorkerDB
 from src.pipeline.reconciler import reconcile_interrupted_pipelines
 from src.k8s.manifest_generator import ServiceOnboardingSpec
@@ -85,6 +86,7 @@ async def _process_pipeline_start_message(app: FastAPI, payload: dict) -> None:
     # processing this run (including the ones from `asyncio.to_thread`,
     # which copies the calling context into the new thread) carries it too.
     trace_id = payload.get("trace_id")
+    target_version = payload.get("target_version")
     policy_yaml = payload["policy_yaml"]
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as tmp:
@@ -101,6 +103,7 @@ async def _process_pipeline_start_message(app: FastAPI, payload: dict) -> None:
             pipeline_id=pipeline_id,
             tenant_id=tenant_id,
             trace_id=trace_id,
+            target_version=target_version,
         )
     finally:
         clear_request_context()
@@ -318,3 +321,47 @@ async def start_pipeline_now(body: dict):
         trace_id=body.get("trace_id"),
     )
     return result
+
+
+@app.post("/pipelines/{run_id}/reverify")
+async def reverify_pipeline_step(run_id: str, body: dict):
+    """
+    Real automated-ramp hand-off (see worker.py's `_register_actuation_target`
+    docstring and policy-controller's `rollout_scheduler.py`): after
+    promoting a canary to one step's traffic weight, policy-controller waits
+    out that step's own minDuration/minSampleSize gate and calls this
+    endpoint to produce the NEXT step's real verdict — closing the loop
+    that used to end every rollout after exactly one verification cycle,
+    always at a hardcoded weight, regardless of how many steps a pipeline
+    actually declared.
+
+    Deliberately thin: this does NOT touch Kubernetes or build/test stages
+    (actuation stays policy-controller's exclusive job — see invariant 3 in
+    CLAUDE.md) — it only asks verification-engine to compare the canary's
+    live telemetry again, at the real elapsed time this run has actually
+    been going, and publishes the signed verdict the normal way. Every
+    other verdict-handling step (HMAC verify, OPA gate, actuate) is
+    unchanged — policy-controller's consumer picks this verdict up off
+    `stream:verdicts` exactly like the first one.
+    """
+    tenant_id = body.get("tenant_id")
+    verification_config = body.get("verification_config", {})
+    elapsed_seconds = float(body.get("elapsed_seconds", 180.0))
+    trace_id = body.get("trace_id")
+
+    bind_request_context(trace_id=trace_id or run_id, tenant_id=tenant_id)
+    try:
+        app.state.orchestrator._log(
+            run_id, f"Traffic step advanced — running verification (elapsed={elapsed_seconds:.0f}s)"
+        )
+        verdict = await asyncio.to_thread(
+            run_verification_task, run_id, verification_config, elapsed_seconds, trace_id, tenant_id
+        )
+        app.state.orchestrator._log(
+            run_id,
+            f"Verdict: {verdict.get('status')} (confidence={verdict.get('confidence')}, "
+            f"score={verdict.get('composite_score')})",
+        )
+        return verdict
+    finally:
+        clear_request_context()

@@ -32,13 +32,14 @@ from sse_starlette.sse import EventSourceResponse
 
 from shared import redis_streams as streams
 from src.auth.rbac import require_role
-from src.db.session import get_request_db
+from src.db.session import get_db, get_request_db
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 
 STREAM_PIPELINE_START = "stream:pipeline:start"
 PIPELINE_WORKER_URL = os.environ.get("PIPELINE_WORKER_URL", "http://pipeline-worker:8001")
+POLICY_CONTROLLER_URL = os.environ.get("POLICY_CONTROLLER_URL", "http://policy-controller:8003")
 LOG_POLL_INTERVAL_SECONDS = 0.5
 
 # The three user-facing stages a project's workspace shows as a stepper.
@@ -825,6 +826,41 @@ async def get_run_stages(
     }
 
 
+@router.get("/{project_id}/runs/{run_id}/rollout")
+async def get_run_rollout_state(
+    project_id: str,
+    run_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_request_db),
+):
+    """
+    Surfaces the automated-ramp state policy-controller's rollout_scheduler.py
+    drives (see controller.py) — which step the run is on, its real target
+    weight, and whether it's paused `AWAITING_APPROVAL` at a step flagged
+    `requiresManualApproval` (the final 100% cutover, by default). This is
+    what lets the UI show a real "Approve" action instead of a promotion
+    silently stalling with no visible reason.
+    """
+    tenant_id = _get_tenant_id(request)
+    await _assert_run_belongs_to_project(db, run_id, project_id, tenant_id)
+
+    raw = await request.app.state.redis.get(f"rollout_state:{run_id}")
+    if not raw:
+        return {"has_rollout_state": False}
+
+    state = json.loads(raw)
+    steps = state.get("steps", [])
+    idx = state.get("current_step_index", 0)
+    return {
+        "has_rollout_state": True,
+        "status": state.get("status"),
+        "current_step_index": idx,
+        "total_steps": len(steps),
+        "current_step_weight": steps[idx]["trafficWeight"] if idx < len(steps) else None,
+        "awaiting_approval": state.get("status") == "AWAITING_APPROVAL",
+    }
+
+
 @router.get("/{project_id}/runs/{run_id}/logs/stream")
 async def stream_project_run_logs(
     project_id: str,
@@ -882,32 +918,133 @@ async def rollback_project_run(
     """
     Manual emergency rollback for a project's run.
 
-    Publishes the same `pipeline:manual_rollback` control message
-    actuation_router.py does — it does NOT call Kubernetes directly. The
-    request still goes through policy-controller's HMAC verification and OPA
-    evaluation before any traffic is actually cut, exactly like an
-    autonomous rollback. Invariant 4/5 stay intact.
+    Real gap found live while wiring up the automated promotion ramp: this
+    used to only publish a `pipeline:manual_rollback` control message and
+    flip `projects.status` — nothing anywhere in this codebase ever
+    subscribed to that channel, so clicking "Emergency Rollback" updated a
+    label in the UI and never actually touched Kubernetes at all. Now calls
+    policy-controller's real `emergency_rollback` directly (the exact same
+    function an autonomous FAILED-verdict rollback calls), so it genuinely
+    cuts canary traffic to 0% and scales the canary Deployment down —
+    signed into the audit ledger as `MANUAL:<email>` rather than
+    `OPA:rule=ROLLBACK`, but otherwise identical in effect.
     """
     tenant_id = _get_tenant_id(request)
     await _assert_run_belongs_to_project(db, run_id, project_id, tenant_id)
 
-    await request.app.state.redis.publish(
-        "pipeline:manual_rollback",
-        json.dumps(
-            {
-                "pipeline_run_id": run_id,
-                "requested_at": datetime.now(timezone.utc).isoformat(),
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{POLICY_CONTROLLER_URL}/internal/manual-rollback/{run_id}",
+            json={
+                "tenant_id": tenant_id,
                 "requested_by": f"project_console:{getattr(request.state, 'email', 'operator')}",
-            }
-        ),
-    )
+            },
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Rollback actuation failed: {resp.text}")
+
     await db.execute(
         text("UPDATE projects SET status = 'ROLLED_BACK' WHERE project_id = :pid AND tenant_id = :tid"),
         {"pid": project_id, "tid": tenant_id},
     )
     await db.commit()
     logger.warning("project_rollback_requested", project_id=project_id, pipeline_run_id=run_id)
-    return {"status": "ROLLBACK_REQUESTED", "pipeline_run_id": run_id, "project_id": project_id}
+    return {"status": "ROLLED_BACK", "pipeline_run_id": run_id, "project_id": project_id}
+
+
+@router.post("/{project_id}/runs/{run_id}/approve", dependencies=[Depends(require_role("lead-sre"))])
+async def approve_project_run(
+    project_id: str,
+    run_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_request_db),
+):
+    """
+    Unblocks a promotion paused at a step flagged `requiresManualApproval`
+    (the final 100% cutover, by default — see projects_router's own
+    generated pipeline YAML). Real gap found live: that gate fired a real
+    `alert_approval_required` notification but there was previously no way
+    for a human to ever actually grant the approval it was waiting for —
+    `approved_signatures` was permanently empty everywhere in this
+    codebase. Calls policy-controller's `handle_approval`, which
+    re-evaluates the ALREADY-HEALTHY verdict that triggered the pause
+    (no new verification cycle needed) with this real signature attached.
+    """
+    tenant_id = _get_tenant_id(request)
+    await _assert_run_belongs_to_project(db, run_id, project_id, tenant_id)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{POLICY_CONTROLLER_URL}/internal/approvals/{run_id}",
+            json={
+                "tenant_id": tenant_id,
+                "approver_role": getattr(request.state, "role", "lead-sre"),
+                "approver_user": getattr(request.state, "email", None),
+            },
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Approval failed: {resp.text}")
+
+    result = resp.json()
+    logger.info("project_run_approved", project_id=project_id, pipeline_run_id=run_id, result=result)
+    return result
+
+
+@router.post("/internal/pipeline-runs/{run_id}/graduate")
+async def graduate_pipeline_run(run_id: str, body: dict, db: AsyncSession = Depends(get_db)):
+    """
+    Internal, service-to-service only (not reachable through the frontend —
+    no route in App.tsx points here). Called by policy-controller's
+    `rollout_scheduler.graduate()` once a canary's ramp reaches its final
+    step. Real gap found live: nothing anywhere updated a project's
+    baseline version after a full promotion — `active_production_tag`
+    was set once at project-creation time and never again, so the NEXT
+    rollout would keep comparing against the ORIGINAL baseline forever
+    instead of the version that was actually just proven healthy and
+    promoted to 100%, defeating the point of a continuous-delivery loop.
+
+    Unauthenticated like `/pipelines/start` and `/services/onboard` on
+    pipeline-worker — this whole platform's service-to-service calls rely
+    on Docker network isolation rather than a shared internal token, and
+    adding auth to only this one route would be inconsistent, not safer.
+    `tenant_id` is supplied by the caller (policy-controller already has it
+    cached from this run's own actuation_target, itself resolved once at
+    pipeline start) rather than looked up here, since RLS requires it to
+    read the row in the first place — the same pattern PolicyControllerDB
+    already uses for audit/cost writes.
+    """
+    tenant_id = body.get("tenant_id")
+    new_version = body.get("new_version")
+    if not tenant_id or not new_version:
+        raise HTTPException(status_code=422, detail="tenant_id and new_version are required")
+
+    await db.execute(text("SELECT set_config('app.active_tenant_id', :tid, true)"), {"tid": tenant_id})
+    run_row = await db.execute(
+        text("SELECT project_id FROM pipeline_executions WHERE pipeline_run_id = :run_id AND tenant_id = :tid"),
+        {"run_id": run_id, "tid": tenant_id},
+    )
+    row = run_row.mappings().first()
+    if row is None or row["project_id"] is None:
+        # Not every run belongs to a project (an adopted/legacy pipeline
+        # execution, or one triggered outside the project wizard) — nothing
+        # to graduate, and not an error.
+        return {"status": "NO_PROJECT_TO_GRADUATE"}
+
+    await db.execute(
+        text(
+            "UPDATE projects SET active_production_tag = :new_version, status = 'HEALTHY' "
+            "WHERE project_id = :project_id AND tenant_id = :tid"
+        ),
+        {"new_version": new_version, "project_id": str(row["project_id"]), "tid": tenant_id},
+    )
+    await db.commit()
+    logger.info(
+        "project_graduated_to_new_baseline",
+        project_id=str(row["project_id"]),
+        pipeline_run_id=run_id,
+        new_version=new_version,
+    )
+    return {"status": "GRADUATED", "project_id": str(row["project_id"]), "new_version": new_version}
 
 
 @router.get("/{project_id}/audit")

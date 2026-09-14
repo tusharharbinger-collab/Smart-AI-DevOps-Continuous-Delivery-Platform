@@ -49,6 +49,18 @@ async def tenant_context_middleware(request: Request, call_next: Callable) -> Re
     ):
         return await call_next(request)
 
+    # Phase 9 — service-to-service only (policy-controller calling back in
+    # once a canary's automated ramp reaches its final step). Prefix match
+    # because `{run_id}` varies per call, unlike every other exact-path
+    # entry above. Not reachable through the frontend — no route in
+    # App.tsx points here — and, like pipeline-worker's `/pipelines/start`/
+    # `/services/onboard`, relies on Docker network isolation rather than a
+    # shared internal token, matching this platform's existing posture for
+    # service-to-service calls rather than inventing a new one for just
+    # this route. See projects_router.py::graduate_pipeline_run.
+    if request.url.path.startswith("/api/v1/projects/internal/"):
+        return await call_next(request)
+
     auth_header = request.headers.get("Authorization", "")
     claims = _extract_claims(auth_header)
 
