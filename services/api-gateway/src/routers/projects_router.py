@@ -215,6 +215,7 @@ spec:
         service: {body.name}
         routeName: {body.name}-route
         canaryDeployment: {body.name}-canary
+        baselineDeployment: {body.name}-baseline
         steps:
 {chr(10).join(step_lines)}
 

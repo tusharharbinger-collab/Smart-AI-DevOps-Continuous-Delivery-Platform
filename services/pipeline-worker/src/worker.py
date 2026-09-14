@@ -92,16 +92,32 @@ class PipelineOrchestrator:
         canary_loop_cfg = next(
             (s.get("config", {}) for s in stage_map.values() if s.get("type") == "canary_loop"), {}
         )
-        route_name = canary_loop_cfg.get("routeName") or f"{canary_loop_cfg.get('service', spec.name)}-route"
+        # Real bug found live: `spec.name` is the pipeline's own metadata
+        # name, which every generator (generate_project_pipeline_yaml,
+        # manifest_generator.py) suffixes with "-rollout" — real onboarded
+        # Deployments never carry that suffix. `route_name`'s fallback
+        # already correctly used the canary_loop config's own `service`
+        # field (the real, unsuffixed name) instead of bare `spec.name`;
+        # canary/baseline's fallbacks didn't, so any pipeline that doesn't
+        # explicitly declare `canaryDeployment`/`baselineDeployment` (every
+        # legacy/adopted one, e.g. payments-pipeline) resolved to a
+        # Deployment that never existed — "{name}-rollout-canary" /
+        # "{name}-rollout-baseline" — 404ing on every real k8s call.
+        # Invisible until now because every test this session either hit a
+        # pipeline that DOES declare `canaryDeployment` explicitly, or
+        # called with redis_client=None (the hardcoded DEFAULT_* fallback),
+        # never actually exercising this derivation for real.
+        service_name = canary_loop_cfg.get("service", spec.name)
+        route_name = canary_loop_cfg.get("routeName") or f"{service_name}-route"
         canary_deployment_name = (
-            deploy_cfg.get("deployment") or canary_loop_cfg.get("canaryDeployment") or f"{spec.name}-canary"
+            deploy_cfg.get("deployment") or canary_loop_cfg.get("canaryDeployment") or f"{service_name}-canary"
         )
         # Mirrors canary_deployment_name's own resolution — needed by
         # policy-controller's cost_tracker.py to read the LIVE baseline
         # Deployment's replica/resource footprint for a real cost delta
         # (previously always hardcoded to 0.0; see cost_tracker.py).
         baseline_deployment_name = (
-            deploy_cfg.get("baselineDeployment") or canary_loop_cfg.get("baselineDeployment") or f"{spec.name}-baseline"
+            deploy_cfg.get("baselineDeployment") or canary_loop_cfg.get("baselineDeployment") or f"{service_name}-baseline"
         )
         target = {
             "route_name": route_name,

@@ -170,7 +170,7 @@ CREATE POLICY tenant_isolation_execstate ON execution_state
 CREATE TABLE IF NOT EXISTS verification_records (
     verdict_id        UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id         UUID          NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    pipeline_run_id   UUID          NOT NULL REFERENCES pipeline_executions(pipeline_run_id),
+    pipeline_run_id   UUID          NOT NULL REFERENCES pipeline_executions(pipeline_run_id) ON DELETE CASCADE,
     status            TEXT          NOT NULL
                           CHECK (status IN ('HEALTHY','DEGRADED','FAILED','UNVERIFIABLE')),
     composite_score   NUMERIC(5,2)  NOT NULL CHECK (composite_score BETWEEN 0 AND 100),
@@ -215,7 +215,7 @@ CREATE POLICY tenant_isolation_policy ON policy_rules
 CREATE TABLE IF NOT EXISTS audit_ledger (
     actuation_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id        UUID        NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id),
+    pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id) ON DELETE CASCADE,
     action           TEXT        NOT NULL
                          CHECK (action IN ('WEIGHT_UPDATE','ROLLBACK','PROMOTE',
                                            'SCALE_ZERO','APPROVE','BLOCK','RIGHTSIZING',
@@ -243,7 +243,7 @@ CREATE POLICY tenant_isolation_audit ON audit_ledger
 CREATE TABLE IF NOT EXISTS approvals (
     approval_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id        UUID        NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id),
+    pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id) ON DELETE CASCADE,
     stage            TEXT        NOT NULL,
     approver_user_id UUID        NOT NULL,
     approver_role    TEXT        NOT NULL CHECK (approver_role IN ('lead-sre','platform-admin','developer')),
@@ -263,7 +263,7 @@ CREATE POLICY tenant_isolation_approvals ON approvals
 CREATE TABLE IF NOT EXISTS cost_analysis (
     cost_id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id        UUID        NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id),
+    pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id) ON DELETE CASCADE,
     baseline_cost    NUMERIC(10,4) NOT NULL,
     canary_cost      NUMERIC(10,4) NOT NULL,
     delta_percent    NUMERIC(6,2)  NOT NULL,
