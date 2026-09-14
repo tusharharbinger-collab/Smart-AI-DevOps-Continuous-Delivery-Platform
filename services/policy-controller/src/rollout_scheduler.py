@@ -16,8 +16,12 @@ the parsed step schedule, and updated here by controller.py after every
 successful promotion. Advancing to the next step means waiting out THAT
 step's own real minDuration (never a flat guess) and then asking
 pipeline-worker's `/pipelines/{run_id}/reverify` to produce the next
-verdict — never touching Kubernetes here, since actuation stays
-policy-controller's `handle_incoming_verdict` path exclusively.
+verdict.
+
+`graduate()` is the one function here that DOES touch Kubernetes (via
+actuation_executor.graduate_canary — still the only module permitted to
+mutate cluster state) — see its own docstring for why a database label
+alone wasn't enough.
 """
 import asyncio
 import json
@@ -27,6 +31,8 @@ from datetime import datetime, timezone
 
 import httpx
 import structlog
+
+from src.actuation_executor import graduate_canary
 
 logger = structlog.get_logger(__name__)
 
@@ -130,24 +136,56 @@ async def _fire_reverify_after_delay(
         logger.error("rollout_step_reverify_failed", pipeline_run_id=run_id, error=str(e))
 
 
-async def graduate(run_id: str, tenant_id: str | None, new_version: str | None) -> None:
+async def graduate(run_id: str, target: dict, new_version: str | None, db=None) -> str:
     """
-    Real gap found live: nothing anywhere updated a project's baseline
-    version once its canary reached 100% — the NEXT release would still be
-    compared against the ORIGINAL baseline forever, defeating the point of
-    a continuous-delivery loop. Tells api-gateway (the sole owner of the
-    `projects` table) that this run's canary is now the production version.
-    Best-effort: a failure here doesn't undo the traffic promotion that
-    already happened, it just means the next rollout's baseline bookkeeping
-    is stale and worth checking manually.
+    Real gap found live: reaching 100% never made that durable on the
+    cluster — the `canary` Deployment kept serving all traffic while
+    `baseline` sat idle running the ORIGINAL image forever, and a database
+    label alone (`projects.active_production_tag`) could claim a version
+    was "live" while the actual baseline Deployment never ran it. This
+    does the REAL work first: actuation_executor.graduate_canary() reads
+    the canary's live image and copies it onto baseline (the only
+    Kubernetes-mutating step here — actuation stays exclusively there),
+    resets traffic to 100% baseline, and idles the canary down. Only if
+    THAT succeeds does this tell api-gateway (the sole owner of the
+    `projects` table) to record the new production version — so the
+    database never claims a version is live when it isn't actually
+    running anywhere. Returns "GRADUATED" or "GRADUATION_FAILED" so the
+    caller can persist which one actually happened instead of assuming.
     """
+    try:
+        result = await graduate_canary(
+            run_id,
+            authorized_by="SYSTEM:auto_graduate",
+            route_name=target["route_name"],
+            namespace=target["namespace"],
+            canary_deployment_name=target["canary_deployment_name"],
+            baseline_deployment_name=target["baseline_deployment_name"],
+            tenant_id=target.get("tenant_id"),
+            db=db,
+        )
+    except Exception as e:
+        logger.error("canary_graduation_kubernetes_step_failed", pipeline_run_id=run_id, error=str(e))
+        return "GRADUATION_FAILED"
+
+    # The image actually running (from the live cluster read inside
+    # graduate_canary) is the source of truth for what got recorded as the
+    # new baseline — not the requested target_version, which could have
+    # drifted from what genuinely built and deployed.
+    recorded_version = result.get("new_baseline_image") or new_version
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 f"{API_GATEWAY_URL}/api/v1/projects/internal/pipeline-runs/{run_id}/graduate",
-                json={"tenant_id": tenant_id, "new_version": new_version},
+                json={"tenant_id": target.get("tenant_id"), "new_version": recorded_version},
             )
             resp.raise_for_status()
-        logger.info("canary_graduated_to_baseline", pipeline_run_id=run_id, new_version=new_version)
+        logger.info("canary_graduated_to_baseline", pipeline_run_id=run_id, new_version=recorded_version)
+        return "GRADUATED"
     except Exception as e:
-        logger.error("canary_graduation_failed", pipeline_run_id=run_id, error=str(e))
+        # The cluster is already correct at this point — only the
+        # project's tracked version bookkeeping is stale, worth checking
+        # manually but not worth treating as a failed graduation.
+        logger.error("canary_graduation_db_record_failed", pipeline_run_id=run_id, error=str(e))
+        return "GRADUATED"

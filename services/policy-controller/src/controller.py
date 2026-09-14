@@ -351,11 +351,16 @@ async def handle_incoming_verdict(
             confidence=verdict.get("confidence"),
         )
         await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="PROMOTE_STEP")
-        await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None)
+        await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None, db=db)
 
 
 async def _advance_or_graduate(
-    pipeline_run_id: str, target: dict, rollout_state: dict | None, redis_client, trace_id: str | None
+    pipeline_run_id: str,
+    target: dict,
+    rollout_state: dict | None,
+    redis_client,
+    trace_id: str | None,
+    db=None,
 ) -> None:
     """
     After a successful PROMOTE_STEP actuation: continues the automated ramp
@@ -374,8 +379,8 @@ async def _advance_or_graduate(
     next_index = rollout_state["current_step_index"] + 1
 
     if next_index >= len(steps):
-        await rollout_scheduler.graduate(pipeline_run_id, target.get("tenant_id"), rollout_state.get("target_version"))
-        rollout_state["status"] = "GRADUATED"
+        status = await rollout_scheduler.graduate(pipeline_run_id, target, rollout_state.get("target_version"), db=db)
+        rollout_state["status"] = status
         await rollout_scheduler.save_rollout_state(redis_client, pipeline_run_id, rollout_state)
         return
 
@@ -450,7 +455,7 @@ async def handle_approval(
         confidence=verdict.get("confidence"),
     )
     await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="PROMOTE_STEP")
-    await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None)
+    await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None, db=db)
     return {"status": "PROMOTED", "canary_weight": canary_weight}
 
 

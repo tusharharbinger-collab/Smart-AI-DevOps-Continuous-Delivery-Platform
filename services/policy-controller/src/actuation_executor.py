@@ -165,3 +165,98 @@ async def emergency_rollback(
         confidence=confidence,
     )
     return {"status": "ROLLED_BACK"}
+
+
+async def graduate_canary(
+    pipeline_run_id: str,
+    authorized_by: str,
+    route_name: str = DEFAULT_ROUTE_NAME,
+    namespace: str = DEFAULT_NAMESPACE,
+    canary_deployment_name: str = DEFAULT_CANARY_DEPLOYMENT,
+    baseline_deployment_name: str = DEFAULT_BASELINE_DEPLOYMENT,
+    tenant_id: str | None = None,
+    db=None,
+) -> dict:
+    """
+    Real gap found live: once a canary's ramp reached 100%, nothing ever
+    made that durable on the cluster — the `canary` Deployment kept serving
+    all traffic while `baseline` sat idle running the ORIGINAL image
+    forever. The next rollout would keep comparing against that stale
+    baseline, and a config/UI record could claim a version was "live" while
+    the actual baseline Deployment never ran it. This makes it real:
+    reads the canary's LIVE image (not whatever tag was requested — if it
+    drifted, this graduates what's actually running), copies it onto
+    baseline via a strategic merge patch (Kubernetes merges the
+    `containers` list by name automatically here — unlike the HTTPRoute
+    case above, no JSON-Patch workaround is needed for a native Deployment
+    resource), resets the route to 100% baseline once both sides run the
+    same image, and idles the canary Deployment down to 0 replicas so it's
+    ready to be reused as the next test's deploy target.
+
+    Idempotent like emergency_rollback: re-running this against an
+    already-graduated baseline (same image already applied, canary already
+    at 0 replicas) is a no-op with no side effects.
+    """
+    _load_kube()
+    apps_v1 = client.AppsV1Api()
+
+    try:
+        canary = apps_v1.read_namespaced_deployment(name=canary_deployment_name, namespace=namespace)
+    except ApiException as e:
+        logger.error("graduate_canary_read_failed", error=str(e), pipeline_run_id=pipeline_run_id)
+        raise
+
+    containers = canary.spec.template.spec.containers
+    if not containers:
+        raise ValueError(f"Canary deployment {canary_deployment_name} has no containers to graduate")
+    canary_image = containers[0].image
+    container_name = containers[0].name
+
+    try:
+        apps_v1.patch_namespaced_deployment(
+            name=baseline_deployment_name,
+            namespace=namespace,
+            body={"spec": {"template": {"spec": {"containers": [{"name": container_name, "image": canary_image}]}}}},
+        )
+        logger.info(
+            "baseline_image_graduated",
+            pipeline_run_id=pipeline_run_id,
+            baseline_deployment_name=baseline_deployment_name,
+            new_image=canary_image,
+        )
+    except ApiException as e:
+        logger.error("graduate_baseline_patch_failed", error=str(e), pipeline_run_id=pipeline_run_id)
+        raise
+
+    await update_traffic_weights(
+        pipeline_run_id,
+        canary_weight=0,
+        baseline_weight=100,
+        authorized_by=authorized_by,
+        route_name=route_name,
+        namespace=namespace,
+        tenant_id=tenant_id,
+        db=db,
+    )
+
+    try:
+        apps_v1.patch_namespaced_deployment_scale(
+            name=canary_deployment_name,
+            namespace=namespace,
+            body={"spec": {"replicas": 0}},
+        )
+    except ApiException as e:
+        # Not fatal — the important safety-relevant change (baseline now
+        # runs the graduated image, traffic is back on it) already
+        # succeeded. An idle canary still holding old replicas just means
+        # the next build reuses it without a fresh scale-up, which is safe.
+        logger.warning("graduate_canary_scale_down_failed", error=str(e), pipeline_run_id=pipeline_run_id)
+
+    await record_actuation(
+        pipeline_run_id=pipeline_run_id,
+        action="GRADUATE",
+        authorized_by=authorized_by,
+        tenant_id=tenant_id,
+        db=db,
+    )
+    return {"status": "GRADUATED", "new_baseline_image": canary_image}

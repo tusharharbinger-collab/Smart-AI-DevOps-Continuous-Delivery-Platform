@@ -112,8 +112,9 @@ def _patch_actuation(monkeypatch):
     async def fake_cost(**kwargs):
         return None
 
-    async def fake_graduate(run_id, tenant_id, new_version):
-        calls["graduate"].append({"run_id": run_id, "tenant_id": tenant_id, "new_version": new_version})
+    async def fake_graduate(run_id, target, new_version, db=None):
+        calls["graduate"].append({"run_id": run_id, "tenant_id": target.get("tenant_id"), "new_version": new_version})
+        return "GRADUATED"
 
     async def fake_advance(redis_client, run_id, tenant_id, state, next_index, trace_id):
         calls["advance"].append({"run_id": run_id, "next_index": next_index})

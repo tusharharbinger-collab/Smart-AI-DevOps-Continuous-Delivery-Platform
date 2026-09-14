@@ -218,7 +218,8 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     pipeline_run_id  UUID        NOT NULL REFERENCES pipeline_executions(pipeline_run_id),
     action           TEXT        NOT NULL
                          CHECK (action IN ('WEIGHT_UPDATE','ROLLBACK','PROMOTE',
-                                           'SCALE_ZERO','APPROVE','BLOCK','RIGHTSIZING')),
+                                           'SCALE_ZERO','APPROVE','BLOCK','RIGHTSIZING',
+                                           'GRADUATE')),
     verdict          TEXT,
     confidence       NUMERIC(4,3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     authorized_by    TEXT        NOT NULL,  -- e.g. "OPA:allow_action=true:rule=PROMOTE_STEP"
