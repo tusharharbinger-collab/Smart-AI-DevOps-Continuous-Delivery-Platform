@@ -17,6 +17,7 @@ auth/middleware.py already opened) and additionally filters on tenant_id.
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -122,6 +123,23 @@ def _metric_prefix(project_name: str) -> str:
     return project_name.replace("-", "_").replace(".", "_")
 
 
+def _k8s_name(name: str) -> str:
+    """
+    Real bug found live: a project named "RaktDoot" (or any name with
+    uppercase letters, spaces, or other characters outside
+    `[a-z0-9-]`) was passed straight through to Deployment/Service/
+    HTTPRoute names — Kubernetes requires a lowercase RFC 1123 label/
+    subdomain for every one of those, and rejected the onboarding call
+    outright with a 422 the wizard gave the user no way to anticipate
+    ("RaktDoot-baseline": a lowercase RFC 1123 subdomain must consist of
+    lower case alphanumeric characters...). Derives a real k8s-safe slug
+    for every K8s-facing identifier this project generates; `projects.name`
+    itself keeps the user's original display name untouched.
+    """
+    slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+    return slug or "service"
+
+
 def generate_project_pipeline_yaml(body: CreateProjectRequest, tenant_id: str, namespace: str) -> str:
     """
     Renders the wizard's inputs into the platform's existing declarative
@@ -160,6 +178,7 @@ def generate_project_pipeline_yaml(body: CreateProjectRequest, tenant_id: str, n
             step_lines.append("            requiresManualApproval: true")
 
     prefix = _metric_prefix(body.name)
+    k8s_name = _k8s_name(body.name)
 
     build_and_test_stages = ""
     if body.source_type != "existing_image":
@@ -202,7 +221,7 @@ def generate_project_pipeline_yaml(body: CreateProjectRequest, tenant_id: str, n
     return f"""apiVersion: delivery.devops.ai/v1alpha1
 kind: Pipeline
 metadata:
-  name: {body.name}-rollout
+  name: {k8s_name}-rollout
   tenantId: "{tenant_id}"
   namespace: {namespace}
 
@@ -212,10 +231,10 @@ spec:
       type: canary_loop
       config:
         gatewayRef: local-edge-gateway
-        service: {body.name}
-        routeName: {body.name}-route
-        canaryDeployment: {body.name}-canary
-        baselineDeployment: {body.name}-baseline
+        service: {k8s_name}
+        routeName: {k8s_name}-route
+        canaryDeployment: {k8s_name}-canary
+        baselineDeployment: {k8s_name}-baseline
         steps:
 {chr(10).join(step_lines)}
 
@@ -465,6 +484,22 @@ async def create_project(
     elif not body.repo_url:
         raise HTTPException(status_code=422, detail="repo_url is required for source_type=repository")
 
+    # Real bug found live: a GitHub repo named "RaktDoot" defaulted to
+    # container_image "registry.internal/RaktDoot" — Docker repository
+    # names must be lowercase, and `docker build -t` rejects an uppercase
+    # one outright as an invalid reference. The wizard now lowercases its
+    # own auto-filled default, but this rejects it clearly (rather than a
+    # confusing failure deep in the build stage) for any caller — the
+    # wizard included, if a user hand-edits the field — that bypasses that.
+    if body.container_image and body.container_image != body.container_image.lower():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"container_image '{body.container_image}' must be lowercase "
+                "(Docker repository names cannot contain uppercase letters)."
+            ),
+        )
+
     tenant_id = _get_tenant_id(request)
     namespace = f"tenant-{tenant_id.split('-')[0]}"
     policy_yaml = generate_project_pipeline_yaml(body, tenant_id, namespace)
@@ -539,13 +574,22 @@ async def create_project(
                 resp = await http_client.post(
                     f"{PIPELINE_WORKER_URL}/services/onboard",
                     json={
-                        "service_name": body.name,
+                        # Real bug found live: passing the raw display name
+                        # here (e.g. "RaktDoot") made pipeline-worker build a
+                        # Deployment named "RaktDoot-baseline" — Kubernetes
+                        # requires lowercase RFC 1123 names and rejected it
+                        # with a 422 the wizard had no way to anticipate. See
+                        # _k8s_name's docstring; must match the slug already
+                        # baked into this project's own pipeline YAML
+                        # (canaryDeployment/baselineDeployment above), or the
+                        # two would silently point at different Deployments.
+                        "service_name": _k8s_name(body.name),
                         "image": body.container_image,
                         "baseline_tag": body.active_production_tag,
                         "canary_tag": body.canary_tag or "v1.1.0",
                         "port": body.port,
                         "health_check_path": body.health_check_path,
-                        "path_prefix": body.path_prefix or f"/api/v1/{body.name}",
+                        "path_prefix": body.path_prefix or f"/api/v1/{_k8s_name(body.name)}",
                         "tenant_id": tenant_id,
                         "namespace": namespace,
                         "registry_credential_id": body.registry_credential_id,

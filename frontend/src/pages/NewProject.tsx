@@ -216,7 +216,10 @@ export function NewProject() {
       ...f,
       name: repo.name,
       branch: repo.default_branch,
-      container_image: f.container_image || `registry.internal/${repo.name}`,
+      // Docker repository names must be lowercase (real bug found live:
+      // a GitHub repo named "RaktDoot" produced "registry.internal/RaktDoot",
+      // which `docker build -t` rejects outright as an invalid reference).
+      container_image: f.container_image || `registry.internal/${repo.name.toLowerCase()}`,
     }));
     const parsed = parseRepoUrl(repo.clone_url);
     if (parsed) {
@@ -235,7 +238,7 @@ export function NewProject() {
     setForm((f) => ({
       ...f,
       name: f.name || parsed?.repo || "",
-      container_image: f.container_image || (parsed ? `registry.internal/${parsed.repo}` : ""),
+      container_image: f.container_image || (parsed ? `registry.internal/${parsed.repo.toLowerCase()}` : ""),
     }));
     setBranches([]);
   }
