@@ -109,6 +109,42 @@ async def advance_to_next_step(
     )
 
 
+async def schedule_retry_of_current_step(
+    run_id: str,
+    tenant_id: str | None,
+    state: dict,
+    remaining_seconds: float,
+    trace_id: str | None = None,
+) -> None:
+    """
+    Real gap found live: a pipeline with no separate deploy/wait stage
+    (canary_verify runs immediately after registration — true of every
+    project this session's onboarding wizard generates, and of the
+    original payments-pipeline demo) produces its FIRST verdict with
+    essentially zero real elapsed time. OPA's own minDuration/minSampleSize
+    gate (correctly, now that it sees REAL evidence instead of the old
+    hardcoded stand-ins — see _build_promotion_opa_input) rejects that
+    first attempt every time. Before this, that rejection just fell into
+    the generic BLOCKED alert and the run ended there — the ramp could
+    never even complete its FIRST step for any pipeline whose evidence
+    literally cannot exist yet, a silent dead end. This does what a human
+    operator obviously would: wait out however much of THIS step's own gate
+    is still unmet, then ask for the verdict again — the SAME step, so
+    (unlike advance_to_next_step) `step_started_at` is deliberately left
+    untouched, letting real elapsed time keep accumulating from when this
+    step genuinely began rather than restarting the clock.
+    """
+    logger.info(
+        "rollout_step_retry_scheduled",
+        pipeline_run_id=run_id,
+        step_index=state["current_step_index"],
+        remaining_seconds=remaining_seconds,
+    )
+    asyncio.create_task(
+        _fire_reverify_after_delay(run_id, tenant_id, state["verification_config"], remaining_seconds, trace_id)
+    )
+
+
 async def _fire_reverify_after_delay(
     run_id: str, tenant_id: str | None, verification_config: dict, delay_seconds: float, trace_id: str | None
 ) -> None:

@@ -169,7 +169,17 @@ def test_successful_non_final_step_schedules_the_next_step(_patch_actuation):
     assert len(_patch_actuation["graduate"]) == 0
 
 
-def test_step_before_final_advances_to_final_without_graduating_yet(_patch_actuation):
+def test_step_before_final_advances_into_the_approval_gated_step(_patch_actuation):
+    """
+    Real bug found live: this used to assert NO advance happened here, on
+    the theory that reaching an approval-gated step should stop the ramp
+    immediately. In reality, nothing else ever schedules that step's own
+    verification — skipping the advance meant the ramp silently dead-
+    ended one step short of ever reaching the gate at all. Advancing the
+    index only schedules the NEXT verification cycle; it does not itself
+    promote or skip the human-approval check, which still fires correctly
+    once a verdict comes back for that step (see the next test).
+    """
     redis_client = FakeRedis()
     run_id = "run-ramp-3"
     state = _make_rollout_state(_steps(), current_index=1)
@@ -178,10 +188,8 @@ def test_step_before_final_advances_to_final_without_graduating_yet(_patch_actua
     asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(run_id), run_id, redis_client=redis_client))
 
     assert _patch_actuation["promote"][0]["canary_weight"] == 50
-    # Advancing INTO the final (requiresManualApproval) step must not
-    # auto-advance past it — the human-approval branch in
-    # handle_incoming_verdict is what actually stops there.
-    assert len(_patch_actuation["advance"]) == 0
+    assert len(_patch_actuation["advance"]) == 1, "must schedule the approval-gated step's own verification"
+    assert _patch_actuation["advance"][0]["next_index"] == 2
     assert len(_patch_actuation["graduate"]) == 0
 
 
@@ -316,3 +324,117 @@ def test_pipeline_real_declared_policy_reaches_opa_not_a_hardcoded_default(monke
 
     assert captured["pipeline_policy"] == real_policy, "the pipeline's own declared policy must reach OPA, not a generic default"
     assert captured["pipeline_policy"]["guardrails"]["requireMinimumConfidence"] == 0.93
+
+
+async def _opa_eval_enforcing_real_evidence_gates(payload):
+    """
+    Mirrors RULE 2's real evidence requirements (delivery_guardrails.rego)
+    that _patch_actuation's own fake OPA deliberately ignores — needed here
+    specifically to prove the retry-on-insufficient-evidence fix, which
+    only matters when the gate it's retrying against is real.
+    """
+    step = payload["current_step"]
+    allow = (
+        payload["requested_action"] == "PROMOTE_STEP"
+        and payload["active_step_duration_seconds"] >= int(step["minDuration"].rstrip("s"))
+        and payload["active_step_sample_count"] >= step["minSampleSize"]
+    )
+    return {
+        "allow_action": allow,
+        "require_human_approval": False,
+        "rejection_reasons": [] if allow else ["insufficient evidence"],
+        "raw_result": {},
+        "opa_unreachable": False,
+    }
+
+
+def test_verdict_produced_with_no_real_elapsed_time_retries_the_same_step_instead_of_dead_ending(monkeypatch):
+    """
+    Real gap found live: a pipeline with no separate deploy/wait stage
+    produces its FIRST verdict at essentially zero real elapsed time. A
+    real minSampleSize/minDuration gate correctly rejects that — before
+    this fix, the rejection fell into the generic BLOCKED alert and the
+    run simply ended, never completing even its first step.
+    """
+    redis_client = FakeRedis()
+    run_id = "run-ramp-fresh-step"
+    state = _make_rollout_state(_steps(), current_index=0)
+    state["step_started_at"] = datetime.now(timezone.utc).isoformat()  # just registered, ~0s elapsed
+    asyncio.run(redis_client.set(f"rollout_state:{run_id}", json.dumps(state)))
+
+    async def fake_get_target(redis_client, pipeline_run_id):
+        return {
+            "route_name": "svc-route", "namespace": "production",
+            "canary_deployment_name": "svc-canary", "baseline_deployment_name": "svc-baseline",
+            "tenant_id": "tenant-1",
+        }
+
+    calls = {"promote": [], "retry": [], "alerts": []}
+
+    async def fake_promote(*args, **kwargs):
+        calls["promote"].append(kwargs)
+
+    async def fake_send_alert(*args, **kwargs):
+        calls["alerts"].append(args)
+
+    async def fake_retry(run_id, tenant_id, state, remaining_seconds, trace_id=None):
+        calls["retry"].append({"run_id": run_id, "remaining_seconds": remaining_seconds})
+
+    async def fake_cost(**kwargs):
+        return None
+
+    monkeypatch.setattr(controller, "_get_actuation_target", fake_get_target)
+    monkeypatch.setattr(controller, "update_traffic_weights", fake_promote)
+    monkeypatch.setattr(controller, "send_alert", fake_send_alert)
+    monkeypatch.setattr(controller, "compute_and_record_cost", fake_cost)
+    monkeypatch.setattr(controller, "evaluate_policy_async", _opa_eval_enforcing_real_evidence_gates)
+    monkeypatch.setattr(controller.rollout_scheduler, "schedule_retry_of_current_step", fake_retry)
+
+    asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(run_id), run_id, redis_client=redis_client))
+
+    assert len(calls["promote"]) == 0, "must not promote before the step's own evidence gate is genuinely satisfied"
+    assert len(calls["alerts"]) == 0, "insufficient evidence isn't an alert-worthy failure, just not ready yet"
+    assert len(calls["retry"]) == 1
+    assert calls["retry"][0]["remaining_seconds"] > 0
+
+    saved = asyncio.run(controller.rollout_scheduler.get_rollout_state(redis_client, run_id))
+    assert saved["current_step_index"] == 0, "a same-step retry must never advance the step index"
+
+
+def test_verdict_with_sufficient_evidence_is_not_retried_and_promotes_normally(monkeypatch):
+    """Once real elapsed time/samples genuinely satisfy the step's own gate,
+    this path must get out of the way and let the normal promotion happen."""
+    redis_client = FakeRedis()
+    run_id = "run-ramp-sufficient-evidence"
+    state = _make_rollout_state(_steps(), current_index=0)  # step_started_at is 999s in the past (see helper)
+    asyncio.run(redis_client.set(f"rollout_state:{run_id}", json.dumps(state)))
+
+    async def fake_get_target(redis_client, pipeline_run_id):
+        return {
+            "route_name": "svc-route", "namespace": "production",
+            "canary_deployment_name": "svc-canary", "baseline_deployment_name": "svc-baseline",
+            "tenant_id": "tenant-1",
+        }
+
+    calls = {"promote": [], "retry": []}
+
+    async def fake_promote(*args, **kwargs):
+        calls["promote"].append(kwargs)
+
+    async def fake_retry(*args, **kwargs):
+        calls["retry"].append(kwargs)
+
+    async def fake_cost(**kwargs):
+        return None
+
+    monkeypatch.setattr(controller, "_get_actuation_target", fake_get_target)
+    monkeypatch.setattr(controller, "update_traffic_weights", fake_promote)
+    monkeypatch.setattr(controller, "compute_and_record_cost", fake_cost)
+    monkeypatch.setattr(controller, "evaluate_policy_async", _opa_eval_enforcing_real_evidence_gates)
+    monkeypatch.setattr(controller.rollout_scheduler, "schedule_retry_of_current_step", fake_retry)
+    monkeypatch.setattr(controller.rollout_scheduler, "advance_to_next_step", fake_promote)
+
+    asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(run_id), run_id, redis_client=redis_client))
+
+    assert len(calls["retry"]) == 0
+    assert len(calls["promote"]) >= 1

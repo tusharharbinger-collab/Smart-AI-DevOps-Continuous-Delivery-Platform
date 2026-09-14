@@ -277,6 +277,38 @@ async def handle_incoming_verdict(
     )
 
     if not opa_result["allow_action"] and not failsafe_rollback_override:
+        if verdict.get("status") == "HEALTHY" and active_step and rollout_state is not None:
+            # Real gap found live: a pipeline with no separate deploy/wait
+            # stage (canary_verify runs immediately after registration —
+            # true of every project the onboarding wizard generates, and
+            # of the payments-pipeline demo) produces its FIRST verdict
+            # with essentially zero real elapsed time. Now that OPA sees
+            # REAL evidence instead of the old hardcoded stand-ins (see
+            # _build_promotion_opa_input), it correctly rejects that first
+            # attempt every time — and before this check existed, that
+            # rejection fell straight into the generic BLOCKED alert below
+            # and the run just ended there: the ramp could never complete
+            # its first step for ANY pipeline whose evidence literally
+            # cannot exist yet. Detected directly (not by parsing OPA's
+            # rejection_reasons text) so it can't drift out of sync with
+            # the real gate; retries the SAME step (never advances the
+            # index) once however much of its own gate is still unmet has
+            # elapsed — not an alert-worthy failure, just evidence still
+            # being gathered.
+            remaining_duration = active_step["minDurationSeconds"] - promotion_fields["active_step_duration_seconds"]
+            remaining_samples = active_step["minSampleSize"] - promotion_fields["active_step_sample_count"]
+            if remaining_duration > 0 or remaining_samples > 0:
+                await rollout_scheduler.schedule_retry_of_current_step(
+                    pipeline_run_id, target.get("tenant_id"), rollout_state, max(remaining_duration, 1.0)
+                )
+                logger.info(
+                    "promotion_retry_scheduled_insufficient_evidence",
+                    pipeline_run_id=pipeline_run_id,
+                    remaining_duration_seconds=remaining_duration,
+                    remaining_samples=remaining_samples,
+                )
+                return
+
         if verdict.get("status") == "HEALTHY" and active_step and active_step.get("requiresManualApproval"):
             # Real gap found live: a step flagged requiresManualApproval in
             # the pipeline's own declared schedule (the final 100% cutover,
@@ -364,13 +396,23 @@ async def _advance_or_graduate(
 ) -> None:
     """
     After a successful PROMOTE_STEP actuation: continues the automated ramp
-    to the next declared step, leaves the run alone if the next step
-    requires manual approval (handle_incoming_verdict's own HEALTHY-verdict
-    pass at that step is what actually pauses and alerts — this only avoids
-    skipping past the gate), or — once the final step is reached —
-    graduates the canary into the new baseline so the NEXT rollout starts
-    from what was just proven healthy instead of comparing against a
-    permanently stale version forever.
+    to the next declared step (regardless of whether THAT step itself
+    requires manual approval — advancing the index only schedules its
+    verification; actuation still only happens if OPA later allows it,
+    which it won't until a human approves), or — once the final step is
+    reached — graduates the canary into the new baseline so the NEXT
+    rollout starts from what was just proven healthy instead of comparing
+    against a permanently stale version forever.
+
+    Real bug found live: this used to `return` early whenever the NEXT
+    step required manual approval, on the theory that
+    handle_incoming_verdict's own approval-pause branch would take it from
+    there. But nothing else ever calls advance_to_next_step for that step —
+    skipping it here meant current_step_index never advanced and no
+    reverify was ever scheduled, so the ramp silently dead-ended at
+    whatever step preceded the approval gate, forever. Caught only by
+    watching a real multi-step rollout live and noticing it never reached
+    its final step at all.
     """
     if rollout_state is None:
         return  # legacy/no-schedule run — nothing further to automate
@@ -382,9 +424,6 @@ async def _advance_or_graduate(
         status = await rollout_scheduler.graduate(pipeline_run_id, target, rollout_state.get("target_version"), db=db)
         rollout_state["status"] = status
         await rollout_scheduler.save_rollout_state(redis_client, pipeline_run_id, rollout_state)
-        return
-
-    if steps[next_index].get("requiresManualApproval"):
         return
 
     await rollout_scheduler.advance_to_next_step(
