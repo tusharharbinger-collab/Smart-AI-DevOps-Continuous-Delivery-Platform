@@ -5,20 +5,24 @@ import { useEffect, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { yaml as yamlLang } from "@codemirror/lang-yaml";
 import { toast } from "sonner";
-import { CheckCircle2, XCircle, FileCode2, ShieldAlert, SlidersHorizontal } from "lucide-react";
+import { CheckCircle2, XCircle, FileCode2, ShieldAlert, SlidersHorizontal, Sparkles } from "lucide-react";
 import { validatePolicy, savePolicy, getPolicy, type ValidationResult } from "@/api/policy";
+import { generatePipelineFromPrompt } from "@/api/projects";
 import { useAppContext } from "@/hooks/useAppContext";
 import { useThemeStore } from "@/lib/theme";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 
 export function PolicyManager() {
-  const { pipelineId } = useAppContext();
+  const { pipelineId, projectId } = useAppContext();
   const theme = useThemeStore((s) => s.theme);
   const [yamlText, setYamlText] = useState("");
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
   const [saving, setSaving] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [generating, setGenerating] = useState(false);
 
   useEffect(() => {
     if (!pipelineId) return;
@@ -41,6 +45,25 @@ export function PolicyManager() {
     }, 500);
     return () => clearTimeout(handle);
   }, [yamlText]);
+
+  async function handleGenerate() {
+    if (!projectId || !aiPrompt.trim()) return;
+    setGenerating(true);
+    try {
+      const result = await generatePipelineFromPrompt(projectId, aiPrompt);
+      // Populates the SAME editor a hand-edit uses — never auto-saved. The
+      // user reviews the diff and clicks the existing Save Policy button,
+      // same as any manual change.
+      setYamlText(result.pipeline_yaml);
+      toast.success("AI proposed a change — review and Save to apply it", {
+        description: result.summary_of_changes,
+      });
+    } catch (e) {
+      toast.error("AI pipeline generation failed", { description: (e as Error).message });
+    } finally {
+      setGenerating(false);
+    }
+  }
 
   async function handleSave() {
     if (!pipelineId) return;
@@ -75,6 +98,28 @@ export function PolicyManager() {
           )}
         </CardHeader>
         <CardContent className="pt-4">
+          {projectId && (
+            <div className="mb-3 flex gap-2">
+              <Input
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                placeholder="Describe a change, e.g. “add a 15% step before 25% and require approval before 50%”"
+                disabled={generating}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !generating) handleGenerate();
+                }}
+              />
+              <Button
+                variant="secondary"
+                onClick={handleGenerate}
+                disabled={generating || !aiPrompt.trim()}
+                className="shrink-0"
+              >
+                <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                {generating ? "Generating…" : "AI Assist"}
+              </Button>
+            </div>
+          )}
           <div className="overflow-hidden rounded-md border">
             <CodeMirror
               value={yamlText}

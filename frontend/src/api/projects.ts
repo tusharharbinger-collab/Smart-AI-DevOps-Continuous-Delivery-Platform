@@ -183,3 +183,29 @@ export const approveRun = (projectId: string, runId: string) =>
   apiClient.post<{ status: string; canary_weight?: number; reasons?: string[] }>(
     `/api/v1/projects/${projectId}/runs/${runId}/approve`
   );
+
+export interface GeneratePipelineResult {
+  pipeline_yaml: string;
+  summary_of_changes: string;
+  valid: boolean;
+}
+
+/**
+ * Natural-language pipeline authoring — returns a CANDIDATE YAML only.
+ * Never auto-saved: the caller must still populate the Policy & Gates
+ * editor and go through the existing savePolicy() flow for a human to
+ * actually commit it.
+ */
+export const generatePipelineFromPrompt = (projectId: string, prompt: string) =>
+  apiClient.post<GeneratePipelineResult>(`/api/v1/projects/${projectId}/pipeline/generate`, { prompt });
+
+export interface StageFailureAnalysis {
+  likely_cause: string;
+  evidence: string[];
+  suggested_fix: string;
+}
+
+export const getRunFailureAnalysis = (projectId: string, runId: string) =>
+  apiClient.get<{ failure_analysis: StageFailureAnalysis | null }>(
+    `/api/v1/projects/${projectId}/runs/${runId}/failure-analysis`
+  );

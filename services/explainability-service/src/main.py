@@ -25,7 +25,9 @@ from src.db import get_db
 from src.decision_report import build_decision_report
 from src.digest_generator import generate_delivery_health_digest
 from src.health_router import router as health_router
+from src.pipeline_generator import PipelineGenerationError, generate_pipeline_yaml
 from src.report_generator import generate_rca
+from src.stage_failure_analyzer import generate_stage_failure_rca
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +75,41 @@ async def post_decision_report(body: dict):
     except KeyError as e:
         raise HTTPException(status_code=422, detail=f"Missing field: {e}")
     return report.to_dict()
+
+
+@app.post("/generate-pipeline")
+async def post_generate_pipeline(body: dict):
+    """
+    body: {"prompt": str, "current_yaml": str, "context": dict, "validation_error": str | None}
+    Never auto-applies anything — the caller (api-gateway) is responsible for
+    validating the result against pipeline-worker's real validator before it
+    ever reaches a human's screen for review.
+    """
+    try:
+        return await generate_pipeline_yaml(
+            prompt=body["prompt"],
+            current_yaml=body["current_yaml"],
+            context=body.get("context", {}),
+            validation_error=body.get("validation_error"),
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing field: {e}")
+    except PipelineGenerationError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/stage-failure-rca")
+async def post_stage_failure_rca(body: dict):
+    """body: {"run_id": str, "failed_stage": str, "error_message": str, "recent_logs": list[str]}"""
+    try:
+        return await generate_stage_failure_rca(
+            run_id=body["run_id"],
+            failed_stage=body["failed_stage"],
+            error_message=body["error_message"],
+            recent_logs=body.get("recent_logs", []),
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing field: {e}")
 
 
 @app.get("/digest/{tenant_id}")
