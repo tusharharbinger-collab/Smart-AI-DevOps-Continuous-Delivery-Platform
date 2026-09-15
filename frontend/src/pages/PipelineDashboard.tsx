@@ -4,9 +4,9 @@
  * WebSocket (usePipelineEvents) drives structured stage/traffic-weight state;
  * SSE (useLiveLogs) drives the raw build/test/deploy log stream.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { AlertTriangle, Pause, Play, X, Terminal, Radio } from "lucide-react";
+import { AlertTriangle, Pause, Play, X, Terminal, Radio, Lightbulb } from "lucide-react";
 import { usePipelineEvents } from "@/hooks/usePipelineEvents";
 import { useLiveLogs } from "@/hooks/useLiveLogs";
 import { useAppContext } from "@/hooks/useAppContext";
@@ -22,6 +22,7 @@ import {
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { pausePipeline, resumePipeline, triggerRollback } from "@/api/pipeline";
+import { getRunFailureAnalysis, type StageFailureAnalysis } from "@/api/projects";
 
 // Matches worker.py's `_log(run_id, f"--- Stage: {stage_name} ({stage_type}) ---")`
 // marker convention — the only structure the raw log stream carries today,
@@ -38,11 +39,25 @@ function filterLogsForStage(logLines: string[], selectedStage: string | null): s
 }
 
 export function PipelineDashboard() {
-  const { pipelineRunId, hideRunControls } = useAppContext();
+  const { pipelineRunId, hideRunControls, projectId } = useAppContext();
   const { stages, currentStage, trafficWeight, status, weightHistory } = usePipelineEvents(pipelineRunId);
   const { logLines } = useLiveLogs(pipelineRunId);
   const [selectedStage, setSelectedStage] = useState<string | null>(null);
   const visibleLogLines = useMemo(() => filterLogsForStage(logLines, selectedStage), [logLines, selectedStage]);
+  const [failureAnalysis, setFailureAnalysis] = useState<StageFailureAnalysis | null>(null);
+
+  // Grounded stage-failure RCA (see worker.py::_request_stage_failure_rca) —
+  // fetched only once a run has actually failed, matching how the rest of
+  // this screen treats FAILED as a terminal state to react to.
+  useEffect(() => {
+    if (status !== "FAILED" || !projectId || !pipelineRunId) {
+      setFailureAnalysis(null);
+      return;
+    }
+    getRunFailureAnalysis(projectId, pipelineRunId)
+      .then((res) => setFailureAnalysis(res.failure_analysis))
+      .catch(() => setFailureAnalysis(null));
+  }, [status, projectId, pipelineRunId]);
 
   if (!pipelineRunId) {
     return (
@@ -108,15 +123,29 @@ export function PipelineDashboard() {
           <span className="text-code text-[11px] text-muted-foreground">{pipelineRunId.slice(0, 8)}…</span>
         </div>
         <div className={`flex items-center gap-2 ${hideRunControls ? "hidden" : ""}`}>
-          <Button variant="outline" size="sm" onClick={handlePause}>
+          {/* Real gap found live (2026-09-15): these buttons used to render
+              enabled regardless of the run's actual status — clicking
+              Resume on an already-FAILED run used to silently fake a
+              "RUNNING" display with zero real work behind it (see
+              actuation_router.py's `_set_status` fix). The backend now
+              correctly rejects an invalid transition with a 409, but the
+              button itself still invited the click. Disabled state here
+              mirrors the backend's own required-current-status rule
+              exactly — pause only from RUNNING, resume only from PAUSED,
+              rollback never on an already-terminal run. */}
+          <Button variant="outline" size="sm" onClick={handlePause} disabled={status !== "RUNNING"}>
             <Pause className="h-3.5 w-3.5" /> Pause
           </Button>
-          <Button variant="outline" size="sm" onClick={handleResume}>
+          <Button variant="outline" size="sm" onClick={handleResume} disabled={status !== "PAUSED"}>
             <Play className="h-3.5 w-3.5" /> Resume
           </Button>
           <AlertDialog>
             <AlertDialogTrigger asChild>
-              <Button variant="destructive" size="sm">
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={status === "FAILED" || status === "COMPLETED" || status === "ROLLED_BACK"}
+              >
                 <AlertTriangle className="h-3.5 w-3.5" /> Emergency Rollback
               </Button>
             </AlertDialogTrigger>
@@ -188,6 +217,30 @@ export function PipelineDashboard() {
           </CardContent>
         </Card>
       </div>
+
+      {failureAnalysis && (
+        <Card className="border-destructive/40">
+          <CardHeader className="border-b bg-destructive/5">
+            <CardTitle className="flex items-center gap-1.5 text-destructive">
+              <Lightbulb className="h-3.5 w-3.5" />
+              Why this run failed
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 pt-4 text-sm">
+            <p>{failureAnalysis.likely_cause}</p>
+            {failureAnalysis.evidence.length > 0 && (
+              <ul className="space-y-1 text-code text-xs">
+                {failureAnalysis.evidence.map((line, i) => (
+                  <li key={i} className="rounded bg-muted px-2 py-1">{line}</li>
+                ))}
+              </ul>
+            )}
+            <p className="text-muted-foreground">
+              <strong className="text-foreground">Suggested fix:</strong> {failureAnalysis.suggested_fix}
+            </p>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }
