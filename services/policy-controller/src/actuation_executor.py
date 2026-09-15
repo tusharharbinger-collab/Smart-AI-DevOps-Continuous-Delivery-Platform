@@ -9,6 +9,7 @@ Uses JSON PATCH (RFC 6902) on Gateway API HTTPRoute resource.
 from kubernetes import client, config as k8s_config
 from kubernetes.client.rest import ApiException
 import structlog
+from shared import eks_auth
 from src.audit_writer import record_actuation
 
 logger = structlog.get_logger(__name__)
@@ -27,6 +28,10 @@ DEFAULT_BASELINE_DEPLOYMENT = "payment-service-baseline"
 
 
 def _load_kube():
+    eks_kube_config = eks_auth.get_eks_kube_client_config()
+    if eks_kube_config:
+        k8s_config.load_kube_config_from_dict(eks_kube_config)
+        return
     try:
         k8s_config.load_incluster_config()
     except Exception:

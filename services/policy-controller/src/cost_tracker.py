@@ -32,6 +32,7 @@ import os
 import structlog
 from kubernetes import client as k8s_client, config as k8s_config
 from kubernetes.client.rest import ApiException
+from shared import eks_auth
 
 logger = structlog.get_logger(__name__)
 
@@ -40,6 +41,10 @@ MEM_COST_PER_GIB_HOUR = float(os.environ.get("MEM_COST_PER_GIB_HOUR", "0.0042"))
 
 
 def _load_kube():
+    eks_kube_config = eks_auth.get_eks_kube_client_config()
+    if eks_kube_config:
+        k8s_config.load_kube_config_from_dict(eks_kube_config)
+        return
     try:
         k8s_config.load_incluster_config()
     except Exception:
