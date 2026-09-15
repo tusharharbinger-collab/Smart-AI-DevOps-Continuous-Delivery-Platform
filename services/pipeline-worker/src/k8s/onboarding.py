@@ -16,6 +16,7 @@ import structlog
 from kubernetes import client, config as k8s_config
 from kubernetes.client.rest import ApiException
 
+from shared import eks_auth
 from src.k8s.manifest_generator import ServiceOnboardingSpec, generate_manifests, generate_pipeline_yaml
 
 logger = structlog.get_logger(__name__)
@@ -26,6 +27,10 @@ PLURAL = "httproutes"
 
 
 def _load_kube():
+    eks_kube_config = eks_auth.get_eks_kube_client_config()
+    if eks_kube_config:
+        k8s_config.load_kube_config_from_dict(eks_kube_config)
+        return
     try:
         k8s_config.load_incluster_config()
     except Exception:

@@ -249,6 +249,13 @@ services:
       # credential the worker itself holds. See the private-repo note in
       # docs/roadmap/08-project-workspaces.md.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # EKS actuation target (optional) — see shared/eks_auth.py. Blank
+      # EKS_CLUSTER_NAME keeps every _load_kube() call on today's local/Kind
+      # path unchanged.
+      EKS_CLUSTER_NAME: ${EKS_CLUSTER_NAME:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     ports:
       - "8001:8001"
     depends_on:
@@ -267,6 +274,14 @@ services:
       - ./shared:/app/shared:ro
       - ./services/pipeline-worker/src:/app/src:ro
       - ./pipelines:/app/pipelines:ro
+      # Real bug found live (while running the legacy demo pipeline's build
+      # stage for the first time — it always skipped straight to
+      # progressive_verify before, per build_task.py's own docstring): its
+      # dockerfilePath ("sample-app/v1.1.0/Dockerfile") resolves relative to
+      # this container's /app, but services/sample-app was never mounted
+      # here at all, so `docker build` always failed with "You must specify
+      # a directory to build in path" the first time this stage actually ran.
+      - ./services/sample-app:/app/sample-app:ro
       - ./k8s/generated/incluster-kubeconfig.yaml:/home/worker/.kube/config:ro
       # Real bug found live: build_task.py's `docker build` subprocess and
       # preflight.py's `docker image inspect` both assume a reachable Docker
@@ -318,6 +333,10 @@ services:
       OPA_URL: http://opa:8181
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       KUBECONFIG: /home/controller/.kube/config
+      EKS_CLUSTER_NAME: ${EKS_CLUSTER_NAME:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -347,6 +366,14 @@ services:
       SERVICE_NAME: explainability-service
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      # Real gap found live: this dev machine's corporate network runs all
+      # egress through a Netskope TLS-inspecting proxy — outbound HTTPS to
+      # api.groq.com (a public SaaS API, unlike the container-to-container
+      # calls this service otherwise makes) fails cert verification against
+      # the default bundle since Netskope re-signs traffic with its own CA.
+      # shared/combined-ca-bundle.pem is certifi's bundle + that CA appended.
+      SSL_CERT_FILE: /app/shared/combined-ca-bundle.pem
+      REQUESTS_CA_BUNDLE: /app/shared/combined-ca-bundle.pem
     ports:
       - "8004:8004"
     depends_on:

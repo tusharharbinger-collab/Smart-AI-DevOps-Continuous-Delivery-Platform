@@ -30,10 +30,16 @@ async def readyz(request: Request):
 
     try:
         from kubernetes import client, config as k8s_config
-        try:
-            k8s_config.load_incluster_config()
-        except Exception:
-            k8s_config.load_kube_config()
+        from shared import eks_auth
+
+        eks_kube_config = eks_auth.get_eks_kube_client_config()
+        if eks_kube_config:
+            k8s_config.load_kube_config_from_dict(eks_kube_config)
+        else:
+            try:
+                k8s_config.load_incluster_config()
+            except Exception:
+                k8s_config.load_kube_config()
         client.VersionApi().get_code()
         checks["kubernetes"] = "ok"
     except Exception as e:

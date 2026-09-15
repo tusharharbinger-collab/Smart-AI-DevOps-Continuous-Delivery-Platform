@@ -135,6 +135,60 @@ deploy-sample-app:
 connect-kind-network:
 	@bash scripts/setup/connect_kind_network.sh
 
+# ─────────────────────────────────────────────────────────────────
+# EKS Cluster (real AWS actuation target)
+# ─────────────────────────────────────────────────────────────────
+.PHONY: eks-up
+eks-up:
+	@echo "☁️  Creating EKS cluster (this bills your AWS account and takes ~15-20 min)..."
+	eksctl create cluster -f k8s/eks-config.yaml
+
+.PHONY: eks-down
+eks-down:
+	@echo "☁️  Deleting EKS cluster — run this between sessions to stop billing..."
+	eksctl delete cluster -f k8s/eks-config.yaml
+
+.PHONY: ecr-up
+ecr-up:
+	@echo "📦 Creating ECR repository (idempotent)..."
+	@python -c "import boto3; c = boto3.client('ecr', region_name='us-east-1'); \
+	c.create_repository(repositoryName='payments')" 2>/dev/null || echo "Repository already exists."
+
+.PHONY: install-envoy-eks
+install-envoy-eks:
+	@echo "📦 Installing Envoy Gateway v1.9.1 + Gateway API CRDs on EKS..."
+	kubectl apply --context $$(kubectl config current-context) \
+		-f https://github.com/envoyproxy/gateway/releases/download/v1.9.1/install.yaml
+	kubectl create namespace production 2>/dev/null || true
+	@echo "⏳ Waiting for Envoy Gateway pods..."
+	kubectl wait --namespace envoy-gateway-system \
+		--for=condition=ready pod \
+		--selector=app.kubernetes.io/name=gateway \
+		--timeout=180s || true
+
+.PHONY: deploy-sample-app-eks
+deploy-sample-app-eks:
+	@echo "🐳 Building and pushing sample-app images to ECR..."
+	@python -c "import boto3; c = boto3.client('ecr', region_name='us-east-1'); \
+	print(c.get_authorization_token()['authorizationData'][0]['authorizationToken'])" \
+	| python -c "import sys, base64; print(base64.b64decode(sys.stdin.read()).decode().split(':', 1)[1])" \
+	| docker login --username AWS --password-stdin 236087863083.dkr.ecr.us-east-1.amazonaws.com
+	docker build -t 236087863083.dkr.ecr.us-east-1.amazonaws.com/payments:v1.0.0 services/sample-app/v1.0.0
+	docker build -t 236087863083.dkr.ecr.us-east-1.amazonaws.com/payments:v1.1.0 services/sample-app/v1.1.0
+	docker push 236087863083.dkr.ecr.us-east-1.amazonaws.com/payments:v1.0.0
+	docker push 236087863083.dkr.ecr.us-east-1.amazonaws.com/payments:v1.1.0
+	@echo "☸️  Applying gateway + baseline/canary manifests to EKS..."
+	kubectl create namespace production 2>/dev/null || true
+	kubectl apply -f k8s/gateway/gateway-class.yaml
+	kubectl apply -f k8s/gateway/httproute-payments.yaml
+	kubectl apply -f k8s/eks/payments-service/baseline-deployment.yaml
+	kubectl apply -f k8s/eks/payments-service/canary-deployment.yaml
+	@echo "✅  Deployed to EKS. Traffic starts at 100% baseline / 0% canary."
+
+.PHONY: connect-eks
+connect-eks:
+	@bash scripts/setup/connect_eks.sh
+
 .PHONY: verify-network-boundary
 verify-network-boundary:
 	@bash scripts/setup/verify_network_boundary.sh

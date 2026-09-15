@@ -1,0 +1,27 @@
+# k8s/eks-config.yaml
+# Real AWS EKS cluster — replaces the local Kind cluster (k8s/kind-config.yaml)
+# as the actuation target. Lean single-node/single-AZ profile to keep this
+# inside a short evaluation window's AWS credit: one t3.medium node, no
+# extra NAT gateways beyond what eksctl's default VPC needs.
+#
+# Create:  eksctl create cluster -f k8s/eks-config.yaml
+# Delete:  eksctl delete cluster -f k8s/eks-config.yaml   (run this between
+#          work sessions — this is the actual cost-control lever, an idle
+#          cluster still bills for the control plane + node continuously)
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: smartcd-eks
+  region: us-east-1
+  version: "1.31"
+
+managedNodeGroups:
+  - name: smartcd-workers
+    instanceType: t3.medium
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 2
+    volumeSize: 20
+    labels:
+      tier: worker
