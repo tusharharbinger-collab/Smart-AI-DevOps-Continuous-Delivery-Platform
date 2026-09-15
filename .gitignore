@@ -5,6 +5,16 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.venv-test/
+
+# Machine-specific corporate TLS-interception CA bundle, generated locally
+# by whoever's on a network that intercepts HTTPS — never a source file,
+# and irrelevant (often unusable) on any other machine.
+shared/netskope-ca.crt
+shared/combined-ca-bundle.pem
+
+# Reference PDF pulled in for background reading, not project source.
+*.pdf
 
 # Node
 node_modules/
