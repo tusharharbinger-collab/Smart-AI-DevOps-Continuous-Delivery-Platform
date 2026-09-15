@@ -47,6 +47,8 @@ from src.worker import PipelineOrchestrator
 from src.tasks.verification_task import run_verification_task
 from src.db import PipelineWorkerDB
 from src.pipeline.reconciler import reconcile_interrupted_pipelines
+from src.pipeline.manifest_loader import load_pipeline
+from src.schemas import PipelineValidationError
 from src.k8s.manifest_generator import ServiceOnboardingSpec
 from src.k8s.onboarding import onboard_service
 
@@ -321,6 +323,29 @@ async def start_pipeline_now(body: dict):
         trace_id=body.get("trace_id"),
     )
     return result
+
+
+@app.post("/pipelines/validate")
+async def validate_pipeline_yaml(body: dict):
+    """
+    body: {"policy_yaml": str}
+    The single source of truth for pipeline validity — other services (e.g.
+    api-gateway's AI-authoring endpoint) call this over HTTP rather than
+    duplicating or cross-importing schemas.py's safety-critical rules, so
+    there's exactly one place these guardrails can drift out of sync from.
+    Runs the exact same load_pipeline() a real triggered run goes through —
+    not a separate, weaker check.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as tmp:
+        tmp.write(body["policy_yaml"])
+        manifest_path = tmp.name
+    try:
+        load_pipeline(manifest_path)
+        return {"valid": True, "error": None}
+    except PipelineValidationError as e:
+        return {"valid": False, "error": str(e)}
+    except Exception as e:
+        return {"valid": False, "error": f"Malformed pipeline YAML: {e}"}
 
 
 @app.post("/pipelines/{run_id}/reverify")

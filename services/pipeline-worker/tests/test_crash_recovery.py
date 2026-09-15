@@ -76,9 +76,9 @@ spec:
         routeName: payment-service-route
         canaryDeployment: payment-service-canary
         steps:
-          - trafficWeight: 10
-            minDuration: 0s
-            minSampleSize: 0
+          - trafficWeight: 100
+            minDuration: 1s
+            minSampleSize: 1
 
   gates:
     blockedDeployWindows: []
