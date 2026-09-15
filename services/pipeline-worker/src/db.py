@@ -130,3 +130,30 @@ class PipelineWorkerDB:
         async with self._superuser_pool.acquire() as conn:
             row = await conn.fetchrow("SELECT policy_yaml FROM pipelines WHERE pipeline_id = $1", pipeline_id)
             return row["policy_yaml"] if row else None
+
+    async def is_first_deployment(self, pipeline_id: str, tenant_id: str) -> bool:
+        """
+        Real gap found live (2026-09-15): onboarding always assumed a
+        baseline version already existed to compare a canary against — a
+        project's genuinely first-ever deployment has nothing to compare
+        against, so canary_loop's statistical verification is a category
+        error for it (matches Argo Rollouts' own documented first-deployment
+        behavior: ship straight to 100%, skip analysis, until a real
+        previous-known-good version exists to protect). True until
+        `mark_first_deployment_completed` is called once for this pipeline.
+        """
+        async with self._app_pool.acquire() as conn:
+            await conn.execute("SELECT set_config('app.active_tenant_id', $1, true)", tenant_id)
+            row = await conn.fetchrow(
+                "SELECT first_deployment_completed_at FROM pipelines WHERE pipeline_id = $1", pipeline_id
+            )
+            return row is not None and row["first_deployment_completed_at"] is None
+
+    async def mark_first_deployment_completed(self, pipeline_id: str, tenant_id: str) -> None:
+        async with self._app_pool.acquire() as conn:
+            await conn.execute("SELECT set_config('app.active_tenant_id', $1, true)", tenant_id)
+            await conn.execute(
+                "UPDATE pipelines SET first_deployment_completed_at = NOW() "
+                "WHERE pipeline_id = $1 AND first_deployment_completed_at IS NULL",
+                pipeline_id,
+            )

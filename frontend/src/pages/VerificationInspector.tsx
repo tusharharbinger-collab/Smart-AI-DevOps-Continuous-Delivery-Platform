@@ -1,7 +1,7 @@
 /**
  * frontend/src/pages/VerificationInspector.tsx — Screen 2.
  */
-import { AlertCircle, Sparkles } from "lucide-react";
+import { AlertCircle, Rocket, Sparkles } from "lucide-react";
 import { useVerificationResult } from "@/hooks/useVerificationResult";
 import { usePipelineEvents } from "@/hooks/usePipelineEvents";
 import { useAppContext } from "@/hooks/useAppContext";
@@ -38,6 +38,30 @@ export function VerificationInspector() {
   }
   if (error) {
     if (error.status === 404) {
+      // Real gap found live (2026-09-15): a project's genuinely first-ever
+      // deployment intentionally never produces a verdict at all — there's
+      // no prior baseline to compare against yet, so canary_loop ships
+      // straight to 100% and skips statistical verification entirely (see
+      // worker.py). Before this, a run that had actually COMPLETED
+      // successfully showed the exact same "hasn't completed (or hasn't
+      // started)" message as one still genuinely in progress — confusing
+      // for the one case where "no verdict" is the CORRECT, expected
+      // outcome rather than something still pending.
+      if (pipelineStatus === "COMPLETED") {
+        return (
+          <Card className="mx-auto mt-8 max-w-lg text-center">
+            <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
+              <Rocket className="h-8 w-8 text-muted-foreground/60" />
+              <p className="font-medium text-foreground">First deployment — no comparison to run yet</p>
+              <p>
+                This was the project's first-ever deployment, so there was no prior baseline version to compare
+                it against. It shipped directly to 100% traffic with no canary step. Future deployments will run
+                the full statistical verification and progressive traffic ramp.
+              </p>
+            </CardContent>
+          </Card>
+        );
+      }
       return (
         <Card className="mx-auto mt-8 max-w-lg text-center">
           <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">

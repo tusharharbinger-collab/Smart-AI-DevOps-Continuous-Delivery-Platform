@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS pipelines (
     name         TEXT        NOT NULL,
     policy_yaml  TEXT        NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- NULL until this pipeline's canary_deploy stage has genuinely
+    -- succeeded once. A project's very first-ever deployment has no prior
+    -- version to compare against, so it skips canary_loop's statistical
+    -- verification and ships straight to 100% on both baseline and
+    -- canary (matches Argo Rollouts' documented first-deployment
+    -- behavior) — see migration 0010.
+    first_deployment_completed_at TIMESTAMPTZ,
     UNIQUE (tenant_id, name)
 );
 
