@@ -11,6 +11,7 @@ import os
 import json
 import asyncio
 import socket
+from datetime import datetime, timezone
 import redis.asyncio as aioredis
 import structlog
 
@@ -29,6 +30,7 @@ from src.actuation_executor import (
 from src.alert_dispatcher import send_alert, alert_rollback, alert_verification_timeout, alert_approval_required
 from src.rca_trigger import trigger_rca_async
 from src.cost_tracker import compute_and_record_cost
+from src.audit_writer import record_actuation
 from src import rollout_scheduler
 
 logger = structlog.get_logger(__name__)
@@ -54,6 +56,28 @@ def _extract_sample_counts(verdict: dict, policy: dict) -> tuple[int, int]:
         collected += (metric_result.get("mann_whitney") or {}).get("n_canary", 0) or 0
     required = policy.get("guardrails", {}).get("minSampleSize", 100)
     return collected, required
+
+
+def _current_freeze_window_context() -> dict:
+    """
+    Real bug found live (2026-09-15): `runtime_context` was hardcoded to
+    `{"cluster_maintenance_lock": False}` at BOTH real call sites — nothing
+    ever supplied `current_day`/`current_time`, the two fields Rule 3
+    (`is_deploy_window_blocked` in policies/delivery_guardrails.rego)
+    actually reads. The rule itself is correct and has its own passing OPA
+    unit tests (with a fully-populated fake context), which is exactly why
+    this was invisible: the RULE worked, the CALLER just never gave it real
+    data, so `blockedDeployWindows` — a required assignment feature — has
+    never actually blocked a single real promotion, for any pipeline, ever.
+    Days spelled out in full (`"Friday"`) and time zero-padded 24h `"HH:MM"`
+    to match the exact string format a pipeline's own YAML declares (see
+    generate_project_pipeline_yaml's `blockedDeployWindows` example).
+    Always UTC — no pipeline YAML's `timezone` field is read anywhere else
+    in this codebase either, so treating every declared window as UTC is
+    at least consistent, not a new inconsistency.
+    """
+    now = datetime.now(timezone.utc)
+    return {"current_day": now.strftime("%A"), "current_time": now.strftime("%H:%M")}
 
 
 def _build_promotion_opa_input(
@@ -266,7 +290,7 @@ async def handle_incoming_verdict(
         "requested_action": "ROLLBACK" if verdict.get("status") == "FAILED" else "PROMOTE_STEP",
         "verification_verdict": verdict,
         "pipeline_policy": policy,
-        "runtime_context": {"cluster_maintenance_lock": False},
+        "runtime_context": {"cluster_maintenance_lock": False, **_current_freeze_window_context()},
         **promotion_fields,
     }
 
@@ -332,6 +356,29 @@ async def handle_incoming_verdict(
                 "promotion_awaiting_approval", pipeline_run_id=pipeline_run_id, stage=opa_input["target_stage"]
             )
             return
+
+        # Real gap found live: a DEGRADED verdict (or any other verdict OPA
+        # declines to promote for a real policy reason — a freeze window, a
+        # cost-delta breach) fell straight through to the generic alert
+        # below with NOTHING durable recorded anywhere: no audit_ledger row
+        # (record_actuation was only ever called from the ROLLBACK/
+        # PROMOTE_STEP branches), and no RCA (trigger_rca_async, same
+        # story) — so the run just sat at its current weight forever with
+        # an empty Audit Ledger tab and a Verification Inspector stuck on
+        # "Generating explanation..." with nothing behind it ever going to
+        # arrive. A blocked promotion is exactly the kind of decision a SOC 2
+        # audit trail and a human-readable explanation matter most for.
+        await record_actuation(
+            pipeline_run_id,
+            action="BLOCK",  # audit_ledger.action CHECK constraint allows 'BLOCK', not 'BLOCKED'
+            authorized_by="OPA:promotion_denied",
+            verdict=verdict.get("status"),
+            confidence=verdict.get("confidence"),
+            policy_rule=str(opa_result.get("rejection_reasons")),
+            tenant_id=target.get("tenant_id"),
+            db=db,
+        )
+        await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="BLOCKED")
         await send_alert("BLOCKED", f"Action blocked: {opa_result.get('rejection_reasons')}")
         return
 
@@ -471,7 +518,7 @@ async def handle_approval(
         "requested_action": "PROMOTE_STEP",
         "verification_verdict": verdict,
         "pipeline_policy": policy,
-        "runtime_context": {"cluster_maintenance_lock": False},
+        "runtime_context": {"cluster_maintenance_lock": False, **_current_freeze_window_context()},
         **promotion_fields,
     }
     opa_result = await evaluate_policy_async(opa_input)

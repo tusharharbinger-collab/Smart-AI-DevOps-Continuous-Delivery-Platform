@@ -84,6 +84,31 @@ cost_delta_exceeds_limit {
 }
 
 # =====================================================================
+# RULE 9: First-Deployment Authorization
+# A project's genuinely first-ever deployment has no prior baseline to
+# compare against, so PROMOTE_STEP's statistical gates (confidence, sample
+# size, verdict freshness) are a category error for it — see worker.py's
+# canary_loop first-deployment branch. The ONE guardrail that still
+# meaningfully applies even with zero statistical evidence is the freeze
+# window: you don't want a first deployment auto-promoting during a
+# declared no-deploy window any more than a normal one. Deliberately its
+# own requested_action rather than overloading PROMOTE_STEP, so this rule
+# can never accidentally authorize a real canary promotion that skipped
+# its actual evidence requirements.
+# =====================================================================
+allow_action {
+    input.requested_action == "FIRST_DEPLOYMENT"
+    not is_deploy_window_blocked
+    not is_emergency_freeze_active
+}
+
+rejection_reasons[reason] {
+    input.requested_action == "FIRST_DEPLOYMENT"
+    is_deploy_window_blocked
+    reason := "Current timestamp falls within an enterprise-blocked deployment window"
+}
+
+# =====================================================================
 # RULE 8: Autonomous Right-Sizing Application Gate
 # (§6d / §10.3 — right-sizing recommendations NEVER auto-apply; this
 # rule only ever fires for a distinct, explicitly-approved action type)
