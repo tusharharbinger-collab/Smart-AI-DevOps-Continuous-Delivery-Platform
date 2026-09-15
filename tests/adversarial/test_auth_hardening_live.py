@@ -57,6 +57,25 @@ def test_developer_role_cannot_pause_a_pipeline():
     assert resp.status_code == 403, f"expected 403, got {resp.status_code}: {resp.text}"
 
 
+def test_developer_role_cannot_generate_a_pipeline_via_ai():
+    """
+    The AI pipeline-authoring endpoint is gated the same as any other
+    policy-mutating action (require_role("lead-sre")) — a `developer` must
+    get 403, not reach the handler (which would 404 on the made-up project
+    id, proving the gate didn't fire, if RBAC were bypassed).
+    """
+    session = _login("demo@other-corp.test", "other-demo-2026")
+    assert session["role"] == "developer"
+
+    resp = httpx.post(
+        f"{API_BASE_URL}/api/v1/projects/{uuid.uuid4()}/pipeline/generate",
+        headers={"Authorization": f"Bearer {session['access_token']}"},
+        json={"prompt": "add a 15% canary step"},
+        timeout=5.0,
+    )
+    assert resp.status_code == 403, f"expected 403, got {resp.status_code}: {resp.text}"
+
+
 def test_developer_role_cannot_register_a_new_service():
     session = _login("demo@other-corp.test", "other-demo-2026")
     resp = httpx.post(
