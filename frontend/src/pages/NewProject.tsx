@@ -46,6 +46,19 @@ const TRAFFIC_PRESET = [10, 25, 50, 100];
 
 type SourceTab = "provider" | "public" | "image";
 
+// Real bug found live: a GitHub repo named "test-" (trailing hyphen)
+// produced the auto-suggested container_image "registry.internal/test-" —
+// already lowercase, so it passed the casing check, but Docker repository
+// name components must also START and END with an alphanumeric character.
+// `docker build -t` rejected it as "invalid reference format" deep inside
+// the build stage instead of at onboarding time. Lowercasing alone (the
+// original fix for the "RaktDoot" bug) isn't enough — strip any leading/
+// trailing non-alphanumeric characters too, matching the same rule
+// projects_router.py now validates server-side.
+function dockerSafeName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "") || "app";
+}
+
 export function NewProject() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -219,7 +232,7 @@ export function NewProject() {
       // Docker repository names must be lowercase (real bug found live:
       // a GitHub repo named "RaktDoot" produced "registry.internal/RaktDoot",
       // which `docker build -t` rejects outright as an invalid reference).
-      container_image: f.container_image || `registry.internal/${repo.name.toLowerCase()}`,
+      container_image: f.container_image || `registry.internal/${dockerSafeName(repo.name)}`,
     }));
     const parsed = parseRepoUrl(repo.clone_url);
     if (parsed) {
@@ -238,7 +251,7 @@ export function NewProject() {
     setForm((f) => ({
       ...f,
       name: f.name || parsed?.repo || "",
-      container_image: f.container_image || (parsed ? `registry.internal/${parsed.repo.toLowerCase()}` : ""),
+      container_image: f.container_image || (parsed ? `registry.internal/${dockerSafeName(parsed.repo)}` : ""),
     }));
     setBranches([]);
   }

@@ -41,6 +41,7 @@ logger = structlog.get_logger(__name__)
 STREAM_PIPELINE_START = "stream:pipeline:start"
 PIPELINE_WORKER_URL = os.environ.get("PIPELINE_WORKER_URL", "http://pipeline-worker:8001")
 POLICY_CONTROLLER_URL = os.environ.get("POLICY_CONTROLLER_URL", "http://policy-controller:8003")
+EXPLAINABILITY_SERVICE_URL = os.environ.get("EXPLAINABILITY_SERVICE_URL", "http://explainability-service:8004")
 LOG_POLL_INTERVAL_SECONDS = 0.5
 
 # The three user-facing stages a project's workspace shows as a stepper.
@@ -107,6 +108,10 @@ class TriggerRolloutRequest(BaseModel):
     commit_message: str | None = None
     target_version: str | None = None
     trigger_type: str = "MANUAL_UI"
+
+
+class GeneratePipelineRequest(BaseModel):
+    prompt: str
 
 
 # ─────────────────────────── helpers ───────────────────────────
@@ -179,6 +184,7 @@ def generate_project_pipeline_yaml(body: CreateProjectRequest, tenant_id: str, n
 
     prefix = _metric_prefix(body.name)
     k8s_name = _k8s_name(body.name)
+    canary_tag = body.canary_tag or "v1.1.0"
 
     build_and_test_stages = ""
     if body.source_type != "existing_image":
@@ -186,7 +192,6 @@ def generate_project_pipeline_yaml(body: CreateProjectRequest, tenant_id: str, n
             body.root_directory.strip("./") or "", body.dockerfile_path
         ).replace("\\", "/").lstrip("/")
         test_command = body.test_command or "echo 'no test command configured'"
-        canary_tag = body.canary_tag or "v1.1.0"
         # Only a private repo names a credentials env var. git_clone.py hard-fails
         # if a pipeline names one that is unset, so emitting this for a public
         # repo would break its build for no reason.
@@ -218,6 +223,30 @@ def generate_project_pipeline_yaml(body: CreateProjectRequest, tenant_id: str, n
 
 """
 
+    # Real bug found live: this generator never emitted a `deploy` stage at
+    # all — a project's build stage would build and PUSH a real image to its
+    # real registry, but `canary_loop` (below) only shifts HTTPRoute traffic
+    # weight and runs verification; it never touches a Deployment's image
+    # (see worker.py). So the canary Deployment onboarding created just sat
+    # on whatever placeholder image it was given at onboarding time,
+    # forever — every wizard-onboarded project's rollout could report
+    # COMPLETED while the actual pods never ran the new code (or, if the
+    # onboarding-time image was invalid, never ran at all). `image` here
+    # (as opposed to the legacy hand-wired payments-service deploy stage,
+    # which has none) is what tells worker.py to patch THIS project's real
+    # onboarded Deployment via deploy_project_canary_task instead of the
+    # payments-specific hardcoded path.
+    deploy_stage = f"""    - name: canary_deploy
+      type: deploy
+      config:
+        deployment: {k8s_name}-canary
+        namespace: {namespace}
+        containerName: {k8s_name}
+        image: {body.container_image}
+        imageTag: {canary_tag}
+
+"""
+
     return f"""apiVersion: delivery.devops.ai/v1alpha1
 kind: Pipeline
 metadata:
@@ -227,7 +256,7 @@ metadata:
 
 spec:
   stages:
-{build_and_test_stages}    - name: canary_verify
+{build_and_test_stages}{deploy_stage}    - name: canary_verify
       type: canary_loop
       config:
         gatewayRef: local-edge-gateway
@@ -500,6 +529,26 @@ async def create_project(
             ),
         )
 
+    # Real bug found live: a GitHub repo named "test-" (trailing hyphen)
+    # defaulted to container_image "registry.internal/test-" — that's
+    # already all-lowercase, so it sailed past the check above, but Docker
+    # repository name components must also START and END with an
+    # alphanumeric character (a lone trailing/leading `-`, `.`, or `_` is
+    # invalid). That's exactly the "invalid reference format" the build
+    # stage failed on, deep inside `docker build -t`, instead of a clear
+    # 422 at onboarding time — same category of bug as the casing check
+    # above, just a different Docker naming rule.
+    if body.container_image:
+        for segment in body.container_image.split("/"):
+            if segment and not re.match(r"^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$", segment):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"container_image '{body.container_image}' is not a valid Docker reference: "
+                        f"segment '{segment}' must start and end with a lowercase alphanumeric character."
+                    ),
+                )
+
     tenant_id = _get_tenant_id(request)
     namespace = f"tenant-{tenant_id.split('-')[0]}"
     policy_yaml = generate_project_pipeline_yaml(body, tenant_id, namespace)
@@ -770,6 +819,105 @@ async def trigger_project_rollout(
         trigger_type=body.trigger_type,
     )
     return {"pipeline_run_id": run_id, "project_id": project_id, "status": "PENDING"}
+
+
+@router.post("/{project_id}/pipeline/generate", dependencies=[Depends(require_role("lead-sre"))])
+async def generate_pipeline_via_ai(
+    project_id: str,
+    body: GeneratePipelineRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_request_db),
+):
+    """
+    Natural-language pipeline authoring — never auto-applies anything. The
+    candidate YAML this returns must be reviewed and explicitly saved via
+    the existing POST /api/v1/policy (policy_router.py) the same as any
+    hand-edit; this endpoint has no path to commit a change unsupervised.
+    Every candidate is validated against pipeline-worker's real
+    /pipelines/validate (the exact rules a hand-authored pipeline must
+    already pass) before it's ever returned — with one retry, feeding the
+    validator's own error back to the model, before giving up with a clear
+    error rather than silently handing back something invalid.
+    """
+    tenant_id = _get_tenant_id(request)
+    project = await _load_project(db, project_id, tenant_id)
+    if not project.get("pipeline_id"):
+        raise HTTPException(status_code=409, detail="Project has no linked pipeline to edit")
+
+    pipeline_row = await db.execute(
+        text("SELECT policy_yaml FROM pipelines WHERE pipeline_id = :pid AND tenant_id = :tid"),
+        {"pid": str(project["pipeline_id"]), "tid": tenant_id},
+    )
+    pipeline = pipeline_row.mappings().first()
+    if pipeline is None:
+        raise HTTPException(status_code=404, detail="Linked pipeline not found")
+
+    context = {"project_name": project.get("name"), "service_name": _k8s_name(project.get("name", ""))}
+    validation_error: str | None = None
+    candidate_yaml = pipeline["policy_yaml"]
+    summary_of_changes = ""
+
+    # Two attempts total: the model's first try, then one retry with the
+    # real validator error fed back — never a third silent attempt.
+    for attempt in range(2):
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            try:
+                gen_resp = await client.post(
+                    f"{EXPLAINABILITY_SERVICE_URL}/generate-pipeline",
+                    json={
+                        "prompt": body.prompt,
+                        "current_yaml": pipeline["policy_yaml"],
+                        "context": context,
+                        "validation_error": validation_error,
+                    },
+                )
+            except httpx.RequestError as e:
+                raise HTTPException(status_code=502, detail=f"AI pipeline generation unavailable: {e}")
+        if gen_resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"AI pipeline generation failed: {gen_resp.text}")
+
+        generated = gen_resp.json()
+        candidate_yaml = generated["pipeline_yaml"]
+        summary_of_changes = generated["summary_of_changes"]
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            val_resp = await client.post(
+                f"{PIPELINE_WORKER_URL}/pipelines/validate", json={"policy_yaml": candidate_yaml}
+            )
+        validation = val_resp.json()
+        if validation["valid"]:
+            logger.info("ai_pipeline_generated", project_id=project_id, attempt=attempt + 1)
+            return {"pipeline_yaml": candidate_yaml, "summary_of_changes": summary_of_changes, "valid": True}
+
+        validation_error = validation["error"]
+
+    logger.warning("ai_pipeline_generation_failed_validation", project_id=project_id, error=validation_error)
+    raise HTTPException(
+        status_code=422,
+        detail=f"AI-generated pipeline failed validation after retry: {validation_error}",
+    )
+
+
+@router.get("/{project_id}/runs/{run_id}/failure-analysis")
+async def get_run_failure_analysis(
+    project_id: str,
+    run_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_request_db),
+):
+    """
+    Reads the grounded stage-failure RCA pipeline-worker requested at
+    `failure_rca:{run_id}` (see worker.py::_request_stage_failure_rca) — a
+    plain Redis key, not a table, matching how `logs:{run_id}` already
+    works. Returns null (not 404) for a run that hasn't failed, or failed
+    before this feature existed, so the frontend can render "no analysis
+    available" instead of treating it as an error.
+    """
+    tenant_id = _get_tenant_id(request)
+    await _assert_run_belongs_to_project(db, run_id, project_id, tenant_id)
+
+    raw = await request.app.state.redis.get(f"failure_rca:{run_id}")
+    return {"failure_analysis": json.loads(raw) if raw else None}
 
 
 @router.get("/{project_id}/runs")

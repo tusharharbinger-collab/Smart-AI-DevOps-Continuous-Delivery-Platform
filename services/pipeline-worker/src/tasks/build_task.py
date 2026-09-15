@@ -86,6 +86,18 @@ def run_build_task(
     Neither runs when `image_name` is None (the legacy demo path), so that
     pipeline's reliance on `make deploy-sample-app`'s one-time manual load
     is completely unaffected.
+
+    Real bug found live (first time a real onboarded GitHub repo's pipeline
+    ever reached its own `test` stage, rather than the pre-seeded demo
+    pipelines whose test commands point at a path bind-mounted directly
+    into this container): this used to delete `cloned_workspace` in a
+    `finally` block before returning, and `run_test_task` had no way to run
+    inside it anyway (no `cwd` parameter) — so a repo-based project's test
+    command could never find the very files this stage just cloned and
+    built from; it silently ran against pipeline-worker's OWN `/app`
+    instead. The workspace is now returned in the result dict so the
+    caller (worker.py) can run the test stage inside it, and is cleaned up
+    once, at the end of the whole pipeline run, instead of immediately here.
     """
     logger.info("build_task_started", pipeline_run_id=pipeline_run_id, image_tag=image_tag, image_name=image_name)
     image_ref = f"{image_name}:{image_tag}" if image_name else f"localhost:5001/payments:{image_tag}"
@@ -135,24 +147,95 @@ def run_build_task(
             raise RuntimeError(f"Could not reach the local Docker daemon to build {image_ref}: {e}") from e
         finally:
             client.close()
-    finally:
+    except Exception:
         if cloned_workspace:
             cleanup_workspace(pipeline_run_id)
+        raise
 
     logger.info("build_task_completed", pipeline_run_id=pipeline_run_id)
-    return {"status": "success", "image": image_ref}
+    return {"status": "success", "image": image_ref, "workspace": cloned_workspace}
 
 
-def run_test_task(pipeline_run_id: str, test_command: str) -> dict:
+def _find_requirements_file(repo_dir: str) -> str | None:
+    """Shallowest `requirements.txt` under the clone wins — prefers repo-root
+    or near-root over one that happens to be vendored/nested deeper."""
+    import glob
+
+    matches = glob.glob(os.path.join(repo_dir, "**", "requirements.txt"), recursive=True)
+    if not matches:
+        return None
+    return min(matches, key=lambda p: p.count(os.sep))
+
+
+def _create_test_venv_python(pipeline_run_id: str, repo_dir: str, requirements_file: str) -> str:
     """
-    Executes unit test command for stage validation.
+    Real bug found live: the test stage used to run directly inside
+    pipeline-worker's OWN Python environment — it "worked" for the first
+    real repo ever onboarded only because that repo's requirements.txt
+    happened to pin the EXACT same fastapi/uvicorn/pytest/httpx versions
+    pipeline-worker already carries for itself. Any project with different
+    or conflicting dependencies (a different pytest version, Django,
+    pandas, anything pipeline-worker doesn't already have) would fail with
+    a ModuleNotFoundError or version clash that has nothing to do with the
+    project's actual tests. Creates a real per-run virtualenv and installs
+    the repo's OWN requirements.txt into it — the same test isolation
+    principle the build stage already gets for real via a Docker image.
     """
     import sys
+
+    venv_dir = os.path.join(repo_dir, ".pipeline-venv")
+    logger.info("test_venv_creating", pipeline_run_id=pipeline_run_id, requirements_file=requirements_file)
+    result = subprocess.run(
+        [sys.executable, "-m", "venv", venv_dir], capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create test virtualenv: {result.stderr}")
+
+    venv_python = os.path.join(venv_dir, "bin", "python") if os.name != "nt" else os.path.join(venv_dir, "Scripts", "python.exe")
+    result = subprocess.run(
+        [venv_python, "-m", "pip", "install", "-q", "-r", requirements_file],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to install {requirements_file} into test virtualenv: {result.stderr}")
+
+    logger.info("test_venv_ready", pipeline_run_id=pipeline_run_id)
+    return venv_python
+
+
+def run_test_task(pipeline_run_id: str, test_command: str, cwd: str | None = None) -> dict:
+    """
+    Executes unit test command for stage validation.
+
+    `cwd` (Phase 8 follow-up — real bug found live): a repo-based project's
+    test command references paths inside its OWN cloned repo (e.g.
+    `pytest test/tests/ -v`), not pipeline-worker's own `/app` — see
+    build_task.py's `run_build_task` docstring. worker.py passes the same
+    workspace directory the build stage just cloned/built from; `None` for
+    every pipeline with no `repoUrl` (including the seeded demo pipelines),
+    which keeps running relative to `/app` exactly as before.
+
+    When `cwd` is set and the clone carries its own `requirements.txt`,
+    tests run inside a fresh virtualenv built from THAT file, not
+    pipeline-worker's own environment — see `_create_test_venv_python`'s
+    docstring for the real gap this closes. Falls back to pipeline-worker's
+    own interpreter only when there's no requirements.txt to install (or no
+    `cwd` at all), matching prior behavior exactly for the legacy demo
+    pipelines.
+    """
+    import sys
+
+    python_bin = sys.executable
+    if cwd:
+        requirements_file = _find_requirements_file(cwd)
+        if requirements_file:
+            python_bin = _create_test_venv_python(pipeline_run_id, cwd, requirements_file)
+
     cmd_to_run = test_command
     if cmd_to_run.startswith("pytest"):
-        cmd_to_run = f'"{sys.executable}" -m ' + cmd_to_run
-    logger.info("test_task_started", pipeline_run_id=pipeline_run_id, command=cmd_to_run)
-    result = subprocess.run(cmd_to_run, shell=True, capture_output=True, text=True)
+        cmd_to_run = f'"{python_bin}" -m ' + cmd_to_run
+    logger.info("test_task_started", pipeline_run_id=pipeline_run_id, command=cmd_to_run, cwd=cwd)
+    result = subprocess.run(cmd_to_run, shell=True, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         logger.error("test_stage_failed", error=result.stderr, pipeline_run_id=pipeline_run_id)
         raise RuntimeError(f"Tests failed: {result.stderr or result.stdout}")
