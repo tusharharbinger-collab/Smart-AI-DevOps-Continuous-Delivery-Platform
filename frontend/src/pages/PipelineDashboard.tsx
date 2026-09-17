@@ -6,13 +6,12 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { AlertTriangle, Pause, Play, X, Terminal, Radio, Lightbulb } from "lucide-react";
+import { AlertTriangle, Check, Loader2, Pause, Play, Rocket, X, Terminal, Radio, Lightbulb } from "lucide-react";
 import { usePipelineEvents } from "@/hooks/usePipelineEvents";
 import { useLiveLogs } from "@/hooks/useLiveLogs";
 import { useAppContext } from "@/hooks/useAppContext";
-import { PipelineDAG } from "@/components/pipeline/PipelineDAG";
-import { TrafficGauge } from "@/components/pipeline/TrafficGauge";
-import { TrafficWeightChart } from "@/components/pipeline/TrafficWeightChart";
+import { StageTimeline } from "@/components/pipeline/StageTimeline";
+import { filterLogsForStage } from "@/lib/pipelineStageSteps";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,20 +23,6 @@ import {
 import { pausePipeline, resumePipeline, triggerRollback } from "@/api/pipeline";
 import { getRunFailureAnalysis, type StageFailureAnalysis } from "@/api/projects";
 
-// Matches worker.py's `_log(run_id, f"--- Stage: {stage_name} ({stage_type}) ---")`
-// marker convention — the only structure the raw log stream carries today,
-// used here purely client-side so filtering a stage's output needs no
-// backend change (the log lines themselves stay plain strings).
-const STAGE_MARKER_RE = /^--- Stage: (.+?) \(.+?\) ---$/;
-
-function filterLogsForStage(logLines: string[], selectedStage: string | null): string[] {
-  if (!selectedStage) return logLines;
-  const startIndex = logLines.findIndex((line) => STAGE_MARKER_RE.exec(line)?.[1] === selectedStage);
-  if (startIndex === -1) return [];
-  const endIndex = logLines.findIndex((line, i) => i > startIndex && STAGE_MARKER_RE.test(line));
-  return logLines.slice(startIndex, endIndex === -1 ? undefined : endIndex);
-}
-
 export function PipelineDashboard() {
   const { pipelineRunId, hideRunControls, projectId } = useAppContext();
   const { stages, currentStage, trafficWeight, status, weightHistory } = usePipelineEvents(pipelineRunId);
@@ -45,6 +30,22 @@ export function PipelineDashboard() {
   const [selectedStage, setSelectedStage] = useState<string | null>(null);
   const visibleLogLines = useMemo(() => filterLogsForStage(logLines, selectedStage), [logLines, selectedStage]);
   const [failureAnalysis, setFailureAnalysis] = useState<StageFailureAnalysis | null>(null);
+
+  // Real gap found live (2026-09-15): a project's first-ever deployment
+  // skips statistical verification entirely (worker.py's canary_loop
+  // first-deployment branch) and, once fixed, waits for a real liveness
+  // check before cutting traffic over — but nothing in the UI ever
+  // explained any of that. A user watching this screen had no way to tell
+  // "verification is being skipped on purpose" apart from reading raw log
+  // text. Reuses the same log-marker-parsing convention filterLogsForStage
+  // already established, rather than adding a new backend API surface for
+  // something the log stream already says in plain English.
+  const firstDeploymentPhase = useMemo<"none" | "skipping-verification" | "checking-liveness" | "healthy">(() => {
+    if (!logLines.some((l) => l.includes("First-ever deployment for this project"))) return "none";
+    if (logLines.some((l) => l.includes("Deployment is healthy — cutting over traffic"))) return "healthy";
+    if (logLines.some((l) => l.includes("Waiting for the new deployment to become healthy"))) return "checking-liveness";
+    return "skipping-verification";
+  }, [logLines]);
 
   // Grounded stage-failure RCA (see worker.py::_request_stage_failure_rca) —
   // fetched only once a run has actually failed, matching how the rest of
@@ -167,21 +168,55 @@ export function PipelineDashboard() {
         </div>
       </div>
 
+      {firstDeploymentPhase !== "none" && (
+        <div className="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/5 p-3 text-sm">
+          <Rocket className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+          <div>
+            <p className="font-medium">
+              First deployment for this service — no prior version exists to compare against yet.
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Statistical canary verification is intentionally skipped (there's no baseline to protect); this
+              ships straight to 100% instead. Future deployments will run the normal verified canary rollout.
+            </p>
+            <p className="mt-1.5 flex items-center gap-1.5 text-xs">
+              {firstDeploymentPhase === "checking-liveness" ? (
+                <>
+                  <Loader2 className="h-3 w-3 animate-spin text-primary" />
+                  Waiting for the new deployment to report healthy before any traffic is cut over…
+                </>
+              ) : firstDeploymentPhase === "healthy" ? (
+                <>
+                  <Check className="h-3 w-3 text-success" />
+                  Deployment confirmed healthy — traffic cut over to 100%.
+                </>
+              ) : (
+                <>
+                  <Loader2 className="h-3 w-3 animate-spin text-primary" />
+                  Deploying…
+                </>
+              )}
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <Card className="md:col-span-2">
           <CardHeader>
             <CardTitle>Rollout progress</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-4">
-            <PipelineDAG
+          <CardContent>
+            <StageTimeline
               stages={stages}
               currentStage={currentStage}
               status={status}
+              logLines={logLines}
+              trafficWeight={trafficWeight}
+              weightHistory={weightHistory}
               selectedStage={selectedStage}
               onSelectStage={setSelectedStage}
             />
-            <TrafficGauge weight={trafficWeight} status={status} />
-            <TrafficWeightChart history={weightHistory} />
           </CardContent>
         </Card>
 

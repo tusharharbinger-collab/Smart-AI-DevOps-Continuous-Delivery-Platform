@@ -29,6 +29,22 @@ class ServiceOnboardingSpec:
     path_prefix: str | None = None
     namespace: str = "production"
     gateway_name: str = "local-edge-gateway"
+    # Real gap found live (2026-09-15): the generated HTTPRoute's parentRef
+    # never named a namespace, which the Gateway API spec defaults to the
+    # ROUTE's own namespace — fine when `namespace` above was still
+    # "production" (routes and the Gateway both there), but Phase 3's
+    # tenant-namespace isolation moved every real onboarded route into its
+    # own "tenant-*" namespace while the one real shared Gateway object
+    # stayed fixed in "production" (see k8s/gateway/gateway-class.yaml).
+    # Every project-onboarded HTTPRoute was consequently never accepted by
+    # Envoy at all — confirmed live: `kubectl get httproute ... -o
+    # jsonpath='{.status}'` returned empty for every one of them, and a
+    # real HTTP request to a real, healthy, Ready pod returned 404 instead
+    # of the app's response. Every canary rollout still correctly patched
+    # `backendRefs[].weight`, but there was no accepted route for that
+    # weight to ever apply to. Defaults to "production" to match where the
+    # Gateway genuinely lives today; becomes configurable if that changes.
+    gateway_namespace: str = "production"
     baseline_replicas: int = 1
     canary_replicas: int = 1
     cpu_request: str = "50m"
@@ -147,7 +163,7 @@ def _build_httproute(spec: ServiceOnboardingSpec) -> dict:
             "labels": {"delivery.devops.ai/managed-by": "autonomous-controller"},
         },
         "spec": {
-            "parentRefs": [{"name": spec.gateway_name}],
+            "parentRefs": [{"name": spec.gateway_name, "namespace": spec.gateway_namespace}],
             "rules": [
                 {
                     "matches": [{"path": {"type": "PathPrefix", "value": spec.path_prefix}}],

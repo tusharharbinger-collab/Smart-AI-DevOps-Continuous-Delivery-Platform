@@ -6,6 +6,8 @@ import { PipelineDashboard } from "@/pages/PipelineDashboard";
 import { VerificationInspector } from "@/pages/VerificationInspector";
 import { PolicyManager } from "@/pages/PolicyManager";
 import { AuditLedger } from "@/pages/AuditLedger";
+import { ReportsTab } from "@/pages/ReportsTab";
+import { CostTab } from "@/pages/CostTab";
 import { ProjectsOverview } from "@/pages/ProjectsOverview";
 import { NewProject } from "@/pages/NewProject";
 import { ProjectWorkspace } from "@/pages/ProjectWorkspace";
@@ -29,6 +31,8 @@ export default function App() {
             <Route path="verification" element={<VerificationInspector />} />
             <Route path="policy" element={<PolicyManager />} />
             <Route path="audit" element={<AuditLedger />} />
+            <Route path="reports" element={<ReportsTab />} />
+            <Route path="cost" element={<CostTab />} />
           </Route>
         </Route>
 

@@ -168,10 +168,17 @@ def test_first_deployment_ships_straight_to_100_and_skips_verification(monkeypat
         route_weight_calls.append({"namespace": namespace, "route_name": route_name})
         return {"status": "route_updated", "route_name": route_name, "baseline_weight": 100, "canary_weight": 0}
 
+    liveness_checks = []
+
+    def _fake_wait_for_deployment_ready(pipeline_run_id, namespace, deployment_name, **kwargs):
+        liveness_checks.append(deployment_name)
+        return {"ready": True, "deployment": deployment_name, "ready_replicas": 1, "desired_replicas": 1}
+
     monkeypatch.setattr(worker_module, "deploy_project_canary_task", _fake_deploy_project_canary_task)
     monkeypatch.setattr(worker_module, "run_verification_task", _fake_run_verification_task)
     monkeypatch.setattr(worker_module, "run_rollout_task", _fake_run_rollout_task)
     monkeypatch.setattr(worker_module, "set_first_deployment_route_weights", _fake_set_first_deployment_route_weights)
+    monkeypatch.setattr(worker_module, "wait_for_deployment_ready", _fake_wait_for_deployment_ready)
 
     fake_db = _FakeDB(first_deployment=True)
     orchestrator = PipelineOrchestrator(_FakeRedis(), db=fake_db)
@@ -197,6 +204,11 @@ def test_first_deployment_ships_straight_to_100_and_skips_verification(monkeypat
 
     assert fake_db.marked_completed_for == ["pipe-1"]
     assert route_weight_calls == [{"namespace": "production", "route_name": "widget-route"}]
+    # Real gap this covers: liveness must be confirmed for BOTH sides before
+    # traffic ever cuts over — the canary Deployment (already patched by the
+    # pipeline's own earlier "canary_deploy" stage) and the baseline
+    # Deployment (just patched above with the same image).
+    assert set(liveness_checks) == {"widget-canary", "widget-baseline"}
 
 
 def test_subsequent_deployment_runs_the_normal_verified_canary_path(monkeypatch, manifest_path):

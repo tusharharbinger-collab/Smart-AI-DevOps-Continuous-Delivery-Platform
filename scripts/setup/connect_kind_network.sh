@@ -29,15 +29,23 @@ kubectl config view --raw --minify --flatten \
   > "${OUT}"
 
 for svc in pipeline-worker policy-controller; do
-  container="smartaidevopscontinuousdeliveryplatform-${svc}-1"
-  if docker inspect "${container}" >/dev/null 2>&1; then
+  # Real gap found live: this used to guess the container name by
+  # concatenating the repo directory name (e.g.
+  # "smartaidevopscontinuousdeliveryplatform-pipeline-worker-1"), but Docker
+  # Compose's actual naming depends on how it normalizes the project name —
+  # here it keeps hyphens ("smart-ai-devops-continuous-delivery-platform-
+  # pipeline-worker-1"), so the guess never matched and every run silently
+  # printed the "not found" warning. Ask Compose directly instead of
+  # guessing — it always knows its own project's real container names.
+  container="$(cd "${REPO_ROOT}" && docker compose ps -q "${svc}" 2>/dev/null)"
+  if [ -n "${container}" ]; then
     if docker network connect kind "${container}" 2>/dev/null; then
-      echo "Connected ${container} to the kind network"
+      echo "Connected ${svc} (${container}) to the kind network"
     else
-      echo "${container} already on the kind network (or connect failed — check manually)"
+      echo "${svc} (${container}) already on the kind network (or connect failed — check manually)"
     fi
   else
-    echo "WARNING: ${container} not found — start it with 'docker compose up -d ${svc}' first"
+    echo "WARNING: ${svc} container not found — start it with 'docker compose up -d ${svc}' first"
   fi
 done
 

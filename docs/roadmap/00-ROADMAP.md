@@ -27,6 +27,14 @@ Phase 6: Platform Observability       ← needs Phase 5's task queue/worker mode
         ▼
 Phase 7: Deployment (Local → Global)  ← last, because deploying an unfinished product just moves
                                           the unfinished product somewhere else
+        │
+        ▼
+Phase 9: Universal Delivery Platform  ← builds on everything above (real auth/RLS, real telemetry,
+                                          real onboarding, real reliability) to generalize WHAT gets
+                                          onboarded (any repo, not just a known service shape) and
+                                          WHERE it deploys (any target, not just this platform's own
+                                          Kubernetes cluster) — see that file for its own internal
+                                          sub-phase ordering (9.1 → 9.6), which is itself sequential.
 ```
 
 **Decided:** Phase 1 (Frontend Overhaul) and Phase 2 (Real Telemetry) run in parallel — they don't touch the same files and don't depend on each other. Phase 1 is the one explicitly prioritized ("should feel like a real world production-ready web app").
@@ -53,6 +61,7 @@ If a phase's acceptance criteria can't be verified yet (e.g., a dependency on a 
 | 6 | Platform Observability | ✅ Done (tracing spans deferred, per its own "stretch goal" label) | Can *we* tell when the platform itself is unhealthy? | [06-observability-platform-ops.md](06-observability-platform-ops.md) |
 | 7 | Deployment (Local → Global) | Not started | Can this run somewhere other than one developer's machine? | [07-deployment-plan.md](07-deployment-plan.md) |
 | 8 | Project Workspaces & GitHub Delivery | ✅ Done (stage_logs persistence deferred) | Can a user connect their own repo and get an isolated, project-scoped workspace? | [08-project-workspaces.md](08-project-workspaces.md) |
+| 9 | Universal Delivery Platform (build any repo, blue-green, deploy anywhere) | 🚧 Planning — sub-phase 9.1 not yet started | Can any repo be built, tested, and deployed to any target, then kept running autonomously? | [09-universal-delivery-platform.md](09-universal-delivery-platform.md) |
 
 ## What's already real (don't re-litigate these)
 

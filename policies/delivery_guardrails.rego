@@ -36,6 +36,22 @@ allow_action {
 }
 
 # =====================================================================
+# RULE 10: Blue-Green Cutover Authorization
+# =====================================================================
+allow_action {
+    input.requested_action == "BLUE_GREEN_CUTOVER"
+    verdict.status == "HEALTHY"
+    verdict.confidence >= policy.guardrails.requireMinimumConfidence
+    input.active_step_sample_count >= max([input.current_step.minSampleSize, policy.guardrails.minSampleSize])
+    input.active_step_duration_seconds >= parse_duration_seconds(input.current_step.minDuration)
+    not is_deploy_window_blocked
+    not is_manual_approval_pending
+    not verdict_is_stale
+    not cost_delta_exceeds_limit
+}
+
+
+# =====================================================================
 # RULE 3: Blocked Deploy Freeze Windows
 # (Friday after 16:00 UTC through end of weekend, per assignment example)
 # =====================================================================
@@ -109,6 +125,35 @@ rejection_reasons[reason] {
 }
 
 # =====================================================================
+# RULE 11: Health-Gated Cutover Authorization (blue-green)
+# Blue-green's whole point is to guarantee a live URL even for a project
+# with zero real traffic — a genuinely new web app can never accumulate
+# PROMOTE_STEP/BLUE_GREEN_CUTOVER's required sample count, so gating on a
+# statistical verdict here is a category error, exactly like
+# FIRST_DEPLOYMENT's own reasoning above. The caller (worker.py's blue-green
+# rollout branch) has already confirmed real infrastructure health — ECS
+# task stability AND a real ALB target-group HTTP health check — before
+# ever requesting this action, so the one guardrail that still meaningfully
+# applies with zero statistical evidence is, again, the freeze window.
+# Deliberately its own requested_action (not reusing RULE 10's
+# BLUE_GREEN_CUTOVER, which stays verdict-gated for any caller that still
+# wants a statistically-informed cutover) so this rule can never
+# accidentally authorize a real canary promotion that skipped its actual
+# evidence requirements.
+# =====================================================================
+allow_action {
+    input.requested_action == "HEALTH_GATED_CUTOVER"
+    not is_deploy_window_blocked
+    not is_emergency_freeze_active
+}
+
+rejection_reasons[reason] {
+    input.requested_action == "HEALTH_GATED_CUTOVER"
+    is_deploy_window_blocked
+    reason := "Current timestamp falls within an enterprise-blocked deployment window"
+}
+
+# =====================================================================
 # RULE 8: Autonomous Right-Sizing Application Gate
 # (§6d / §10.3 — right-sizing recommendations NEVER auto-apply; this
 # rule only ever fires for a distinct, explicitly-approved action type)
@@ -125,13 +170,13 @@ allow_action {
 # the Action Decision Report, §12.2)
 # =====================================================================
 rejection_reasons[reason] {
-    input.requested_action == "PROMOTE_STEP"
+    input.requested_action in ["PROMOTE_STEP", "BLUE_GREEN_CUTOVER"]
     verdict.status != "HEALTHY"
-    reason := sprintf("Verification verdict is %v; promotion requires HEALTHY", [verdict.status])
+    reason := sprintf("Verification verdict is %v; promotion/cutover requires HEALTHY", [verdict.status])
 }
 
 rejection_reasons[reason] {
-    input.requested_action == "PROMOTE_STEP"
+    input.requested_action in ["PROMOTE_STEP", "BLUE_GREEN_CUTOVER"]
     verdict.confidence < policy.guardrails.requireMinimumConfidence
     reason := sprintf("Confidence %v is below required threshold %v",
         [verdict.confidence, policy.guardrails.requireMinimumConfidence])

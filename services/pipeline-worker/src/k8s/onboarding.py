@@ -131,6 +131,71 @@ def _apply_http_route(custom_api: "client.CustomObjectsApi", route: dict, namesp
             raise
 
 
+def deprovision_service(namespace: str, service_name: str) -> dict:
+    """
+    Real gap found live (2026-09-15): api-gateway's DELETE /projects/{id}
+    only ever removed the DB row — the real Deployments/Services/HTTPRoute
+    `onboard_service` created were left running in the cluster forever. A
+    project recreated later with the same name hit `onboard_service`'s own
+    409-then-PATCH idempotency path against these orphaned objects instead
+    of a clean create, silently merging old and new config (a real bug: a
+    stale `containerPort: 8080` survived alongside a freshly-declared
+    `containerPort: 80`, caught live while proving the `live_url` feature
+    end to end). Symmetric to onboard_service's own naming derivation
+    (`{service_name}-baseline`/`-canary`/`-route`) — never guesses names,
+    always the exact ones onboarding itself would have produced.
+
+    Best-effort and idempotent like onboarding: every delete call ignores
+    404 (the object was never created, or this is a retry), and one
+    object's absence never blocks deleting the others.
+    """
+    _load_kube()
+    apps_v1 = client.AppsV1Api()
+    core_v1 = client.CoreV1Api()
+    custom_api = client.CustomObjectsApi()
+
+    baseline_name = f"{service_name}-baseline"
+    canary_name = f"{service_name}-canary"
+    route_name = f"{service_name}-route"
+    secret_name = f"{service_name}-registry-cred"
+    deleted: dict[str, list[str]] = {"deployments": [], "services": [], "http_routes": [], "secrets": []}
+
+    for name in (baseline_name, canary_name):
+        try:
+            apps_v1.delete_namespaced_deployment(name=name, namespace=namespace)
+            deleted["deployments"].append(name)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    for name in (baseline_name, canary_name):
+        try:
+            core_v1.delete_namespaced_service(name=name, namespace=namespace)
+            deleted["services"].append(name)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    try:
+        custom_api.delete_namespaced_custom_object(
+            group=GROUP, version=VERSION, namespace=namespace, plural=PLURAL, name=route_name
+        )
+        deleted["http_routes"].append(route_name)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+    try:
+        core_v1.delete_namespaced_secret(name=secret_name, namespace=namespace)
+        deleted["secrets"].append(secret_name)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+    logger.info("service_deprovisioned", service_name=service_name, namespace=namespace, deleted=deleted)
+    return deleted
+
+
 def onboard_service(spec: ServiceOnboardingSpec, dockerconfigjson_b64: str | None = None) -> dict:
     """
     Applies every generated manifest to the cluster (idempotent — safe to

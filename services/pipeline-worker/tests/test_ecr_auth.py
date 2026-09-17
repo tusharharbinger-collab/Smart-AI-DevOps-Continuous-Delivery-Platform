@@ -66,3 +66,57 @@ def test_get_ecr_registry_credential_passes_region_through(monkeypatch):
     ecr_auth.get_ecr_registry_credential("eu-west-1")
 
     assert captured == {"service": "ecr", "region_name": "eu-west-1"}
+
+
+class _RepositoryAlreadyExistsException(Exception):
+    pass
+
+
+class _FakeECRClientForRepoCreation:
+    """Real gap found live: ECR (unlike most registries) never auto-creates
+    a repository on first push — a project's first-ever build failed the
+    push outright until someone had already run `aws ecr create-repository`
+    by hand. ensure_ecr_repository_exists closes that gap; this stand-in
+    mirrors the real client's `.exceptions.RepositoryAlreadyExistsException`
+    attribute access pattern (boto3 generates that class per-client, not as
+    a plain importable exception)."""
+
+    exceptions = type("Exceptions", (), {"RepositoryAlreadyExistsException": _RepositoryAlreadyExistsException})
+
+    def __init__(self, already_exists: bool = False):
+        self.already_exists = already_exists
+        self.create_calls = []
+
+    def create_repository(self, repositoryName):
+        self.create_calls.append(repositoryName)
+        if self.already_exists:
+            raise self.exceptions.RepositoryAlreadyExistsException()
+
+
+def test_ensure_ecr_repository_exists_creates_a_new_repo(monkeypatch):
+    fake = _FakeECRClientForRepoCreation(already_exists=False)
+    monkeypatch.setattr(ecr_auth.boto3, "client", lambda service, region_name=None: fake)
+
+    ecr_auth.ensure_ecr_repository_exists("123456789012.dkr.ecr.us-east-1.amazonaws.com/payments", "us-east-1")
+
+    assert fake.create_calls == ["payments"]
+
+
+def test_ensure_ecr_repository_exists_is_idempotent_when_already_present(monkeypatch):
+    fake = _FakeECRClientForRepoCreation(already_exists=True)
+    monkeypatch.setattr(ecr_auth.boto3, "client", lambda service, region_name=None: fake)
+
+    # Must not raise — an already-existing repo is the normal case for
+    # every build after a project's first one.
+    ecr_auth.ensure_ecr_repository_exists("123456789012.dkr.ecr.us-east-1.amazonaws.com/payments", "us-east-1")
+
+    assert fake.create_calls == ["payments"]
+
+
+def test_ensure_ecr_repository_exists_extracts_the_repo_name_from_the_full_uri(monkeypatch):
+    fake = _FakeECRClientForRepoCreation()
+    monkeypatch.setattr(ecr_auth.boto3, "client", lambda service, region_name=None: fake)
+
+    ecr_auth.ensure_ecr_repository_exists("236087863083.dkr.ecr.us-east-1.amazonaws.com/cicd-test", "us-east-1")
+
+    assert fake.create_calls == ["cicd-test"]

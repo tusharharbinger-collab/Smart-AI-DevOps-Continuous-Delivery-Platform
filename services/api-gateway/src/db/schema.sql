@@ -93,11 +93,41 @@ CREATE TABLE IF NOT EXISTS projects (
     repo_url              TEXT,
     branch                TEXT        NOT NULL DEFAULT 'main',
     root_directory        TEXT        NOT NULL DEFAULT './',
-    dockerfile_path       TEXT        NOT NULL DEFAULT 'Dockerfile',
+    -- Nullable (migration 0011): a project the build-detection scanner
+    -- (shared/repo_scanner.py) identified as having NO Dockerfile is built
+    -- via language/start_command synthesis instead (dockerfile_synthesis.py)
+    -- — exactly one of dockerfile_path or (language + start_command) is set.
+    dockerfile_path       TEXT,
+    language              TEXT,
+    start_command         TEXT,
+    manifest_path         TEXT,
     test_command          TEXT,
     container_image       TEXT,
     active_production_tag TEXT        NOT NULL DEFAULT 'v1.0.0',
     canary_tag            TEXT,
+    -- Migration 0012: was computed at onboarding and thrown away — never
+    -- persisted, so there was no way to show a user a real "is my product
+    -- live" link. Combined with GATEWAY_BASE_URL, this is what a live_url
+    -- is built from in projects_router.py.
+    path_prefix            TEXT,
+    -- Migration 0013 (Module 8): "kubernetes" or "aws_ecs" — which real
+    -- deployment target this project actually runs on, so live_url is
+    -- computed against the right base URL for each.
+    deploy_target           TEXT        NOT NULL DEFAULT 'kubernetes',
+    -- Migration 0014 (Guaranteed Live Web App CI/CD): "canary" or
+    -- "blue_green" — persisted for display/API convenience only. The
+    -- generated pipeline YAML (pipelines.policy_yaml, deployment_strategy:
+    -- blue_green) is the actual source of truth worker.py reads at
+    -- execution time; this column just lets the API/UI show a badge
+    -- without parsing YAML.
+    deploy_mode            TEXT        NOT NULL DEFAULT 'canary',
+    -- Migration 0014: set by pipeline-worker's shared/live_url_check.py
+    -- after every real cutover (first deployment, blue-green, canary
+    -- graduation) — a genuine HTTP GET through the real ALB/gateway,
+    -- proving the live_url actually serves a response rather than just
+    -- reporting the ALB weight was flipped.
+    live_url_status        TEXT,
+    live_url_verified_at   TIMESTAMPTZ,
     status                TEXT        NOT NULL DEFAULT 'IDLE'
                               CHECK (status IN ('IDLE','BUILDING','TESTING','VERIFYING',
                                                 'HEALTHY','ROLLED_BACK','FAILED')),
@@ -226,7 +256,7 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     action           TEXT        NOT NULL
                          CHECK (action IN ('WEIGHT_UPDATE','ROLLBACK','PROMOTE',
                                            'SCALE_ZERO','APPROVE','BLOCK','RIGHTSIZING',
-                                           'GRADUATE')),
+                                           'GRADUATE','BLUE_GREEN_CUTOVER')),
     verdict          TEXT,
     confidence       NUMERIC(4,3) CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 1),
     authorized_by    TEXT        NOT NULL,  -- e.g. "OPA:allow_action=true:rule=PROMOTE_STEP"

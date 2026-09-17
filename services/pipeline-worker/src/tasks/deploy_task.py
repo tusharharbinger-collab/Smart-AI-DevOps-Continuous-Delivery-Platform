@@ -4,6 +4,8 @@ services/pipeline-worker/src/tasks/deploy_task.py
 Applies/patches the canary Deployment against the REAL Kind cluster.
 Spec §4.2.
 """
+import time
+
 from kubernetes import client, config as k8s_config
 import structlog
 
@@ -16,6 +18,13 @@ logger = structlog.get_logger(__name__)
 GATEWAY_GROUP = "gateway.networking.k8s.io"
 GATEWAY_VERSION = "v1"
 GATEWAY_PLURAL = "httproutes"
+
+DEFAULT_READINESS_TIMEOUT_SECONDS = 90
+DEFAULT_READINESS_POLL_SECONDS = 3.0
+
+
+class DeploymentNotReadyError(Exception):
+    pass
 
 
 def _load_kube():
@@ -212,3 +221,61 @@ def set_first_deployment_route_weights(
         "first_deployment_route_weights_set", pipeline_run_id=pipeline_run_id, route_name=route_name, namespace=namespace
     )
     return {"status": "route_updated", "route_name": route_name, "baseline_weight": 100, "canary_weight": 0}
+
+
+def wait_for_deployment_ready(
+    pipeline_run_id: str,
+    namespace: str,
+    deployment_name: str,
+    timeout_seconds: int = DEFAULT_READINESS_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = DEFAULT_READINESS_POLL_SECONDS,
+) -> dict:
+    """
+    Real gap found live (2026-09-15): the first-deployment fast path patched
+    the baseline/canary Deployments and cut real HTTPRoute traffic over to
+    them WITHOUT ever confirming a pod actually came up healthy — "the
+    Deployment object was patched" and "it's actually serving traffic" were
+    silently treated as the same thing. They aren't: a bad image, a crashing
+    container, or a misconfigured health/readiness probe all patch cleanly
+    but never become Ready, and this path had no statistical verification
+    stage (by design — see canary_loop's first-deployment branch) to ever
+    catch that. A real canary rollout gets this same guarantee for free,
+    since verification only ever runs against pods that are already up; a
+    first deployment needs its own explicit check standing in for that.
+
+    Polls the real Kubernetes API (not `kubectl rollout status` via
+    subprocess — this container has no `kubectl` binary, only the Python
+    client already used everywhere else in this module) until
+    `status.readyReplicas` meets `spec.replicas`, or raises
+    `DeploymentNotReadyError` on timeout. The caller (worker.py) lets this
+    exception propagate to the pipeline's normal failure path — the run is
+    marked FAILED, a real stage-failure RCA is generated, and critically,
+    `mark_first_deployment_completed` is never reached, so a retry is still
+    correctly treated as a first deployment rather than silently marked done
+    against an unhealthy target.
+    """
+    _load_kube()
+    apps_v1 = client.AppsV1Api()
+    deadline = time.monotonic() + timeout_seconds
+    desired = 0
+    ready = 0
+    while time.monotonic() < deadline:
+        dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
+        desired = dep.spec.replicas or 1
+        ready = dep.status.ready_replicas or 0
+        if ready >= desired and desired > 0:
+            logger.info(
+                "deployment_liveness_confirmed",
+                pipeline_run_id=pipeline_run_id,
+                deployment=deployment_name,
+                namespace=namespace,
+                ready_replicas=ready,
+                desired_replicas=desired,
+            )
+            return {"ready": True, "deployment": deployment_name, "ready_replicas": ready, "desired_replicas": desired}
+        time.sleep(poll_interval_seconds)
+    raise DeploymentNotReadyError(
+        f"Deployment '{deployment_name}' in namespace '{namespace}' did not become ready within "
+        f"{timeout_seconds}s (ready={ready}/{desired}) — check pod logs/events for the real cause "
+        f"(bad image, crashing container, failing readiness probe) before retrying."
+    )

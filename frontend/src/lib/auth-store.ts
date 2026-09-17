@@ -16,6 +16,8 @@ interface AuthState {
   updateTokens: (accessToken: string, refreshToken: string) => void;
 }
 
+const PERSIST_KEY = "cd_platform_session";
+
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
@@ -33,9 +35,30 @@ export const useAuthStore = create<AuthState>()(
             : state
         ),
     }),
-    { name: "cd_platform_session" }
+    { name: PERSIST_KEY }
   )
 );
+
+// Real bug found live: a refresh token is single-use — api/client.ts's
+// silent-refresh flow deletes the old one in Redis the instant a new one
+// is issued. This store only ever wrote its refreshed tokens to ITS OWN
+// tab's localStorage; a second open tab kept the now-rotated-away refresh
+// token in memory and had no idea it had gone stale. The next time that
+// second tab's access token expired, its silent refresh attempt used a
+// token Redis no longer recognized, failed, and force-logged-out a session
+// that was actually fine — reported live as "click New Service, it loads,
+// then bounces to login." Zustand's `persist` writes state changes out to
+// localStorage automatically, but does NOT listen for OTHER tabs writing
+// to that same key by default; this re-hydrates from localStorage whenever
+// a `storage` event fires for it, so every open tab picks up whichever
+// tab most recently rotated the tokens instead of racing on a stale copy.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key === PERSIST_KEY) {
+      useAuthStore.persist.rehydrate();
+    }
+  });
+}
 
 /** Non-reactive read for use outside React components (e.g. the fetch wrapper). */
 export function getSession(): Session | null {

@@ -106,11 +106,13 @@ async def _resolve_token(request: Request, header_token: str | None) -> str:
 
 
 def _github_headers(token: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
+    headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 async def _github_get(path: str, token: str, params: dict | None = None):
@@ -121,9 +123,22 @@ async def _github_get(path: str, token: str, params: dict | None = None):
             raise HTTPException(status_code=502, detail=f"Could not reach GitHub: {e}")
 
     if resp.status_code == 401:
+        # Real bug found live: this used to raise a bare HTTP 401 from
+        # api-gateway itself — but 401 from OUR OWN API means exactly one
+        # thing everywhere else in this codebase: "your platform login
+        # session is invalid," and the frontend's api client (client.ts)
+        # treats ANY 401 as that, force-logging the user out and bouncing
+        # them to /login. This 401 has nothing to do with the user's
+        # platform session — it means the platform's STORED GitHub OAuth
+        # token is stale/revoked. Conflating the two meant a stale GitHub
+        # token silently logged users out of the whole platform the moment
+        # they opened the repo picker, with a "session expired" message
+        # that had nothing to do with what actually happened. 502 (this
+        # server's own upstream dependency failed) is the correct status —
+        # never re-introduce a bare 401 here.
         raise HTTPException(
-            status_code=401,
-            detail="GitHub rejected the token (401). Reconnect your GitHub account.",
+            status_code=502,
+            detail="GitHub rejected the stored token. Reconnect your GitHub account (Disconnect, then Connect GitHub again).",
         )
     if resp.status_code == 403:
         raise HTTPException(
@@ -391,3 +406,168 @@ async def get_head_commit(
         "author": (commit.get("author") or {}).get("name"),
         "committed_at": (commit.get("author") or {}).get("date"),
     }
+
+
+async def _fetch_repo_tree_and_manifests(
+    request: Request,
+    owner: str,
+    repo: str,
+    ref: str,
+    x_github_token: str | None,
+) -> dict:
+    from shared.repo_scanner import MANIFEST_FILENAMES
+
+    try:
+        token = await _resolve_token(request, x_github_token)
+        tree_raw = await _github_get(f"/repos/{owner}/{repo}/git/trees/{ref}", token, params={"recursive": "1"})
+    except HTTPException as e:
+        if e.status_code not in (400, 401):
+            raise
+        logger.info("github_tree_fetch_falling_back_to_anonymous", owner=owner, repo=repo, reason=e.detail)
+        token = None
+        tree_raw = await _github_get(f"/repos/{owner}/{repo}/git/trees/{ref}", None, params={"recursive": "1"})
+
+    tree = tree_raw.get("tree") or []
+    file_paths = [e["path"] for e in tree if e.get("type") == "blob"]
+
+    async def _fetch_text_file(path: str) -> str | None:
+        try:
+            contents_raw = await _github_get(f"/repos/{owner}/{repo}/contents/{path}", token, params={"ref": ref})
+            import base64
+
+            if contents_raw.get("encoding") == "base64":
+                return base64.b64decode(contents_raw["content"]).decode("utf-8")
+        except Exception as e:
+            logger.warning("manifest_fetch_failed", owner=owner, repo=repo, path=path, error=str(e))
+        return None
+
+    yaml_manifest_content = None
+    yaml_manifest_path: str | None = None
+    yaml_candidates = [p for p in file_paths if p.rsplit("/", 1)[-1] in MANIFEST_FILENAMES and p.count("/") <= 2]
+    if yaml_candidates:
+        yaml_manifest_path = sorted(yaml_candidates, key=lambda p: p.count("/"))[0]
+        yaml_manifest_content = await _fetch_text_file(yaml_manifest_path)
+
+    package_json_content = None
+    if any(p.rsplit("/", 1)[-1] == "package.json" for p in file_paths):
+        pkg_path = next((p for p in file_paths if p.rsplit("/", 1)[-1] == "package.json" and p.count("/") <= 2), None)
+        if pkg_path:
+            content = await _fetch_text_file(pkg_path)
+            if content is not None:
+                import json
+
+                try:
+                    package_json_content = json.loads(content)
+                except json.JSONDecodeError as e:
+                    logger.warning("package_json_parse_failed", owner=owner, repo=repo, error=str(e))
+
+    requirements_txt_content = None
+    req_path = next((p for p in file_paths if p.rsplit("/", 1)[-1] == "requirements.txt" and p.count("/") <= 2), None)
+    if req_path:
+        requirements_txt_content = await _fetch_text_file(req_path)
+
+    return {
+        "file_paths": file_paths,
+        "package_json_content": package_json_content,
+        "requirements_txt_content": requirements_txt_content,
+        "yaml_manifest_content": yaml_manifest_content,
+        "yaml_manifest_path": yaml_manifest_path,
+        "truncated": bool(tree_raw.get("truncated")),
+    }
+
+
+@router.get("/repos/{owner}/{repo}/build-detection")
+async def detect_build_config(
+    owner: str,
+    repo: str,
+    request: Request,
+    ref: str = Query(default="main"),
+    x_github_token: str | None = Header(default=None, alias="X-GitHub-Token"),
+):
+    """
+    Real onboarding-flow gap this closes: looks at the repo file tree and manifests
+    first to propose build method, commands, and networking suggestions.
+    """
+    from shared.repo_scanner import detect_build_method, suggest_networking_defaults
+
+    fetch_res = await _fetch_repo_tree_and_manifests(request, owner, repo, ref, x_github_token)
+    file_paths = fetch_res["file_paths"]
+
+    detection = detect_build_method(
+        file_paths,
+        package_json_content=fetch_res["package_json_content"],
+        yaml_manifest_content=fetch_res["yaml_manifest_content"],
+        yaml_manifest_path=fetch_res["yaml_manifest_path"],
+    )
+    return {
+        "method": detection.method,
+        "dockerfile_path": detection.dockerfile_path,
+        "language": detection.language,
+        "framework": detection.framework,
+        "manifest_path": detection.manifest_path,
+        "start_command": detection.start_command,
+        "test_command": detection.test_command,
+        "test_config_found": detection.test_config_found,
+        "confidence": detection.confidence,
+        "issues": detection.issues,
+        "deploy_config": detection.deploy_config,
+        "truncated": fetch_res["truncated"],
+        **suggest_networking_defaults(detection),
+    }
+
+
+@router.get("/repos/{owner}/{repo}/repo-report")
+async def get_repo_report(
+    owner: str,
+    repo: str,
+    request: Request,
+    ref: str = Query(default="main"),
+    x_github_token: str | None = Header(default=None, alias="X-GitHub-Token"),
+):
+    """
+    ML-based repo health report, risk anomaly score (IsolationForest), hosting cost
+    prediction, and executive summary narrative for pre-onboarding decision-making.
+    """
+    from dataclasses import asdict
+    from shared.repo_scanner import detect_build_method
+    from shared.repo_report import (
+        extract_repo_features,
+        score_repo_risk,
+        predict_hosting_cost,
+        build_narrative,
+    )
+
+    fetch_res = await _fetch_repo_tree_and_manifests(request, owner, repo, ref, x_github_token)
+    file_paths = fetch_res["file_paths"]
+
+    detection = detect_build_method(
+        file_paths,
+        package_json_content=fetch_res["package_json_content"],
+        yaml_manifest_content=fetch_res["yaml_manifest_content"],
+        yaml_manifest_path=fetch_res["yaml_manifest_path"],
+    )
+
+    features = extract_repo_features(
+        file_paths,
+        package_json_content=fetch_res["package_json_content"],
+        requirements_txt_content=fetch_res["requirements_txt_content"],
+        detection=detection,
+    )
+
+    risk = score_repo_risk(features)
+    cost = predict_hosting_cost(features)
+    narrative = await build_narrative(
+        risk_level=risk["risk_level"],
+        risk_flags=risk["risk_flags"],
+        cost=cost,
+        features=features,
+    )
+
+    return {
+        "features": asdict(features),
+        "risk": risk,
+        "cost": cost,
+        "narrative": narrative,
+        "truncated": fetch_res["truncated"],
+    }
+

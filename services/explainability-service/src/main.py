@@ -24,6 +24,7 @@ from src.citation_builder import build_citations_from_engine_evidence
 from src.db import get_db
 from src.decision_report import build_decision_report
 from src.digest_generator import generate_delivery_health_digest
+from src.digest_summarizer import generate_digest_summary
 from src.health_router import router as health_router
 from src.pipeline_generator import PipelineGenerationError, generate_pipeline_yaml
 from src.report_generator import generate_rca
@@ -122,4 +123,15 @@ async def get_digest(tenant_id: str, days: int = 7, db: AsyncSession = Depends(g
     from sqlalchemy import text
 
     await db.execute(text("SELECT set_config('app.active_tenant_id', :tid, true)"), {"tid": tenant_id})
-    return await generate_delivery_health_digest(db, tenant_id, days)
+    digest = await generate_delivery_health_digest(db, tenant_id, days)
+    # AI digest summary (P0, 2026-09-16) — grounded entirely in the numbers
+    # digest_generator.py just computed above, never a second data source.
+    # Wrapped so a Groq outage degrades the summary quality, never the
+    # digest response itself (generate_digest_summary already guarantees
+    # this internally via its own fallback, this is defense in depth).
+    try:
+        digest["ai_summary"] = await generate_digest_summary(digest)
+    except Exception as e:
+        logger.warning("digest_ai_summary_failed", tenant_id=tenant_id, error=str(e))
+        digest["ai_summary"] = None
+    return digest

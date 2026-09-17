@@ -20,6 +20,26 @@ spec:
     - name: http
       protocol: HTTP
       port: 80
+      # Real gap found live (2026-09-15): "Same" meant this Gateway only
+      # ever accepted HTTPRoutes from its own "production" namespace — but
+      # Phase 3's tenant-namespace isolation (see onboarding.py's
+      # _ensure_namespace_exists) puts every onboarded project's real
+      # HTTPRoute in its OWN "tenant-*" namespace instead, sharing this ONE
+      # Gateway across all tenants by design (a single ingress point).
+      # With "Same", every one of those routes was silently never accepted
+      # by Envoy at all — proven live: `kubectl get httproute ... -o
+      # jsonpath='{.status}'` returned an empty object for every
+      # project-onboarded route, and a real HTTP request through the real
+      # Gateway to a real, healthy, Ready pod returned 404 instead of the
+      # app's actual response. Every canary rollout this session shifted
+      # `backendRefs[].weight` correctly, but zero real traffic was ever
+      # actually routed by any of them — the weight patch had nothing to
+      # act on. "All" is the correct fix for "one shared Gateway, routes
+      # from many tenant namespaces" (no ReferenceGrant needed: that's only
+      # required when a route's own backendRefs point at a Service in a
+      # DIFFERENT namespace than the route itself, which is not the case
+      # here — each route and its backends both live in the same tenant
+      # namespace).
       allowedRoutes:
         namespaces:
-          from: Same
+          from: All

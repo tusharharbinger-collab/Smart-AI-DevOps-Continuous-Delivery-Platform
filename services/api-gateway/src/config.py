@@ -41,5 +41,20 @@ class Settings:
     # fallback when the signed-in user has not connected their own account.
     GITHUB_TOKEN: str = os.environ.get("GITHUB_TOKEN", "")
 
+    # ── GitHub webhooks (Phase 9.6 — autonomous "git push -> cloud") ──
+    # Shared HMAC secret GitHub signs every webhook delivery with
+    # (X-Hub-Signature-256) — one platform-wide secret reused across every
+    # repo's webhook subscription, matching how VERDICT_SIGNING_KEY and the
+    # shared ALB are already single platform-wide values rather than
+    # per-project ones. Blank by default so a fresh clone fails closed
+    # (webhooks_router.py refuses to accept deliveries with no secret
+    # configured) instead of silently accepting unsigned/forged requests.
+    GITHUB_WEBHOOK_SECRET: str = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+    # The externally-reachable base URL GitHub's servers can actually POST
+    # to — cannot be localhost for a real webhook (GitHub is not on this
+    # machine's network). Same class of "must be a real public address for
+    # the real feature to work" setting as GATEWAY_BASE_URL/AWS_ALB_BASE_URL.
+    API_GATEWAY_PUBLIC_URL: str = os.environ.get("API_GATEWAY_PUBLIC_URL", "http://localhost:8000")
+
 
 settings = Settings()

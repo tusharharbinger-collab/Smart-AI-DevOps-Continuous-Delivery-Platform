@@ -37,3 +37,31 @@ def get_ecr_registry_credential(region: str) -> dict:
     username, secret = decoded.split(":", 1)
     logger.info("ecr_credential_generated", region=region)
     return {"username": username, "secret": secret}
+
+
+def ensure_ecr_repository_exists(image_name: str, region: str) -> None:
+    """
+    Real gap found live (2026-09-16): unlike most registries, ECR does NOT
+    auto-create a repository on first push — `docker push` to a repository
+    name nobody ever ran `aws ecr create-repository` for just fails, and
+    (worse, the failure mode actually hit) a project onboarded with a
+    registry.internal-style placeholder never even reached ECR at all,
+    since the image name wasn't real. A human onboarding a new AWS ECS
+    project has no reason to know ECR needs this extra step — the build
+    stage is the one place that already knows the real image name and is
+    about to push to it, so it's the natural, safe place to make repo
+    creation implicit rather than a manual prerequisite every project
+    would otherwise need documented separately.
+
+    Idempotent and safe to call on every build (create_repository's own
+    "already exists" error is caught, not treated as a failure) — matches
+    this codebase's established pattern for create-or-patch AWS/Kubernetes
+    calls (e.g. deploy_task.py's `ensure_service`).
+    """
+    repo_name = image_name.split("/", 1)[1] if "/" in image_name else image_name
+    client = boto3.client("ecr", region_name=region)
+    try:
+        client.create_repository(repositoryName=repo_name)
+        logger.info("ecr_repository_created", repository=repo_name, region=region)
+    except client.exceptions.RepositoryAlreadyExistsException:
+        pass

@@ -116,7 +116,7 @@ def _patch_actuation(monkeypatch):
         calls["graduate"].append({"run_id": run_id, "tenant_id": target.get("tenant_id"), "new_version": new_version})
         return "GRADUATED"
 
-    async def fake_advance(redis_client, run_id, tenant_id, state, next_index, trace_id):
+    async def fake_advance(redis_client, run_id, tenant_id, state, next_index, trace_id, target=None):
         calls["advance"].append({"run_id": run_id, "next_index": next_index})
         state["current_step_index"] = next_index
         await controller.rollout_scheduler.save_rollout_state(redis_client, run_id, state)
@@ -377,7 +377,7 @@ def test_verdict_produced_with_no_real_elapsed_time_retries_the_same_step_instea
     async def fake_send_alert(*args, **kwargs):
         calls["alerts"].append(args)
 
-    async def fake_retry(run_id, tenant_id, state, remaining_seconds, trace_id=None):
+    async def fake_retry(run_id, tenant_id, state, remaining_seconds, trace_id=None, target=None):
         calls["retry"].append({"run_id": run_id, "remaining_seconds": remaining_seconds})
 
     async def fake_cost(**kwargs):

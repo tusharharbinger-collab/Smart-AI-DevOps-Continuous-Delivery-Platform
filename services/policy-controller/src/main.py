@@ -31,6 +31,7 @@ from src.controller import (
     GROUP_POLICY_CONTROLLERS,
 )
 from src.actuation_executor import emergency_rollback
+from src.aws_actuation_executor import emergency_rollback_ecs
 from src.alert_dispatcher import alert_rollback
 from src.db import PolicyControllerDB
 from src.health_router import router as health_router
@@ -127,14 +128,25 @@ async def manual_rollback(run_id: str, body: dict):
     requested_by = body.get("requested_by", "operator")
     target = await _get_actuation_target(app.state.redis, run_id)
 
-    await emergency_rollback(
-        run_id,
-        authorized_by=f"MANUAL:{requested_by}",
-        route_name=target["route_name"],
-        namespace=target["namespace"],
-        canary_deployment_name=target["canary_deployment_name"],
-        tenant_id=tenant_id or target.get("tenant_id"),
-        db=app.state.db,
-    )
+    if target.get("deployment_target", "kubernetes") == "aws_ecs":
+        await emergency_rollback_ecs(
+            run_id,
+            authorized_by=f"MANUAL:{requested_by}",
+            service_name=target["canary_deployment_name"].removesuffix("-canary"),
+            path_prefix=target["path_prefix"],
+            region=target.get("aws_region", "us-east-1"),
+            tenant_id=tenant_id or target.get("tenant_id"),
+            db=app.state.db,
+        )
+    else:
+        await emergency_rollback(
+            run_id,
+            authorized_by=f"MANUAL:{requested_by}",
+            route_name=target["route_name"],
+            namespace=target["namespace"],
+            canary_deployment_name=target["canary_deployment_name"],
+            tenant_id=tenant_id or target.get("tenant_id"),
+            db=app.state.db,
+        )
     await alert_rollback(run_id, reason=f"Manual rollback requested by {requested_by}")
     return {"status": "ROLLED_BACK", "pipeline_run_id": run_id}

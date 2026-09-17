@@ -23,6 +23,7 @@ import {
 import { pausePipeline, resumePipeline } from "@/api/pipeline";
 import { useAuthStore } from "@/lib/auth-store";
 import type { AppContext } from "@/types/app-context";
+import { LiveUrlBadge } from "@/components/LiveUrlBadge";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -41,6 +42,8 @@ const TABS = [
   { to: "verification", label: "Verification Inspector" },
   { to: "policy", label: "Policy & Gates" },
   { to: "audit", label: "Audit Ledger" },
+  { to: "reports", label: "Reports" },
+  { to: "cost", label: "Cost" },
 ];
 
 const STAGE_LABELS: Record<string, string> = {
@@ -117,6 +120,18 @@ export function ProjectWorkspace() {
   });
 
   const runs = runsData?.runs ?? [];
+
+  // Real gap found live (2026-09-16): these three buttons render in THIS
+  // component, not PipelineDashboard.tsx (whose own copy is hidden here via
+  // `hideRunControls` — see the outlet context below — to avoid rendering
+  // the controls twice). PipelineDashboard.tsx's copy already gates on the
+  // run's actual status; this one only ever checked `!selectedRunId`, so
+  // Pause/Resume/Emergency Rollback stayed enabled for a run that was
+  // already COMPLETED/FAILED/ROLLED_BACK — confirmed live: opening an
+  // already-FAILED run's workspace left all three clickable. `runs` already
+  // carries each run's real, durable status (COALESCE'd server-side, see
+  // projects_router.py's list_project_runs), so no extra fetch is needed.
+  const selectedRunStatus = runs.find((r) => r.pipeline_run_id === selectedRunId)?.status;
 
   // Auto-select the latest run when the URL doesn't name one, or names one
   // that doesn't belong to this project (e.g. a stale link from another
@@ -246,6 +261,20 @@ export function ProjectWorkspace() {
                 <GitBranch className="h-2.5 w-2.5" /> {project.branch}
               </span>
               {project.container_image && <span>image: {project.container_image}</span>}
+              {project.deploy_mode === "blue_green" && (
+                <span className="inline-flex items-center gap-1 rounded border border-primary/30 bg-primary/10 px-1.5 text-primary">
+                  Blue-Green
+                </span>
+              )}
+              {/* Real gap found live: this URL was computed at onboarding
+                  and thrown away — no clickable way for a user to check
+                  their product is truly live, the way Render/Vercel show
+                  you a link. Always shown once a path_prefix exists, even
+                  before a first successful rollout — same as those
+                  platforms, which assign the URL immediately and it simply
+                  doesn't respond until something is actually deployed.
+                  Status-aware since 2026-09-17 — see LiveUrlBadge. */}
+              <LiveUrlBadge liveUrl={project.live_url} status={project.live_url_status} />
             </div>
           </div>
 
@@ -318,15 +347,34 @@ export function ProjectWorkspace() {
                 </AlertDialogContent>
               </AlertDialog>
             )}
-            <Button size="sm" variant="outline" onClick={handlePause} disabled={!selectedRunId}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handlePause}
+              disabled={!selectedRunId || selectedRunStatus !== "RUNNING"}
+            >
               <Pause className="h-3.5 w-3.5" /> Pause
             </Button>
-            <Button size="sm" variant="outline" onClick={handleResume} disabled={!selectedRunId}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleResume}
+              disabled={!selectedRunId || selectedRunStatus !== "PAUSED"}
+            >
               <Play className="h-3.5 w-3.5" /> Resume
             </Button>
             <AlertDialog>
               <AlertDialogTrigger asChild>
-                <Button size="sm" variant="destructive" disabled={!selectedRunId}>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={
+                    !selectedRunId ||
+                    selectedRunStatus === "FAILED" ||
+                    selectedRunStatus === "COMPLETED" ||
+                    selectedRunStatus === "ROLLED_BACK"
+                  }
+                >
                   <AlertTriangle className="h-3.5 w-3.5" /> Emergency Rollback
                 </Button>
               </AlertDialogTrigger>

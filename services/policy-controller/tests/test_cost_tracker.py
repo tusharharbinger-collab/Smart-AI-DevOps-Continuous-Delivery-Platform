@@ -75,6 +75,38 @@ def test_compute_cost_delta_within_budget_not_flagged():
     assert result["exceeds_policy_limit"] is False
 
 
+def test_compute_cost_delta_defaults_to_module_kubernetes_rates():
+    import src.cost_tracker as cost_tracker_module
+
+    result = _compute_cost_delta(
+        canary_replicas=1, canary_cpu_vcpu=1.0, canary_mem_gib=1.0,
+        baseline_replicas=1, baseline_cpu_vcpu=1.0, baseline_mem_gib=1.0,
+        max_permitted_delta_percent=15.0,
+    )
+    expected = cost_tracker_module.CPU_COST_PER_VCPU_HOUR + cost_tracker_module.MEM_COST_PER_GIB_HOUR
+    assert result["canary_cost_usd"] == round(expected, 6)
+
+
+def test_compute_cost_delta_accepts_overridden_rates_for_a_different_target():
+    # cost_tracker_ecs.py reuses this exact formula against real AWS Fargate
+    # rates instead of the Kubernetes-node-estimate module constants — this
+    # proves overriding the rate actually changes the computed cost and
+    # doesn't silently fall back to the Kubernetes defaults.
+    result_default = _compute_cost_delta(
+        canary_replicas=1, canary_cpu_vcpu=1.0, canary_mem_gib=1.0,
+        baseline_replicas=1, baseline_cpu_vcpu=1.0, baseline_mem_gib=1.0,
+        max_permitted_delta_percent=15.0,
+    )
+    result_overridden = _compute_cost_delta(
+        canary_replicas=1, canary_cpu_vcpu=1.0, canary_mem_gib=1.0,
+        baseline_replicas=1, baseline_cpu_vcpu=1.0, baseline_mem_gib=1.0,
+        max_permitted_delta_percent=15.0,
+        cpu_rate=0.040478, mem_rate=0.004446,
+    )
+    assert result_overridden["canary_cost_usd"] == round(0.040478 + 0.004446, 6)
+    assert result_overridden["canary_cost_usd"] != result_default["canary_cost_usd"]
+
+
 def test_read_deployment_footprint_returns_none_when_not_found():
     from kubernetes.client.rest import ApiException
 

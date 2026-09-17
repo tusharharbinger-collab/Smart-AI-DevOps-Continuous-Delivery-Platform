@@ -116,6 +116,31 @@ class PolicyControllerDB:
                     json.dumps(rightsizing_rec) if rightsizing_rec is not None else None,
                 )
 
+    async def record_live_url_verification(self, tenant_id: str, pipeline_run_id: str, verified: bool) -> None:
+        """
+        Guaranteed Live Web App CI/CD — mirrors pipeline-worker's
+        src/db.py::record_live_url_verification (same real gap: a project's
+        live_url was reported without ever confirming it responds — see
+        shared/live_url_check.py's module docstring). This is the
+        canary-ramp-graduation call site; joins through
+        pipeline_executions.project_id (this table always carries it, per
+        migration 0006) since graduate_canary_ecs only ever has
+        pipeline_run_id in scope, never project_id directly.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.active_tenant_id', $1, true)", tenant_id)
+                await conn.execute(
+                    """
+                    UPDATE projects SET live_url_status = $1, live_url_verified_at = NOW()
+                    WHERE project_id = (
+                        SELECT project_id FROM pipeline_executions WHERE pipeline_run_id = $2
+                    )
+                    """,
+                    "verified" if verified else "failed",
+                    pipeline_run_id,
+                )
+
     async def update_rca_summary(self, tenant_id: str, verdict_id: str, rca_summary: str) -> None:
         """
         Fills in the RCA explanation generated asynchronously, after the

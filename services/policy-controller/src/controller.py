@@ -27,9 +27,11 @@ from src.actuation_executor import (
     DEFAULT_CANARY_DEPLOYMENT,
     DEFAULT_BASELINE_DEPLOYMENT,
 )
+from src.aws_actuation_executor import update_traffic_weights_ecs, emergency_rollback_ecs
 from src.alert_dispatcher import send_alert, alert_rollback, alert_verification_timeout, alert_approval_required
 from src.rca_trigger import trigger_rca_async
 from src.cost_tracker import compute_and_record_cost
+from src.cost_tracker_ecs import compute_and_record_cost_ecs
 from src.audit_writer import record_actuation
 from src import rollout_scheduler
 
@@ -137,6 +139,37 @@ def _build_promotion_opa_input(
     )
 
 
+async def _compute_cost(pipeline_run_id: str, target: dict, policy: dict, db) -> dict | None:
+    """
+    Branches cost computation onto the run's real deploy target — the one
+    place both handle_incoming_verdict and the manual-approval path resolve
+    a real cost_analysis.delta_percent for RULE 7 instead of a hardcoded
+    0.0. Both compute_and_record_cost (Kubernetes) and
+    compute_and_record_cost_ecs (AWS ECS) are fail-soft: None here always
+    means "not cost-gated yet," never a crash.
+    """
+    max_delta = policy.get("guardrails", {}).get("maxPermittedCostDeltaPercent", 15.0)
+    if target.get("deployment_target", "kubernetes") == "aws_ecs":
+        return await compute_and_record_cost_ecs(
+            pipeline_run_id=pipeline_run_id,
+            tenant_id=target.get("tenant_id"),
+            baseline_service_name=target["baseline_deployment_name"],
+            canary_service_name=target["canary_deployment_name"],
+            region=target.get("aws_region", "us-east-1"),
+            db=db,
+            max_permitted_delta_percent=max_delta,
+        )
+    return await compute_and_record_cost(
+        pipeline_run_id=pipeline_run_id,
+        tenant_id=target.get("tenant_id"),
+        namespace=target["namespace"],
+        baseline_deployment_name=target["baseline_deployment_name"],
+        canary_deployment_name=target["canary_deployment_name"],
+        db=db,
+        max_permitted_delta_percent=max_delta,
+    )
+
+
 async def _get_actuation_target(redis_client, pipeline_run_id: str) -> dict:
     """
     Looks up WHICH service's route/namespace/deployment this run's verdict
@@ -155,9 +188,15 @@ async def _get_actuation_target(redis_client, pipeline_run_id: str) -> dict:
             "canary_deployment_name": DEFAULT_CANARY_DEPLOYMENT,
             "baseline_deployment_name": DEFAULT_BASELINE_DEPLOYMENT,
             "tenant_id": None,
+            "deployment_target": "kubernetes",
         }
     target = json.loads(raw)
     target.setdefault("tenant_id", None)
+    # Module 8 — a run registered before deployment_target existed (any
+    # Kubernetes project onboarded before this feature) has no such key at
+    # all; defaulting to "kubernetes" keeps every existing pipeline's
+    # actuation on the exact path it always used.
+    target.setdefault("deployment_target", "kubernetes")
     # A run registered before baseline_deployment_name existed (see
     # worker.py::_register_actuation_target) — re-derive it from the
     # canary name using manifest_generator.py's own naming convention
@@ -273,21 +312,20 @@ async def handle_incoming_verdict(
     # is fail-soft (returns None, never raises) so a demo/no-cluster pipeline
     # still runs — it just never gets cost-gated or a real cost_analysis row.
     target = await _get_actuation_target(redis_client, pipeline_run_id)
-    cost_result = await compute_and_record_cost(
-        pipeline_run_id=pipeline_run_id,
-        tenant_id=target.get("tenant_id"),
-        namespace=target["namespace"],
-        baseline_deployment_name=target["baseline_deployment_name"],
-        canary_deployment_name=target["canary_deployment_name"],
-        db=db,
-        max_permitted_delta_percent=policy.get("guardrails", {}).get("maxPermittedCostDeltaPercent", 15.0),
-    )
+    cost_result = await _compute_cost(pipeline_run_id, target, policy, db)
 
     promotion_fields, active_step = _build_promotion_opa_input(
         verdict, policy, rollout_state, cost_result["delta_percent"] if cost_result else 0.0, approved_signatures=[]
     )
+    
+    is_rollback = verdict.get("status") == "FAILED"
+    requested_action = "ROLLBACK" if is_rollback else "PROMOTE_STEP"
+    if not is_rollback and target.get("deployment_strategy") == "blue_green":
+        if active_step and active_step["trafficWeight"] == 100:
+            requested_action = "BLUE_GREEN_CUTOVER"
+
     opa_input = {
-        "requested_action": "ROLLBACK" if verdict.get("status") == "FAILED" else "PROMOTE_STEP",
+        "requested_action": requested_action,
         "verification_verdict": verdict,
         "pipeline_policy": policy,
         "runtime_context": {"cluster_maintenance_lock": False, **_current_freeze_window_context()},
@@ -295,7 +333,6 @@ async def handle_incoming_verdict(
     }
 
     opa_result = await evaluate_policy_async(opa_input)  # Structural gate #2 (OPA)
-    is_rollback = verdict.get("status") == "FAILED"
     failsafe_rollback_override = (
         not opa_result["allow_action"] and opa_result.get("opa_unreachable") and is_rollback
     )
@@ -323,7 +360,8 @@ async def handle_incoming_verdict(
             remaining_samples = active_step["minSampleSize"] - promotion_fields["active_step_sample_count"]
             if remaining_duration > 0 or remaining_samples > 0:
                 await rollout_scheduler.schedule_retry_of_current_step(
-                    pipeline_run_id, target.get("tenant_id"), rollout_state, max(remaining_duration, 1.0)
+                    pipeline_run_id, target.get("tenant_id"), rollout_state, max(remaining_duration, 1.0),
+                    target=target,
                 )
                 logger.info(
                     "promotion_retry_scheduled_insufficient_evidence",
@@ -393,18 +431,33 @@ async def handle_incoming_verdict(
             "SECURITY", f"OPA unreachable — rolling back {pipeline_run_id} via fail-safe override, not blocking it"
         )
 
+    is_aws = target.get("deployment_target", "kubernetes") == "aws_ecs"
+
     if verdict.get("status") == "FAILED":
-        await emergency_rollback(
-            pipeline_run_id,
-            authorized_by="FAILSAFE:opa_unreachable" if failsafe_rollback_override else "OPA:rule=ROLLBACK",
-            route_name=target["route_name"],
-            namespace=target["namespace"],
-            canary_deployment_name=target["canary_deployment_name"],
-            tenant_id=target.get("tenant_id"),
-            db=db,
-            verdict_status=verdict.get("status"),
-            confidence=verdict.get("confidence"),
-        )
+        if is_aws:
+            await emergency_rollback_ecs(
+                pipeline_run_id,
+                authorized_by="FAILSAFE:opa_unreachable" if failsafe_rollback_override else "OPA:rule=ROLLBACK",
+                service_name=target["canary_deployment_name"].removesuffix("-canary"),
+                path_prefix=target["path_prefix"],
+                region=target.get("aws_region", "us-east-1"),
+                tenant_id=target.get("tenant_id"),
+                db=db,
+                verdict_status=verdict.get("status"),
+                confidence=verdict.get("confidence"),
+            )
+        else:
+            await emergency_rollback(
+                pipeline_run_id,
+                authorized_by="FAILSAFE:opa_unreachable" if failsafe_rollback_override else "OPA:rule=ROLLBACK",
+                route_name=target["route_name"],
+                namespace=target["namespace"],
+                canary_deployment_name=target["canary_deployment_name"],
+                tenant_id=target.get("tenant_id"),
+                db=db,
+                verdict_status=verdict.get("status"),
+                confidence=verdict.get("confidence"),
+            )
         await alert_rollback(pipeline_run_id, reason="Statistical failure detected by verification engine")
         await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="ROLLBACK")
         if rollout_state is not None:
@@ -417,18 +470,47 @@ async def handle_incoming_verdict(
         # with no registered rollout_state (see _build_promotion_opa_input).
         canary_weight = active_step["trafficWeight"] if active_step else verdict.get("recommended_weight", 25)
         baseline_weight = 100 - canary_weight
-        await update_traffic_weights(
-            pipeline_run_id,
-            canary_weight=canary_weight,
-            baseline_weight=baseline_weight,
-            authorized_by="OPA:rule=PROMOTE_STEP",
-            route_name=target["route_name"],
-            namespace=target["namespace"],
-            tenant_id=target.get("tenant_id"),
-            db=db,
-            verdict_status=verdict.get("status"),
-            confidence=verdict.get("confidence"),
-        )
+        if is_aws:
+            if target.get("deployment_strategy") == "blue_green" and canary_weight == 100:
+                from src.aws_actuation_executor import blue_green_cutover_ecs
+                await blue_green_cutover_ecs(
+                    pipeline_run_id,
+                    authorized_by="OPA:rule=BLUE_GREEN_CUTOVER",
+                    service_name=target["canary_deployment_name"].removesuffix("-canary"),
+                    path_prefix=target["path_prefix"],
+                    region=target.get("aws_region", "us-east-1"),
+                    tenant_id=target.get("tenant_id"),
+                    db=db,
+                    verdict_status=verdict.get("status"),
+                    confidence=verdict.get("confidence"),
+                )
+            else:
+                await update_traffic_weights_ecs(
+                    pipeline_run_id,
+                    canary_weight=canary_weight,
+                    baseline_weight=baseline_weight,
+                    authorized_by="OPA:rule=PROMOTE_STEP",
+                    service_name=target["canary_deployment_name"].removesuffix("-canary"),
+                    path_prefix=target["path_prefix"],
+                    region=target.get("aws_region", "us-east-1"),
+                    tenant_id=target.get("tenant_id"),
+                    db=db,
+                    verdict_status=verdict.get("status"),
+                    confidence=verdict.get("confidence"),
+                )
+        else:
+            await update_traffic_weights(
+                pipeline_run_id,
+                canary_weight=canary_weight,
+                baseline_weight=baseline_weight,
+                authorized_by="OPA:rule=PROMOTE_STEP",
+                route_name=target["route_name"],
+                namespace=target["namespace"],
+                tenant_id=target.get("tenant_id"),
+                db=db,
+                verdict_status=verdict.get("status"),
+                confidence=verdict.get("confidence"),
+            )
         await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="PROMOTE_STEP")
         await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None, db=db)
 
@@ -474,7 +556,8 @@ async def _advance_or_graduate(
         return
 
     await rollout_scheduler.advance_to_next_step(
-        redis_client, pipeline_run_id, target.get("tenant_id"), rollout_state, next_index, trace_id
+        redis_client, pipeline_run_id, target.get("tenant_id"), rollout_state, next_index, trace_id,
+        target=target,
     )
 
 
@@ -502,20 +585,17 @@ async def handle_approval(
     target = await _get_actuation_target(redis_client, pipeline_run_id)
     approved_signatures = [{"role": approver_role, "user": approver_user}]
 
-    cost_result = await compute_and_record_cost(
-        pipeline_run_id=pipeline_run_id,
-        tenant_id=target.get("tenant_id"),
-        namespace=target["namespace"],
-        baseline_deployment_name=target["baseline_deployment_name"],
-        canary_deployment_name=target["canary_deployment_name"],
-        db=db,
-        max_permitted_delta_percent=policy.get("guardrails", {}).get("maxPermittedCostDeltaPercent", 15.0),
-    )
+    cost_result = await _compute_cost(pipeline_run_id, target, policy, db)
     promotion_fields, active_step = _build_promotion_opa_input(
         verdict, policy, rollout_state, cost_result["delta_percent"] if cost_result else 0.0, approved_signatures
     )
+    
+    requested_action = "PROMOTE_STEP"
+    if target.get("deployment_strategy") == "blue_green" and active_step and active_step["trafficWeight"] == 100:
+        requested_action = "BLUE_GREEN_CUTOVER"
+
     opa_input = {
-        "requested_action": "PROMOTE_STEP",
+        "requested_action": requested_action,
         "verification_verdict": verdict,
         "pipeline_policy": policy,
         "runtime_context": {"cluster_maintenance_lock": False, **_current_freeze_window_context()},
@@ -528,18 +608,47 @@ async def handle_approval(
 
     canary_weight = active_step["trafficWeight"] if active_step else 100
     baseline_weight = 100 - canary_weight
-    await update_traffic_weights(
-        pipeline_run_id,
-        canary_weight=canary_weight,
-        baseline_weight=baseline_weight,
-        authorized_by=f"APPROVED:{approver_role}",
-        route_name=target["route_name"],
-        namespace=target["namespace"],
-        tenant_id=target.get("tenant_id"),
-        db=db,
-        verdict_status=verdict.get("status"),
-        confidence=verdict.get("confidence"),
-    )
+    if target.get("deployment_target", "kubernetes") == "aws_ecs":
+        if target.get("deployment_strategy") == "blue_green" and canary_weight == 100:
+            from src.aws_actuation_executor import blue_green_cutover_ecs
+            await blue_green_cutover_ecs(
+                pipeline_run_id,
+                authorized_by=f"APPROVED:{approver_role}",
+                service_name=target["canary_deployment_name"].removesuffix("-canary"),
+                path_prefix=target["path_prefix"],
+                region=target.get("aws_region", "us-east-1"),
+                tenant_id=target.get("tenant_id"),
+                db=db,
+                verdict_status=verdict.get("status"),
+                confidence=verdict.get("confidence"),
+            )
+        else:
+            await update_traffic_weights_ecs(
+                pipeline_run_id,
+                canary_weight=canary_weight,
+                baseline_weight=baseline_weight,
+                authorized_by=f"APPROVED:{approver_role}",
+                service_name=target["canary_deployment_name"].removesuffix("-canary"),
+                path_prefix=target["path_prefix"],
+                region=target.get("aws_region", "us-east-1"),
+                tenant_id=target.get("tenant_id"),
+                db=db,
+                verdict_status=verdict.get("status"),
+                confidence=verdict.get("confidence"),
+            )
+    else:
+        await update_traffic_weights(
+            pipeline_run_id,
+            canary_weight=canary_weight,
+            baseline_weight=baseline_weight,
+            authorized_by=f"APPROVED:{approver_role}",
+            route_name=target["route_name"],
+            namespace=target["namespace"],
+            tenant_id=target.get("tenant_id"),
+            db=db,
+            verdict_status=verdict.get("status"),
+            confidence=verdict.get("confidence"),
+        )
     await trigger_rca_async(db, tenant_id=target.get("tenant_id"), verdict=verdict, action="PROMOTE_STEP")
     await _advance_or_graduate(pipeline_run_id, target, rollout_state, redis_client, trace_id=None, db=db)
     return {"status": "PROMOTED", "canary_weight": canary_weight}

@@ -22,20 +22,41 @@ from src.pipeline.execution_state import (
     StageStatus,
 )
 from src.tasks.build_task import run_build_task, run_test_task
+from src.tasks.dockerfile_synthesis import synthesize_dockerfile
 from src.tasks.git_clone import cleanup_workspace
 from src.tasks.deploy_task import (
     deploy_canary_task,
     deploy_project_canary_task,
     set_first_deployment_route_weights,
+    wait_for_deployment_ready,
 )
-from src.tasks.ecr_auth import is_ecr_image, get_ecr_registry_credential
+from src.tasks.ecr_auth import is_ecr_image, get_ecr_registry_credential, ensure_ecr_repository_exists
 from src.tasks.verification_task import run_verification_task
 from src.tasks.rollout_task import run_rollout_task
 from src.schemas import parse_duration_seconds
+from src.aws.ecs_deploy_task import (
+    deploy_ecs_canary_task,
+    deploy_ecs_baseline_task,
+    wait_for_ecs_service_ready,
+    set_first_deployment_ecs_weights,
+    cutover_blue_green_ecs_weights,
+    rollback_blue_green_ecs_weights,
+    graduate_blue_green_ecs,
+    compute_blue_green_cost,
+)
+from shared.aws_ecs_actuation import wait_for_target_group_healthy
+from shared.live_url_check import verify_live_url
+from shared.live_url_builder import build_live_url
 
 logger = structlog.get_logger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 EXPLAINABILITY_SERVICE_URL = os.environ.get("EXPLAINABILITY_SERVICE_URL", "http://explainability-service:8004")
+# Module 8 continuation — must match api-gateway's projects_router.py's own
+# AWS_ALB_BASE_URL exactly (the real shared ALB's stable DNS name). Needed
+# here, not just in api-gateway, because the blue-green cutover path below
+# verifies the live URL for real BEFORE reporting a rollout as complete —
+# api-gateway's own copy only ever computes the string for display.
+AWS_ALB_BASE_URL = os.environ.get("AWS_ALB_BASE_URL")
 
 
 class PipelineOrchestrator:
@@ -169,6 +190,23 @@ class PipelineOrchestrator:
             # human-readable slug), so it travels alongside the route/
             # namespace lookup policy-controller already does per verdict.
             "tenant_id": tenant_id,
+            # Module 8 — real gap found live: policy-controller's ongoing
+            # weight-shift/graduate/rollback actuation was hardcoded to
+            # Kubernetes with no way to know a project's real deploy target.
+            # `deploymentTarget`/`awsRegion`/`pathPrefix` are emitted onto
+            # this same canary_loop config by generate_project_pipeline_yaml
+            # for an "aws_ecs" project — reused here as-is (never guessed)
+            # so policy-controller's actuation branch and this project's
+            # real onboarded ALB listener rule can never drift apart.
+            # canary_deployment_name/baseline_deployment_name double as the
+            # real ECS service names for an AWS project too — both targets
+            # derive them from the identical f"{service_name}-canary"/
+            # "-baseline" convention (see ecs_manifest.py), so no separate
+            # field is needed for that part.
+            "deployment_target": canary_loop_cfg.get("deploymentTarget", "kubernetes"),
+            "aws_region": canary_loop_cfg.get("awsRegion", "us-east-1"),
+            "path_prefix": canary_loop_cfg.get("pathPrefix"),
+            "deployment_strategy": canary_loop_cfg.get("deploymentStrategy", "canary"),
         }
         self.redis.set(f"actuation_target:{run_id}", json.dumps(target), ex=86400)
         logger.info("actuation_target_registered", pipeline_run_id=run_id, **target)
@@ -324,6 +362,11 @@ class PipelineOrchestrator:
         # first-deployment handling below.
         last_deploy_image_name: str | None = None
         last_deploy_image_tag: str | None = None
+        # Set by the build stage — reused by the test stage as a hint for
+        # WHICH requirements.txt is this run's own, when a repo has more
+        # than one at equal depth (see build_task.py's
+        # _find_requirements_file docstring for the real bug this guards).
+        dockerfile: str | None = None
 
         self._log(run_id, f"Pipeline started for {service_name} — stages: {', '.join(order)}")
 
@@ -340,7 +383,41 @@ class PipelineOrchestrator:
                 self.state_store.save_state_sync(initial_state)
 
                 if stage_type == "build":
-                    dockerfile = config.get("dockerfilePath", "sample-app/v1.1.0/Dockerfile")
+                    # Real gap found live: this only ever read `dockerfilePath`
+                    # — a project onboarded via the wizard's YAML-manifest or
+                    # auto-detected-language path (shared/repo_scanner.py,
+                    # dockerfile_synthesis.py) worked for the onboarding-time
+                    # PREVIEW build, but a real triggered rollout's build
+                    # stage had no way to synthesize a Dockerfile at all, so
+                    # it would fail here even though the exact same repo had
+                    # already been proven buildable during onboarding.
+                    # Mirrors build_preview.py's synthesis branch exactly —
+                    # same templates, same "never guess a start command"
+                    # rule — so preview and real rollout answer "does this
+                    # build" with literally the same mechanism.
+                    dockerfile_content = None
+                    # Guaranteed Live Web App CI/CD — a static site (no
+                    # process to start, nginx just serves files) and a Vite/
+                    # CRA "spa" framework (built to static assets, also
+                    # served by nginx) are the two real cases with no
+                    # startCommand at all — requiring one for them would
+                    # reject a perfectly buildable project.
+                    no_start_command_needed = (
+                        config.get("language") == "static" or config.get("framework") == "spa"
+                    )
+                    if config.get("dockerfilePath"):
+                        dockerfile = config["dockerfilePath"]
+                    elif config.get("language") and (config.get("startCommand") or no_start_command_needed):
+                        manifest_path = config.get("manifestPath", "")
+                        dockerfile_content = synthesize_dockerfile(
+                            config["language"], manifest_path or "requirements.txt", config.get("startCommand"),
+                            framework=config.get("framework"),
+                        )
+                        manifest_dir = manifest_path.rsplit("/", 1)[0] if "/" in manifest_path else ""
+                        dockerfile = "/".join(p for p in [manifest_dir, "Dockerfile"] if p) or "Dockerfile"
+                        self._log(run_id, f"No Dockerfile declared — synthesized one for {config['language']} at {dockerfile}")
+                    else:
+                        dockerfile = "sample-app/v1.1.0/Dockerfile"
                     # target_version (a real per-run override) always wins;
                     # otherwise resolve the manifest's own imageTag, honoring
                     # a literal `{{ .TargetVersion }}` placeholder if present
@@ -406,9 +483,15 @@ class PipelineOrchestrator:
                         # worker's own AWS IAM identity registry access, so
                         # generate the (12h-lived) push token on the fly
                         # instead of asking a user to paste one in.
-                        registry_credential = get_ecr_registry_credential(
-                            os.environ.get("AWS_REGION", "us-east-1")
-                        )
+                        aws_region = os.environ.get("AWS_REGION", "us-east-1")
+                        # Real gap found live: unlike most registries, ECR
+                        # doesn't auto-create a repository on first push — a
+                        # project's very first build always failed the push
+                        # unless someone had already run `aws ecr
+                        # create-repository` by hand. Idempotent, so this is
+                        # a no-op on every build after the first.
+                        ensure_ecr_repository_exists(image_name, aws_region)
+                        registry_credential = get_ecr_registry_credential(aws_region)
 
                     self._log(run_id, f"Building {dockerfile} -> tag {tag}")
                     res = run_build_task(
@@ -418,6 +501,7 @@ class PipelineOrchestrator:
                         repo_config=repo_config,
                         image_name=image_name,
                         registry_credential=registry_credential,
+                        dockerfile_content=dockerfile_content,
                     )
                     results[stage_name] = res
                     repo_clone_workspace = res.get("workspace")
@@ -426,11 +510,37 @@ class PipelineOrchestrator:
                     self._log(run_id, f"Build finished: {res.get('status')}")
 
                 elif stage_type == "test":
-                    test_cmd = config.get("command", "pytest sample-app/v1.1.0/tests/ -v")
-                    self._log(run_id, f"Running: {test_cmd}")
-                    res = run_test_task(run_id, test_cmd, cwd=repo_clone_workspace)
-                    results[stage_name] = res
-                    self._log(run_id, f"Tests finished: {res.get('status')}")
+                    # Real gap found live: this used to default to a
+                    # Python-specific `pytest` command whenever a pipeline's
+                    # test stage declared none, and ANY failure here — wrong
+                    # language, no matching test files, the command itself
+                    # missing on this container — hard-failed the whole
+                    # pipeline. A project's own Dockerfile very often
+                    # already runs its real tests as a build layer (e.g.
+                    # `RUN npm run test` before the production build), which
+                    # already gates the build genuinely — this separate
+                    # stage runs in pipeline-worker's OWN container (no
+                    # Node.js, no Go, etc.), so it can only ever be a
+                    # supplementary, best-effort signal for whatever
+                    # language IS runnable here, never a mandatory gate.
+                    # No command configured -> skip outright, don't guess one.
+                    test_cmd = config.get("command")
+                    if not test_cmd:
+                        self._log(run_id, "No test command configured — skipping (the Docker build itself may already run real tests).")
+                        results[stage_name] = {"status": "skipped", "reason": "no test command configured"}
+                    else:
+                        self._log(run_id, f"Running: {test_cmd}")
+                        requirements_subdir = dockerfile.rsplit("/", 1)[0] if dockerfile and "/" in dockerfile else None
+                        try:
+                            res = run_test_task(
+                                run_id, test_cmd, cwd=repo_clone_workspace, requirements_subdir=requirements_subdir
+                            )
+                            results[stage_name] = res
+                            self._log(run_id, f"Tests finished: {res.get('status')}")
+                        except Exception as e:
+                            logger.warning("test_stage_failed_non_blocking", run_id=run_id, error=str(e))
+                            results[stage_name] = {"status": "failed_non_blocking", "error": str(e)}
+                            self._log(run_id, f"Test stage failed (non-blocking, continuing to build/deploy): {e}")
 
                 elif stage_type == "deploy":
                     deployment = config.get("deployment", "payment-service-canary")
@@ -451,7 +561,23 @@ class PipelineOrchestrator:
                     # using its own hardcoded name/namespace/image exactly as
                     # before. See deploy_project_canary_task's docstring for
                     # the real gap this branch closes.
-                    if config.get("image"):
+                    if config.get("image") and config.get("deploymentTarget") == "aws_ecs":
+                        # Module 8 — real gap found live: this branch didn't
+                        # exist at all until now, so an "aws_ecs" project's
+                        # real ECS canary service kept running whatever
+                        # image:tag onboarding gave it at creation time,
+                        # forever — a genuine git push built and pushed a
+                        # new image to ECR that nothing ever deployed.
+                        res = deploy_ecs_canary_task(
+                            run_id,
+                            service_name=config.get("containerName", service_name),
+                            image=config["image"],
+                            image_tag=deploy_tag,
+                            region=config.get("awsRegion", "us-east-1"),
+                        )
+                        last_deploy_image_name = config["image"]
+                        last_deploy_image_tag = deploy_tag
+                    elif config.get("image"):
                         res = deploy_project_canary_task(
                             run_id,
                             namespace=config.get("namespace", spec.namespace),
@@ -468,6 +594,127 @@ class PipelineOrchestrator:
                     self._log(run_id, f"Deploy finished: {res.get('status')}")
 
                 elif stage_type == "canary_loop":
+                    # Real gap found live (2026-09-16): a genuinely new web
+                    # app with zero real visitors can never accumulate the
+                    # samples PROMOTE_STEP's statistical gates require, so a
+                    # project onboarded with deploy_mode: blue_green would
+                    # sit DEGRADED ("insufficient samples") forever and never
+                    # actually reach its live URL — even though the build and
+                    # deploy themselves succeeded. Blue-green is deliberately
+                    # its own strategy, checked BEFORE is_first_deploy and
+                    # applying to EVERY rollout (not just the first — this is
+                    # a deployment-strategy choice, not a one-time exception):
+                    # it never runs statistical verification at all, gating
+                    # the cutover on real infrastructure health instead
+                    # (ECS task stability + a real ALB HTTP liveness check),
+                    # the same category of gate the first-deployment branch
+                    # below already established as legitimate.
+                    is_blue_green = (
+                        config.get("deploymentStrategy") == "blue_green"
+                        and config.get("deploymentTarget") == "aws_ecs"
+                    )
+                    if is_blue_green:
+                        ecs_service_name = config.get("service", service_name)
+                        aws_region = config.get("awsRegion", "us-east-1")
+                        path_prefix = config.get("pathPrefix") or f"/api/v1/{ecs_service_name}"
+                        live_url = build_live_url(AWS_ALB_BASE_URL, path_prefix)
+                        blue_green_policy = {"gates": spec.gates, "guardrails": spec.guardrails}
+
+                        self._log(run_id, "Blue-green rollout — waiting for the new (green) ECS service to stabilize...")
+                        wait_for_ecs_service_ready(aws_region, ecs_service_name, "canary")
+                        self._log(run_id, "Waiting for the green target group to report healthy via a real ALB health check...")
+                        wait_for_target_group_healthy(aws_region, f"{ecs_service_name}-canary")
+                        self._log(run_id, "Green is healthy — cutting over 100% of traffic (no statistical verification needed).")
+                        cutover_blue_green_ecs_weights(
+                            run_id, service_name=ecs_service_name, path_prefix=path_prefix,
+                            region=aws_region, pipeline_policy=blue_green_policy,
+                        )
+                        # Real gap found live (2026-09-17): this whole
+                        # blue-green path never wrote a single audit_ledger
+                        # row — the Audit Ledger UI correctly showed "0
+                        # total actions" for a run that had genuinely cut
+                        # over real production traffic, because nothing
+                        # here ever called record_actuation (unlike the
+                        # verdict-driven canary path, which always does via
+                        # policy-controller's audit_writer.py).
+                        if self.db:
+                            self.db.run_from_thread(
+                                self.db.record_actuation(
+                                    tenant_id=resolved_tenant_id, pipeline_run_id=run_id,
+                                    action="BLUE_GREEN_CUTOVER", canary_weight=100, baseline_weight=0,
+                                    authorized_by="OPA:rule=HEALTH_GATED_CUTOVER",
+                                )
+                            )
+                            # Real gap found live (2026-09-17): cost_analysis
+                            # had 0 rows for any blue-green rollout ever —
+                            # the Reports & Cost UI and RULE 7's guardrail
+                            # both read from a table only the verdict-driven
+                            # controller.py ever wrote to. Fail-soft: a cost
+                            # snapshot failing must never fail the rollout.
+                            cost_guardrail = spec.guardrails.get("maxPermittedCostDeltaPercent", 15.0)
+                            cost_result = compute_blue_green_cost(ecs_service_name, aws_region, cost_guardrail)
+                            if cost_result:
+                                self.db.run_from_thread(
+                                    self.db.record_cost_analysis(
+                                        tenant_id=resolved_tenant_id, pipeline_run_id=run_id,
+                                        baseline_cost=cost_result["baseline_cost_usd"],
+                                        canary_cost=cost_result["canary_cost_usd"],
+                                        delta_percent=cost_result["delta_percent"],
+                                    )
+                                )
+
+                        verify_result = (
+                            verify_live_url(live_url) if live_url
+                            else {"verified": False, "status_code": None, "error": "AWS_ALB_BASE_URL not configured"}
+                        )
+                        if pipeline_id and self.db:
+                            self.db.run_from_thread(
+                                self.db.record_live_url_verification(
+                                    pipeline_id, resolved_tenant_id, verify_result["verified"]
+                                )
+                            )
+                        if not verify_result["verified"]:
+                            self._log(
+                                run_id,
+                                f"Live URL verification failed after cutover ({verify_result.get('error')}) — "
+                                "rolling back to the previous version.",
+                            )
+                            rollback_blue_green_ecs_weights(
+                                run_id, service_name=ecs_service_name, path_prefix=path_prefix, region=aws_region,
+                            )
+                            if self.db:
+                                self.db.run_from_thread(
+                                    self.db.record_actuation(
+                                        tenant_id=resolved_tenant_id, pipeline_run_id=run_id,
+                                        action="ROLLBACK", canary_weight=0, baseline_weight=100,
+                                        authorized_by="SYSTEM:blue_green_post_cutover_live_url_verification_failed",
+                                    )
+                                )
+                            raise RuntimeError(
+                                f"Blue-green cutover for '{ecs_service_name}' failed live-URL verification "
+                                f"({verify_result.get('error')}) — rolled back to the previous version."
+                            )
+
+                        self._log(run_id, "Live URL verified — graduating: promoting the new image onto baseline.")
+                        graduate_blue_green_ecs(
+                            run_id, service_name=ecs_service_name, image=last_deploy_image_name,
+                            image_tag=last_deploy_image_tag, path_prefix=path_prefix, region=aws_region,
+                        )
+                        if self.db:
+                            self.db.run_from_thread(
+                                self.db.record_actuation(
+                                    tenant_id=resolved_tenant_id, pipeline_run_id=run_id,
+                                    action="GRADUATE", canary_weight=0, baseline_weight=100,
+                                    authorized_by="SYSTEM:blue_green_graduate",
+                                )
+                            )
+                        initial_state.current_traffic_weight = 100
+                        initial_state.last_updated = datetime.now(timezone.utc).isoformat()
+                        self.state_store.save_state_sync(initial_state)
+                        results[stage_name] = {"status": "blue_green_cutover_verified_and_graduated"}
+                        self._log(run_id, "Blue-green rollout complete — live and verified.")
+                        continue
+
                     # Real gap found live (2026-09-15): a project's genuinely
                     # first-ever deployment has no prior version to compare
                     # against — running statistical verification against a
@@ -493,21 +740,96 @@ class PipelineOrchestrator:
                             "First-ever deployment for this project — no baseline to compare against yet; "
                             "shipping straight to 100% and skipping canary verification.",
                         )
-                        if last_deploy_image_name:
+                        if last_deploy_image_name and config.get("deploymentTarget") == "aws_ecs":
+                            # Module 8 — AWS ECS equivalent of the Kubernetes
+                            # first-deployment branch below: deploy baseline
+                            # with the same image the canary deploy stage
+                            # just pushed, wait for BOTH real ECS services to
+                            # actually stabilize (the direct equivalent of
+                            # wait_for_deployment_ready) before cutting real
+                            # ALB traffic over — an unhealthy first AWS
+                            # deployment must never get traffic either.
+                            ecs_service_name = config.get("service", service_name)
+                            aws_region = config.get("awsRegion", "us-east-1")
+                            deploy_ecs_baseline_task(
+                                run_id, ecs_service_name, last_deploy_image_name, last_deploy_image_tag, aws_region,
+                            )
+                            self._log(run_id, "Waiting for the new ECS services to become stable before cutting over traffic...")
+                            for cohort in ("canary", "baseline"):
+                                wait_for_ecs_service_ready(aws_region, ecs_service_name, cohort)
+                            self._log(run_id, "ECS services stable — cutting over traffic to 100%.")
+                            path_prefix = config.get("pathPrefix") or f"/api/v1/{ecs_service_name}"
+                            set_first_deployment_ecs_weights(
+                                run_id,
+                                service_name=ecs_service_name,
+                                path_prefix=path_prefix,
+                                region=aws_region,
+                                pipeline_policy={"gates": spec.gates, "guardrails": spec.guardrails},
+                            )
+                            # Guaranteed Live Web App CI/CD — real gap this
+                            # closes: everything above confirms the ECS
+                            # tasks are RUNNING and shifts the ALB weight,
+                            # but nothing ever confirmed a real visitor's
+                            # request through the real ALB actually gets a
+                            # response — the exact "healthy target group,
+                            # 404 through the real URL" class of bug (ALB
+                            # path-prefix trap, see CLAUDE.md) that
+                            # target-group health alone can't catch. Not
+                            # gated (unlike blue-green's own check): a
+                            # first deployment has no prior known-good
+                            # version to roll back TO, so a failed check
+                            # here is recorded and logged, not fatal.
+                            if AWS_ALB_BASE_URL:
+                                verify_result = verify_live_url(build_live_url(AWS_ALB_BASE_URL, path_prefix))
+                                if pipeline_id and self.db:
+                                    self.db.run_from_thread(
+                                        self.db.record_live_url_verification(
+                                            pipeline_id, resolved_tenant_id, verify_result["verified"]
+                                        )
+                                    )
+                                if verify_result["verified"]:
+                                    self._log(run_id, "Live URL verified — a real request through the ALB got a response.")
+                                else:
+                                    self._log(
+                                        run_id,
+                                        f"Live URL verification did not succeed ({verify_result.get('error')}) — "
+                                        "the deployment is live per ECS/ALB state, but check the app's routing "
+                                        "(e.g. does it handle the assigned path prefix?).",
+                                    )
+                        elif last_deploy_image_name:
                             deploy_cfg = next(
                                 (s.get("config", {}) for s in spec.stages if s.get("type") == "deploy"), {}
                             )
+                            deploy_namespace = deploy_cfg.get("namespace", spec.namespace)
                             baseline_deployment_name = (
                                 config.get("baselineDeployment") or f"{service_name}-baseline"
                             )
+                            canary_deployment_name = config.get("canaryDeployment") or f"{service_name}-canary"
                             deploy_project_canary_task(
                                 run_id,
-                                namespace=deploy_cfg.get("namespace", spec.namespace),
+                                namespace=deploy_namespace,
                                 deployment_name=baseline_deployment_name,
                                 container_name=deploy_cfg.get("containerName", service_name),
                                 image_name=last_deploy_image_name,
                                 image_tag=last_deploy_image_tag,
                             )
+                            # Real gap found live: everything above patches
+                            # the Deployment objects, but nothing ever
+                            # confirmed a pod actually came up healthy before
+                            # cutting real traffic over — "patched" and
+                            # "serving traffic" were silently treated as the
+                            # same thing. wait_for_deployment_ready raises on
+                            # timeout, which propagates to this pipeline's
+                            # normal failure path (FAILED + real RCA) and
+                            # deliberately happens BEFORE route weights ever
+                            # change and BEFORE mark_first_deployment_completed
+                            # — an unhealthy first deployment never gets
+                            # traffic, and a retry is still correctly treated
+                            # as a first deployment, not silently marked done.
+                            self._log(run_id, "Waiting for the new deployment to become healthy before cutting over traffic...")
+                            for name in (canary_deployment_name, baseline_deployment_name):
+                                wait_for_deployment_ready(run_id, namespace=deploy_namespace, deployment_name=name)
+                            self._log(run_id, "Deployment is healthy — cutting over traffic to 100%.")
                             # Real gap found live: everything above patches
                             # the Deployments, but nothing told the real
                             # Gateway API HTTPRoute this project is now
@@ -521,7 +843,7 @@ class PipelineOrchestrator:
                             route_name = config.get("routeName") or f"{service_name}-route"
                             set_first_deployment_route_weights(
                                 run_id,
-                                namespace=deploy_cfg.get("namespace", spec.namespace),
+                                namespace=deploy_namespace,
                                 route_name=route_name,
                                 pipeline_policy={"gates": spec.gates, "guardrails": spec.guardrails},
                             )
@@ -550,7 +872,10 @@ class PipelineOrchestrator:
                         rollout_res = run_rollout_task(run_id, steps, 0, self.state_store)
                         self._log(run_id, f"Traffic step: {rollout_res.get('traffic_weight', rollout_res.get('weight', 0))}% canary — running verification")
                         verdict = run_verification_task(
-                            run_id, spec.verificationConfig, trace_id=trace_id, tenant_id=resolved_tenant_id
+                            run_id, spec.verificationConfig, trace_id=trace_id, tenant_id=resolved_tenant_id,
+                            deployment_target=config.get("deploymentTarget", "kubernetes"),
+                            aws_region=config.get("awsRegion"),
+                            ecs_service_name=config.get("service"),
                         )
                         results[stage_name] = {"rollout": rollout_res, "verdict": verdict}
                         self._log(

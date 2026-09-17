@@ -5,11 +5,14 @@ Executes verification for the active canary step. Prefers real telemetry:
 if the pipeline's `verificationConfig.metrics` entries carry a `prometheus`
 query block (see docs/roadmap/02-real-telemetry.md), this asks
 verification-engine's `/verify` to pull real, live-scraped data itself
-(`use_prometheus=True`) rather than sending any samples at all. Only when
-NO metric declares a `prometheus` block does this fall back to synthesizing
-representative telemetry locally — an explicit, clearly-logged demo/fallback
-path, not the default, for pipelines that haven't been wired to a real
-metrics source yet.
+(`use_prometheus=True`) rather than sending any samples at all. Same for a
+`cloudwatch` block (P1, 2026-09-16) on an AWS ECS-deployed project's
+metrics — `use_cloudwatch=True`, with the run's real deployment_target/
+aws_region/service_name threaded through from worker.py's own canary_loop
+config (never guessed here). Only when NO metric declares either block
+does this fall back to synthesizing representative telemetry locally — an
+explicit, clearly-logged demo/fallback path, not the default, for
+pipelines that haven't been wired to a real metrics source yet.
 """
 import os
 import random
@@ -64,12 +67,18 @@ def run_verification_task(
     elapsed_seconds: float = 180.0,
     trace_id: str | None = None,
     tenant_id: str | None = None,
+    deployment_target: str = "kubernetes",
+    aws_region: str | None = None,
+    ecs_service_name: str | None = None,
 ) -> dict:
     """
-    Calls verification-engine's /verify — with real Prometheus-backed
-    telemetry when the pipeline's metrics are wired for it, synthesized
-    telemetry otherwise — and returns the resulting (signed, published)
-    verdict.
+    Calls verification-engine's /verify — with real Prometheus- or
+    CloudWatch-backed telemetry when the pipeline's metrics are wired for
+    it, synthesized telemetry otherwise — and returns the resulting
+    (signed, published) verdict. `deployment_target`/`aws_region`/
+    `ecs_service_name` come from worker.py's own canary_loop stage config
+    (the same fields _register_actuation_target already threads through
+    for actuation) — never guessed here.
     """
     logger.info("verification_task_started", pipeline_run_id=pipeline_run_id)
 
@@ -77,16 +86,31 @@ def run_verification_task(
     min_eval_seconds = (verification_config or {}).get("minEvaluationWindowSeconds", 120)
 
     use_prometheus = any(m.get("prometheus") for m in metrics)
+    # "cloudwatch" in m, not m.get("cloudwatch") — a real cloudwatch config is
+    # legitimately `{}` for every metric the project-YAML generator emits
+    # (unlike prometheus, which always carries real query strings and is
+    # never an empty-but-present dict), so a truthiness check here would
+    # treat every real AWS ECS project's metrics as unconfigured and this
+    # would never actually turn True. See src/main.py's identical fix in
+    # _fetch_metric_from_cloudwatch for the same underlying trap.
+    use_cloudwatch = not use_prometheus and deployment_target == "aws_ecs" and any(
+        "cloudwatch" in m for m in metrics
+    )
     baseline_telemetry: dict = {}
     canary_telemetry: dict = {}
 
     if use_prometheus:
         logger.info("verification_using_real_prometheus_telemetry", pipeline_run_id=pipeline_run_id)
+    elif use_cloudwatch:
+        logger.info(
+            "verification_using_real_cloudwatch_telemetry",
+            pipeline_run_id=pipeline_run_id, aws_region=aws_region, ecs_service_name=ecs_service_name,
+        )
     else:
         logger.warning(
             "verification_using_synthetic_fallback_telemetry",
             pipeline_run_id=pipeline_run_id,
-            reason="no metric in verificationConfig declares a `prometheus` query block",
+            reason="no metric in verificationConfig declares a `prometheus`/`cloudwatch` query block",
         )
         for metric_cfg in metrics:
             b, c = _synthesize_telemetry(metric_cfg)
@@ -100,6 +124,9 @@ def run_verification_task(
                 "pipeline_run_id": pipeline_run_id,
                 "metrics": metrics,
                 "use_prometheus": use_prometheus,
+                "use_cloudwatch": use_cloudwatch,
+                "aws_region": aws_region,
+                "ecs_service_name": ecs_service_name,
                 "baseline_telemetry": baseline_telemetry,
                 "canary_telemetry": canary_telemetry,
                 "elapsed_seconds": max(elapsed_seconds, min_eval_seconds),

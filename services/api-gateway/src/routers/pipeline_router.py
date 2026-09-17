@@ -234,10 +234,23 @@ async def get_run(pipeline_run_id: str, request: Request, db: AsyncSession = Dep
     result = await db.execute(
         text(
             """
-            SELECT pipeline_run_id, target_version, status, current_stage,
-                   current_traffic_weight, started_at, completed_at
-            FROM pipeline_executions
-            WHERE pipeline_run_id = :run_id AND tenant_id = :tenant_id
+            -- `pipeline_executions.status` is written once, as 'PENDING', at
+            -- trigger time and never updated again — the durable final status
+            -- lives in `execution_state.status` (see CLAUDE.md's own trap
+            -- note). Reading the raw column here made an already-terminal
+            -- run (COMPLETED/FAILED/ROLLED_BACK) whose 24h Redis `state:`
+            -- key had expired report back as "PENDING" once it fell through
+            -- to this fallback — which the frontend's Emergency Rollback
+            -- disabled-check doesn't recognize as terminal, so the button
+            -- stayed wrongly enabled for an old, already-finished run.
+            SELECT e.pipeline_run_id, e.target_version,
+                   COALESCE(es.status, e.status) AS status,
+                   COALESCE(es.current_stage, e.current_stage) AS current_stage,
+                   COALESCE(es.current_traffic_weight, e.current_traffic_weight) AS current_traffic_weight,
+                   e.started_at, e.completed_at
+            FROM pipeline_executions e
+            LEFT JOIN execution_state es ON es.pipeline_run_id = e.pipeline_run_id
+            WHERE e.pipeline_run_id = :run_id AND e.tenant_id = :tenant_id
             """
         ),
         {"run_id": pipeline_run_id, "tenant_id": tenant_id},

@@ -98,12 +98,16 @@ def test_ecr_image_auto_generates_a_registry_credential(monkeypatch, tmp_path):
     manifest_path = _write_manifest(tmp_path, "123456789012.dkr.ecr.us-east-1.amazonaws.com/orders-api")
     captured = {}
 
-    def _fake_run_build_task(run_id, dockerfile, tag, repo_config=None, image_name=None, registry_credential=None):
+    def _fake_run_build_task(run_id, dockerfile, tag, repo_config=None, image_name=None, registry_credential=None, dockerfile_content=None):
         captured["registry_credential"] = registry_credential
         return {"status": "success", "image": f"{image_name}:{tag}"}
 
+    def _fake_ensure_repo(image_name, region):
+        captured["ensure_repo_called_with"] = (image_name, region)
+
     fake_token = base64.b64encode(b"AWS:some-temporary-ecr-token").decode("utf-8")
     monkeypatch.setattr(worker_module, "run_build_task", _fake_run_build_task)
+    monkeypatch.setattr(worker_module, "ensure_ecr_repository_exists", _fake_ensure_repo)
     monkeypatch.setattr(
         worker_module,
         "get_ecr_registry_credential",
@@ -114,13 +118,20 @@ def test_ecr_image_auto_generates_a_registry_credential(monkeypatch, tmp_path):
     orchestrator.start_pipeline(manifest_path, tenant_id="tenant-1")
 
     assert captured["registry_credential"] == {"username": "AWS", "secret": "some-temporary-ecr-token"}
+    # Real gap this closes: ECR doesn't auto-create a repository on first
+    # push, unlike most registries — a project's very first build used to
+    # fail the push outright unless someone had already run
+    # `aws ecr create-repository` by hand.
+    assert captured["ensure_repo_called_with"] == (
+        "123456789012.dkr.ecr.us-east-1.amazonaws.com/orders-api", "us-east-1",
+    )
 
 
 def test_non_ecr_image_does_not_auto_generate_a_credential(monkeypatch, tmp_path):
     manifest_path = _write_manifest(tmp_path, "registry.internal/orders-api")
     captured = {}
 
-    def _fake_run_build_task(run_id, dockerfile, tag, repo_config=None, image_name=None, registry_credential=None):
+    def _fake_run_build_task(run_id, dockerfile, tag, repo_config=None, image_name=None, registry_credential=None, dockerfile_content=None):
         captured["registry_credential"] = registry_credential
         return {"status": "success", "image": f"{image_name}:{tag}"}
 

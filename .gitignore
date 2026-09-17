@@ -35,7 +35,9 @@ frontend/tsconfig.tsbuildinfo
 Thumbs.db
 
 # Claude Code local session data
-.claude/
+.claude/*
+!.claude/agents/
+!.claude/agents/**
 
 # Vendored binaries (large; documented in README how to obtain locally)
 bin/*.exe

@@ -5,6 +5,7 @@ FastAPI entrypoint. Wires together: structured logging, the tenant-context
 RLS middleware, every REST router, the WebSocket event stream, and the
 health/readiness endpoints. Spec §6 (Phase 6 / api-gateway).
 """
+import asyncio
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
@@ -34,9 +35,34 @@ from src.routers.registry_router import router as registry_router
 from src.routers.reports_router import router as reports_router
 from src.routers.services_router import router as services_router
 from src.routers.verification_router import router as verification_router
+from src.routers.webhooks_router import (
+    router as webhooks_router,
+    poll_for_missed_webhook_deliveries,
+    WEBHOOK_POLL_INTERVAL_SECONDS,
+)
 from src.websocket.event_stream import router as event_stream_router
 
 logger = structlog.get_logger(__name__)
+
+
+async def _webhook_poll_loop(app: FastAPI):
+    """
+    Webhook polling fallback (P0, 2026-09-16) — periodic safety net for a
+    delivery GitHub itself never retried, or this platform being
+    unreachable when it tried. See webhooks_router.py's
+    poll_for_missed_webhook_deliveries for the real comparison logic; this
+    is just the loop shape (sleep, run, never let one bad cycle kill the
+    task — the same "log and keep looping" pattern pipeline-worker's
+    reconcile loop already uses).
+    """
+    while True:
+        await asyncio.sleep(WEBHOOK_POLL_INTERVAL_SECONDS)
+        try:
+            await poll_for_missed_webhook_deliveries(app.state.redis)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("webhook_poll_loop_failed", error=str(e))
 
 
 @asynccontextmanager
@@ -44,7 +70,13 @@ async def lifespan(app: FastAPI):
     app.state.db_engine = engine
     app.state.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
     logger.info("api_gateway_startup", redis_url=settings.REDIS_URL)
+    poll_task = asyncio.create_task(_webhook_poll_loop(app))
     yield
+    poll_task.cancel()
+    try:
+        await poll_task
+    except asyncio.CancelledError:
+        pass
     await app.state.redis.aclose()
     await engine.dispose()
     logger.info("api_gateway_shutdown")
@@ -91,6 +123,12 @@ app.include_router(services_router, prefix="/api/v1/services", tags=["services"]
 app.include_router(projects_router, prefix="/api/v1/projects", tags=["projects"])
 app.include_router(github_router, prefix="/api/v1/integrations/github", tags=["github"])
 app.include_router(registry_router, prefix="/api/v1/integrations/registry", tags=["registry"])
+
+# Phase 9.6 (P0 #1, 2026-09-16) — the real "git push -> cloud" trigger.
+# Deliberately unauthenticated (see auth/middleware.py's allowlist) — GitHub
+# cannot send this platform's Authorization header; the HMAC signature is
+# the real authentication here, verified inside the handler itself.
+app.include_router(webhooks_router, prefix="/api/v1/webhooks", tags=["webhooks"])
 
 # Phase 6 (§06-observability-platform-ops.md, deliverable 6.2): RED metrics
 # (request rate/latency/error-rate per endpoint) at /metrics, scraped by the

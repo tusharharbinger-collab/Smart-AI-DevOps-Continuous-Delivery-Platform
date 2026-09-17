@@ -46,6 +46,14 @@ async def tenant_context_middleware(request: Request, call_next: Callable) -> Re
         # router minted and stored in Redis, which is also what makes the
         # flow CSRF-resistant. See routers/github_router.py.
         "/api/v1/integrations/github/callback",
+        # Phase 9.6 — GitHub's webhook delivery. Also cannot carry this
+        # platform's Authorization header (it's GitHub's own server making
+        # the request, not a browser we redirected). Authenticated instead
+        # by HMAC signature (X-Hub-Signature-256), verified inside
+        # webhooks_router.py itself — never let this fall through to a bare
+        # 401 the way an unauthenticated real GitHub delivery otherwise
+        # would.
+        "/api/v1/webhooks/github",
     ):
         return await call_next(request)
 

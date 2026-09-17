@@ -1,0 +1,92 @@
+ASSIGNMENT 
+05
+ · AI-NATIVE BUILD TRACK
+Smart AI DevOps & Continuous Delivery Platform
+CI/CD that verifies its own deployments — and decides, on real evidence, whether to promote or roll back.
+Context
+Most CI/CD tooling stops at "run the pipeline" — a human still has to eyeball a dashboard for twenty minutes after every deploy and hope nothing looks wrong. The AI-native version of this problem is Continuous Verification: the platform itself statistically compares the new version's live 
+behavior
+ against a baseline and decides, with evidence, whether the rollout is healthy. This assignment asks you to build that platform: real pipeline orchestration against a real deploy target, progressive delivery, and an AI-native verification engine that autonomously promotes or rolls back — inside guardrails as strict as anything in this assignment set.
+This is a full delivery platform, not a monitoring add-on: pipelines, deployments, and the AI verification/decision layer are all in scope and all judged.
+The Assignment
+Build a smart AI DevOps and continuous delivery platform: define and execute multi-stage CI/CD pipelines against a real deployment target using progressive delivery (canary and/or blue-green), continuously verify each rollout by statistically or ML-comparing its live telemetry against a baseline, and autonomously promote or roll back based on that verification and a declarative policy — with every decision explained and grounded, and a real delivery-ops UI surfacing pipelines, verification results, policy, 
+and history.
+Functional Requirements
+Pipeline orchestration: define and execute multi-stage pipelines (e.g. build → test → deploy) from a declarative pipeline spec (YAML/JSON, your own schema) against at least one real deployment target (Kubernetes is the natural choice) — the AI layer sits on top of a genuinely working delivery pipeline, not a mocked one.
+Progressive delivery: support canary and/or blue-green rollout strategies that incrementally shift traffic or instances from the old version to the new one, with the ability to halt a rollout mid-shift.
+AI-native deployment verification — the core of this assignment: continuously compare the new version's live telemetry (error rate, latency, saturation, and at least one custom/business metric) against a baseline/control cohort using a genuine statistical or ML-based comparison (e.g. anomaly/change-point detection, hypothesis testing) — a static threshold check ("error rate > 1%") does not satisfy this requirement.
+Autonomous promote/rollback decisions: based on the verification verdict (healthy / degraded / failed, with a confidence signal) and a declarative per-pipeline policy, the platform automatically promotes to 
+the next stage or rolls back. Any action outside what the policy explicitly authorizes must never fire unsupervised — this is judged with the same rigor as the guardrail requirement in Assignment 06.
+Grounded decision explanations: every promote or rollback decision must state exactly which metric(s)/signal(s) drove it and by how much, tied to the real comparison data — an unexplained autonomous rollback is treated as a failed rollback here, correct outcome or not.
+Pipeline-level policy & gates: declarative, per-pipeline/per-environment configuration for required approvals, blocked deploy windows, minimum verification duration/sample size before a decision is allowed to fire, and rollback authority scope.
+Cost-aware delivery: track the resource cost impact of every rollout (compute/replica cost delta versus the previous version) and surface it alongside the verification report; recommend concrete, safe cost optimizations (e.g. right-sizing replica counts or resource requests based on observed utilization) — any auto-applied optimization is gated by the same declarative policy as promotion/rollback, never applied silently.
+Delivery-ops B2B UI: a pipeline view (stages and live execution status), a verification detail view (baseline vs. canary metrics, verdict, confidence, explanation), a policy/gates configuration view, and a deployment history/audit view — multi-tenant across teams with proper data isolation.
+Required reports (auto-generated, not hand-assembled): a per-deployment verification report for every rollout (baseline vs. canary comparison, verdict, and the evidence behind it); a rollback/promotion decision report tied to that specific action; a periodic delivery-health digest per team/org (pipeline success/failure rate, rollback frequency, mean-time-to-verify, and resource cost trend over a rolling window); and an audit/compliance export covering every autonomous decision the platform made over a given
+ period.
+Automated alerts: the platform must proactively notify the right people the moment it acts or needs one — at minimum when a rollback fires, when a promotion is blocked pending required approval, and when verification can't reach a confident verdict in the allotted time — pushed out (webhook, email, or chat-style notification) rather than requiring someone to be watching the dashboard live.
+Technical Constraints — Read Carefully
+Third-party AI APIs are allowed for the underlying model layer
+ You can use free APIs
+Ships as a microservice, not a script. Clean, versioned API contract (REST and/or 
+gRPC
+ and/or WebSocket as appropriate), independently deployable, containerized, and built to be dropped into an existing application rather than run by hand from a notebook.
+Production posture, not a demo posture. Structured logging, health checks, config via environment, meaningful error handling, and a story for how it behaves under load, bad input, and partial failure. "It worked once on my machine" does not clear the bar.
+Automated tests. Unit tests for core logic at minimum; integration tests for the API surface are strongly preferred.
+The web UI is in scope for judging: usability, information density, and whether a non-agent-expert engineer or engineering manager could pick it up without a walkthrough all count.
+Multi-tenant from the start: more than one team/org must be able to use the product with properly isolated data — this is not a single-user local tool with a UI bolted on.
+The verification engine's comparison must be a genuine statistical or ML method you can explain and defend — this is the entire point of the assignment, and a disguised threshold check will be judged as not meeting the requirement at all, not as a weaker version of it.
+Autonomous promotion/rollback is a safety-sensitive surface, same bar as Assignment 06: the boundary between what the verification engine believes and what the executor is actually permitted to do must be one the reasoning layer cannot cross by construction.
+Architecture Expectations
+Expect: a pipeline execution engine orchestrating stages against a real deploy target; a per-cohort telemetry collector (so canary and baseline traffic can be compared apples-to-apples); a verification engine doing the statistical/ML comparison and producing an inspectable verdict; a policy-gated promotion/rollback controller sitting behind a hard permission boundary; a durable pipeline/execution/audit store; and the delivery-ops UI consuming all of it.
+Keep the verification engine and the promotion/rollback controller as separate components with a narrow, well-defined interface — the controller should only ever be able to act on verdicts the verification engine actually produced, never a shortcut around it.
+Unlike the other assignments in this set, a real front-end is a required, judged deliverable here — this is a B2B product, not an API with a demo page. Build it as something you'd actually ask a paying engineering team to use.
+Required Deliverables
+Git repository with a clean commit history — not a single squashed commit.
+README covering setup, how to run it locally (ideally `docker compose up`), architecture overview, and known limitations.
+API reference (
+OpenAPI
+/Swagger spec, or equivalent) for every exposed endpoint.
+A short (3–5 min) screen-recorded demo showing the system working end to end, including at least one failure/edge case handled gracefully.
+A one-page ARCHITECTURE.md or diagram explaining the key design decisions and trade-offs you made and why.
+The web UI, running end to end against the real backend (not a static mock/Figma) — deployable via the same `docker compose up` as the rest of the system.
+What This Is Judged On
+Weighted rubric below. This is what reviewers score against — build for it, not around it.
+Judged on
+Weight
+What we're actually looking for
+Deployment verification quality
+20%
+Is the baseline-vs-canary comparison a genuine statistical/ML method, correctly applied, or a threshold check wearing an AI label?
+Guardrails & safe autonomous promote/rollback
+20%
+Can a deliberately misleading telemetry pattern be made to trigger an out-of-policy promotion or rollback? Actively tested; a bypass here is a critical failure.
+Pipeline orchestration & real deploy target
+15%
+Do pipelines actually execute multi-stage progressive delivery against a real target (e.g. Kubernetes canary/blue-green), not a simulated stub?
+Explainability of decisions
+15%
+Does every promote/rollback decision cite the specific metrics and comparison data behind it?
+B2B UI & product quality
+15%
+Would a real release engineer trust this UI to watch a production rollout?
+Production readiness & multi-tenancy
+5%
+Data isolation across teams, concurrent pipeline execution, resilience to noisy or missing telemetry.
+Constraint adherence
+5%
+Third-party AI APIs are fine for the underlying models; the pipeline orchestration and verification-engine logic must be built by you.
+Code quality, tests & docs
+5%
+Test coverage — especially adversarial guardrail and verification-engine tests — and documentation.
+Total
+100%
+Bonus — Above and Beyond
+Not required. These separate a solid submission from a standout one.
+Feature-flag-scoped rollouts, where verification is tied to flag-gated exposure rather than only infrastructure-level traffic shifting.
+Fully autonomous cost optimization — not just recommending a right-size, but applying it within policy — held to the same explainability and guardrail bar as a rollback.
+Auto-tuned canary duration/traffic-shift schedule based on how much historical evidence past decisions actually needed.
+A 
+ChatOps
+-style query interface ("why did the last prod deploy roll back") that still grounds its answer in the real comparison data.
+Explicitly Out of Scope
+Enterprise SSO and billing infrastructure.

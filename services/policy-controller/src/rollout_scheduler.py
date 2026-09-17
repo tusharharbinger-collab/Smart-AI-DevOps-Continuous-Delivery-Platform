@@ -33,6 +33,7 @@ import httpx
 import structlog
 
 from src.actuation_executor import graduate_canary
+from src.aws_actuation_executor import graduate_canary_ecs
 
 logger = structlog.get_logger(__name__)
 
@@ -83,12 +84,19 @@ async def advance_to_next_step(
     state: dict,
     next_index: int,
     trace_id: str | None = None,
+    target: dict | None = None,
 ) -> None:
     """
     Persists the new step index/start-time, then schedules the next
     verification cycle to fire once that step's own real minDuration has
     elapsed — fully autonomous, but never faster than the policy's own
     evidence-sufficiency requirement (no static/guessed dwell time).
+
+    `target` (P1, 2026-09-16 — CloudWatch telemetry) carries this run's
+    real deployment_target/aws_region/canary_deployment_name, already
+    resolved once by controller.py's own `_get_actuation_target` — threaded
+    through to the reverify call so an AWS ECS project's SECOND-and-later
+    verdicts use real CloudWatch telemetry too, not just its first.
     """
     next_step = state["steps"][next_index]
     state["current_step_index"] = next_index
@@ -105,7 +113,7 @@ async def advance_to_next_step(
         delay_seconds=delay_seconds,
     )
     asyncio.create_task(
-        _fire_reverify_after_delay(run_id, tenant_id, state["verification_config"], delay_seconds, trace_id)
+        _fire_reverify_after_delay(run_id, tenant_id, state["verification_config"], delay_seconds, trace_id, target)
     )
 
 
@@ -115,6 +123,7 @@ async def schedule_retry_of_current_step(
     state: dict,
     remaining_seconds: float,
     trace_id: str | None = None,
+    target: dict | None = None,
 ) -> None:
     """
     Real gap found live: a pipeline with no separate deploy/wait stage
@@ -141,12 +150,17 @@ async def schedule_retry_of_current_step(
         remaining_seconds=remaining_seconds,
     )
     asyncio.create_task(
-        _fire_reverify_after_delay(run_id, tenant_id, state["verification_config"], remaining_seconds, trace_id)
+        _fire_reverify_after_delay(run_id, tenant_id, state["verification_config"], remaining_seconds, trace_id, target)
     )
 
 
 async def _fire_reverify_after_delay(
-    run_id: str, tenant_id: str | None, verification_config: dict, delay_seconds: float, trace_id: str | None
+    run_id: str,
+    tenant_id: str | None,
+    verification_config: dict,
+    delay_seconds: float,
+    trace_id: str | None,
+    target: dict | None = None,
 ) -> None:
     """
     Fire-and-forget background task (never blocks verdict handling for the
@@ -154,6 +168,7 @@ async def _fire_reverify_after_delay(
     current, already-verified-safe weight — logged loudly rather than
     silently losing the next step forever.
     """
+    target = target or {}
     try:
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
@@ -165,6 +180,23 @@ async def _fire_reverify_after_delay(
                     "verification_config": verification_config,
                     "elapsed_seconds": delay_seconds,
                     "trace_id": trace_id,
+                    # CloudWatch telemetry (P1, 2026-09-16) — an AWS ECS
+                    # project's SECOND-and-later verdicts need the same real
+                    # deployment_target/aws_region/service_name its FIRST
+                    # one already gets via worker.py's own canary_loop
+                    # config; this is the one place that context has to
+                    # cross the policy-controller -> pipeline-worker
+                    # boundary for a reverify. `target` has no plain
+                    # service_name field (see _register_actuation_target) —
+                    # canary_deployment_name doubles as the real ECS service
+                    # name for an AWS project too (aws_ecs_actuation.py's
+                    # own f"{service_name}-canary" convention), so stripping
+                    # its "-canary" suffix recovers the base name reliably
+                    # for exactly the deployment_target this field is ever
+                    # read for.
+                    "deployment_target": target.get("deployment_target", "kubernetes"),
+                    "aws_region": target.get("aws_region"),
+                    "ecs_service_name": (target.get("canary_deployment_name") or "").removesuffix("-canary") or None,
                 },
             )
             resp.raise_for_status()
@@ -190,16 +222,27 @@ async def graduate(run_id: str, target: dict, new_version: str | None, db=None) 
     caller can persist which one actually happened instead of assuming.
     """
     try:
-        result = await graduate_canary(
-            run_id,
-            authorized_by="SYSTEM:auto_graduate",
-            route_name=target["route_name"],
-            namespace=target["namespace"],
-            canary_deployment_name=target["canary_deployment_name"],
-            baseline_deployment_name=target["baseline_deployment_name"],
-            tenant_id=target.get("tenant_id"),
-            db=db,
-        )
+        if target.get("deployment_target", "kubernetes") == "aws_ecs":
+            result = await graduate_canary_ecs(
+                run_id,
+                authorized_by="SYSTEM:auto_graduate",
+                service_name=target["canary_deployment_name"].removesuffix("-canary"),
+                path_prefix=target["path_prefix"],
+                region=target.get("aws_region", "us-east-1"),
+                tenant_id=target.get("tenant_id"),
+                db=db,
+            )
+        else:
+            result = await graduate_canary(
+                run_id,
+                authorized_by="SYSTEM:auto_graduate",
+                route_name=target["route_name"],
+                namespace=target["namespace"],
+                canary_deployment_name=target["canary_deployment_name"],
+                baseline_deployment_name=target["baseline_deployment_name"],
+                tenant_id=target.get("tenant_id"),
+                db=db,
+            )
     except Exception as e:
         logger.error("canary_graduation_kubernetes_step_failed", pipeline_run_id=run_id, error=str(e))
         return "GRADUATION_FAILED"

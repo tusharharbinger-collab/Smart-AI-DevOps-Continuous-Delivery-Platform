@@ -10,9 +10,20 @@
  * backend only ever reports the current weight, not a time series, so this
  * is a per-viewing-session chart, not a durable history. Good enough to
  * visualize a rollout's progression while you're watching it.
+ *
+ * Real gap found live: this used to be WebSocket-only, seeding `status` from
+ * nothing until the first live push arrived. An already-terminal run
+ * (COMPLETED/FAILED/ROLLED_BACK) never produces another event, so opening
+ * its dashboard left `status` stuck at "UNKNOWN" forever — which
+ * PipelineDashboard.tsx's Emergency Rollback disabled-check doesn't
+ * recognize as terminal, so the button stayed wrongly enabled for a run
+ * that was already finished. Seeding an initial snapshot via `getRun` (the
+ * same Redis-then-Postgres-fallback endpoint Screen 1 already used
+ * elsewhere) closes that gap; a live WS push, once one arrives, still wins.
  */
 import { useEffect, useRef, useState } from "react";
 import type { WeightPoint } from "@/components/pipeline/TrafficWeightChart";
+import { getRun } from "@/api/pipeline";
 
 export interface PipelineEventState {
   pipeline_run_id?: string;
@@ -31,6 +42,22 @@ export function usePipelineEvents(pipelineRunId: string) {
     setState(null);
     setWeightHistory([]);
     if (!pipelineRunId) return;
+    let cancelled = false;
+    let receivedLiveEvent = false;
+
+    getRun(pipelineRunId)
+      .then((run) => {
+        // Only seed from the snapshot if no live WS push has already landed
+        // — a live event is always fresher than this point-in-time fetch,
+        // and must never be overwritten by a slower-resolving snapshot.
+        if (cancelled || receivedLiveEvent) return;
+        setState((prev) => ({ ...prev, ...run }));
+      })
+      .catch(() => {
+        // No snapshot available (e.g. a brand-new run not committed yet) —
+        // the WS stream is still the primary source and unaffected.
+      });
+
     const wsUrl = `${import.meta.env.VITE_WS_URL ?? "ws://localhost:8000/ws"}/pipelines/${pipelineRunId}`;
     const socket = new WebSocket(wsUrl);
     wsRef.current = socket;
@@ -38,6 +65,7 @@ export function usePipelineEvents(pipelineRunId: string) {
     socket.onmessage = (event) => {
       try {
         const parsed = JSON.parse(event.data) as PipelineEventState;
+        receivedLiveEvent = true;
         setState((prev) => ({ ...prev, ...parsed }));
         if (typeof parsed.current_traffic_weight === "number") {
           setWeightHistory((prev) => [
@@ -51,7 +79,10 @@ export function usePipelineEvents(pipelineRunId: string) {
     };
     socket.onerror = () => socket.close();
 
-    return () => socket.close();
+    return () => {
+      cancelled = true;
+      socket.close();
+    };
   }, [pipelineRunId]);
 
   return {

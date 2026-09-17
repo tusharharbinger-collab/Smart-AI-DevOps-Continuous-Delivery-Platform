@@ -130,3 +130,107 @@ def test_promotion_not_blocked_when_cost_tracker_is_fail_soft_none(monkeypatch, 
     asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(), "run-cost-wiring-test"))
 
     assert len(_patch_actuation["promote"]) == 1
+
+
+# ─── AWS ECS deploy-target wiring ──────────────────────────────────────
+# Real gap this closes: before this fix, target.get("deployment_target")
+# == "aws_ecs" meant cost_result was hardcoded to None (see the old
+# handle_incoming_verdict comment this replaced) — an AWS project's
+# RULE 7 guardrail could never fire no matter how expensive a canary
+# actually was. These mirror the three Kubernetes wiring tests above,
+# proving _compute_cost now genuinely branches onto compute_and_record_cost_ecs
+# instead of compute_and_record_cost for an aws_ecs target.
+
+@pytest.fixture
+def _patch_actuation_aws_ecs(monkeypatch):
+    calls = {"promote": [], "opa_inputs": []}
+
+    async def fake_promote(pipeline_run_id, canary_weight, baseline_weight, authorized_by, **kwargs):
+        calls["promote"].append({"pipeline_run_id": pipeline_run_id, "authorized_by": authorized_by})
+
+    async def fake_send_alert(*args, **kwargs):
+        pass
+
+    async def fake_get_target(redis_client, pipeline_run_id):
+        return {
+            "route_name": "svc-route",
+            "namespace": "production",
+            "canary_deployment_name": "svc-canary",
+            "baseline_deployment_name": "svc-baseline",
+            "tenant_id": "tenant-1",
+            "deployment_target": "aws_ecs",
+            "aws_region": "us-east-1",
+            "path_prefix": "/api/v1/svc",
+        }
+
+    monkeypatch.setattr(controller, "update_traffic_weights_ecs", fake_promote)
+    monkeypatch.setattr(controller, "send_alert", fake_send_alert)
+    monkeypatch.setattr(controller, "_get_actuation_target", fake_get_target)
+    return calls
+
+
+def test_real_ecs_cost_delta_reaches_opa_and_blocks_an_expensive_promotion(monkeypatch, _patch_actuation_aws_ecs):
+    async def fake_expensive_ecs_cost(**kwargs):
+        assert kwargs["baseline_service_name"] == "svc-baseline"
+        assert kwargs["canary_service_name"] == "svc-canary"
+        assert kwargs["region"] == "us-east-1"
+        return {"delta_percent": 40.0, "exceeds_policy_limit": True}
+
+    monkeypatch.setattr(controller, "compute_and_record_cost_ecs", fake_expensive_ecs_cost)
+
+    captured_opa_input = {}
+
+    async def capturing_opa_eval(payload):
+        captured_opa_input.update(payload)
+        return _opa_eval_mirroring_real_cost_rule(payload)
+
+    monkeypatch.setattr(controller, "evaluate_policy_async", capturing_opa_eval)
+
+    asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(), "run-cost-wiring-test"))
+
+    assert captured_opa_input["cost_analysis"]["delta_percent"] == 40.0
+    assert len(_patch_actuation_aws_ecs["promote"]) == 0, "a 40% cost overrun must block promotion under a 15% ceiling on AWS too"
+
+
+def test_cheap_ecs_promotion_still_proceeds_when_cost_is_within_budget(monkeypatch, _patch_actuation_aws_ecs):
+    async def fake_cheap_ecs_cost(**kwargs):
+        return {"delta_percent": 2.0, "exceeds_policy_limit": False}
+
+    monkeypatch.setattr(controller, "compute_and_record_cost_ecs", fake_cheap_ecs_cost)
+
+    asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(), "run-cost-wiring-test"))
+
+    assert len(_patch_actuation_aws_ecs["promote"]) == 1, "a promotion within the cost ceiling must still proceed on AWS too"
+
+
+def test_ecs_promotion_not_blocked_when_cost_tracker_ecs_is_fail_soft_none(monkeypatch, _patch_actuation_aws_ecs):
+    """compute_and_record_cost_ecs returns None when AWS is unreachable — this
+    must fall back to delta_percent=0.0 (never blocking), not crash the verdict."""
+
+    async def fake_unreachable(**kwargs):
+        return None
+
+    monkeypatch.setattr(controller, "compute_and_record_cost_ecs", fake_unreachable)
+
+    asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(), "run-cost-wiring-test"))
+
+    assert len(_patch_actuation_aws_ecs["promote"]) == 1
+
+
+def test_kubernetes_target_never_calls_the_ecs_cost_function(monkeypatch, _patch_actuation):
+    """The branch in _compute_cost must be mutually exclusive — a plain
+    Kubernetes target (the default _patch_actuation fixture, no
+    deployment_target key) must never reach compute_and_record_cost_ecs."""
+
+    async def exploding_ecs_cost(**kwargs):
+        raise AssertionError("compute_and_record_cost_ecs must not be called for a kubernetes target")
+
+    async def fake_k8s_cost(**kwargs):
+        return {"delta_percent": 2.0, "exceeds_policy_limit": False}
+
+    monkeypatch.setattr(controller, "compute_and_record_cost_ecs", exploding_ecs_cost)
+    monkeypatch.setattr(controller, "compute_and_record_cost", fake_k8s_cost)
+
+    asyncio.run(controller.handle_incoming_verdict(_signed_healthy_payload(), "run-cost-wiring-test"))
+
+    assert len(_patch_actuation["promote"]) == 1

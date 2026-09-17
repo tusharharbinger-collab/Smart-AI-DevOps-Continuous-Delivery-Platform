@@ -55,6 +55,26 @@ export interface ProjectSummary {
   /** null when no finished runs exist in the window — never a filler number. */
   success_rate_7d: number | null;
   mttv_seconds: number | null;
+  /**
+   * Real gap found live: this was computed at onboarding and thrown away —
+   * never persisted, never returned, so there was no way to click a link
+   * and check "is my product truly live" the way Render/Vercel do. Null
+   * for a pre-existing project onboarded before this existed, or one with
+   * no path_prefix at all (e.g. an adopted pre-Phase-8 pipeline).
+   */
+  live_url: string | null;
+  /** "kubernetes" (default, local Kind cluster) or "aws_ecs" (real AWS Fargate). */
+  deploy_target: "kubernetes" | "aws_ecs";
+  /** "canary" (progressive, statistically verified) or "blue_green" (instant, health-gated). */
+  deploy_mode: "canary" | "blue_green";
+  /**
+   * Set by pipeline-worker's shared/live_url_check.py after every real
+   * cutover — a genuine HTTP GET through the real ALB/gateway, not just a
+   * report that the traffic weight was flipped. Null for a project that
+   * predates this, or whose deploy path doesn't run the check yet.
+   */
+  live_url_status: "verified" | "failed" | null;
+  live_url_verified_at: string | null;
 }
 
 export interface ProjectDetail {
@@ -72,6 +92,11 @@ export interface ProjectDetail {
   status: ProjectStatus;
   created_at: string;
   latest_run: ProjectRun | null;
+  live_url: string | null;
+  deploy_target: "kubernetes" | "aws_ecs";
+  deploy_mode: "canary" | "blue_green";
+  live_url_status: "verified" | "failed" | null;
+  live_url_verified_at: string | null;
 }
 
 export interface ProjectRun {
@@ -107,8 +132,15 @@ export interface CreateProjectInput {
   repo_private: boolean;
   branch: string;
   root_directory: string;
-  dockerfile_path: string;
-  test_command: string;
+  /** Set when building from a Dockerfile; null when using language/start_command synthesis instead. */
+  dockerfile_path: string | null;
+  /** Populated only when dockerfile_path is null — see shared/repo_scanner.py's BuildDetection. */
+  language: string | null;
+  /** Only meaningful when language === "node" ("spa" | "nextjs" | "node-server"). */
+  framework: string | null;
+  start_command: string | null;
+  manifest_path: string | null;
+  test_command: string | null;
   container_image: string;
   active_production_tag: string;
   canary_tag: string;
@@ -124,8 +156,30 @@ export interface CreateProjectInput {
     min_sample_size: number;
     max_cost_delta_percent: number;
   };
+  /**
+   * Real gap found live: freeze windows and approver roles used to be
+   * hardcoded server-side for every project — never actually wizard-
+   * configurable. `deploy_mode` "blue_green" is only accepted when
+   * `deploy_target` is "aws_ecs" — the server rejects blue_green +
+   * kubernetes with a 422 (see projects_router.py's create_project).
+   */
+  deploy_policy: {
+    deploy_mode: "canary" | "blue_green";
+    blocked_deploy_windows: { days: string[]; start_time: string; end_time: string }[];
+    manual_approval_required: boolean;
+    manual_approval_roles: string[];
+  };
   traffic_steps: number[];
   provision_cluster: boolean;
+  /**
+   * Module 8 — real second deployment target. "kubernetes" (default) uses
+   * the local Kind cluster + Envoy Gateway; "aws_ecs" provisions this
+   * project onto the shared real AWS ECS Fargate cluster + ALB instead
+   * (see docs/roadmap/09-universal-delivery-platform.md). Only meaningful
+   * when provision_cluster is true.
+   */
+  deploy_target: "kubernetes" | "aws_ecs";
+  aws_region: string;
 }
 
 export interface CreateProjectResult {
@@ -135,6 +189,7 @@ export interface CreateProjectResult {
   namespace: string;
   generated_pipeline_yaml: string;
   cluster_provisioning: { attempted: boolean; succeeded: boolean; detail: string | null };
+  live_url: string | null;
 }
 
 export const listProjects = () =>
@@ -147,7 +202,17 @@ export const createProject = (input: CreateProjectInput) =>
   apiClient.post<CreateProjectResult>("/api/v1/projects", input);
 
 export const deleteProject = (projectId: string) =>
-  apiClient.del<{ deleted: string }>(`/api/v1/projects/${projectId}`);
+  apiClient.del<{
+    deleted: string;
+    pipeline_retained: boolean;
+    /**
+     * Real gap found live: deleting a project used to only remove the DB
+     * row — the real Deployments/Services/HTTPRoute it onboarded were left
+     * running in the cluster forever. Best-effort, mirroring create's own
+     * cluster_provisioning shape.
+     */
+    cluster_deprovisioning: { attempted: boolean; succeeded: boolean; detail: string | null };
+  }>(`/api/v1/projects/${projectId}`);
 
 export const listProjectRuns = (projectId: string) =>
   apiClient.get<{ runs: ProjectRun[] }>(`/api/v1/projects/${projectId}/runs`);
@@ -209,3 +274,46 @@ export const getRunFailureAnalysis = (projectId: string, runId: string) =>
   apiClient.get<{ failure_analysis: StageFailureAnalysis | null }>(
     `/api/v1/projects/${projectId}/runs/${runId}/failure-analysis`
   );
+
+/**
+ * Build-only dry run (services/pipeline-worker/src/build_preview.py) — runs
+ * BEFORE a project exists, so it lives at /projects/build-preview rather
+ * than nested under a project id. Clone -> build (real Dockerfile or
+ * synthesized) -> test, zero deploy/cluster involvement. The same
+ * run_build_task/run_test_task a real pipeline's build/test stages call,
+ * so "does this build" here and during an actual rollout can never drift
+ * apart into two different answers.
+ */
+export interface BuildPreviewRequest {
+  repo_url: string;
+  ref: string;
+  repo_private: boolean;
+  root_directory: string;
+  dockerfile_path: string | null;
+  language: string | null;
+  framework: string | null;
+  manifest_path: string | null;
+  start_command: string | null;
+  test_command: string | null;
+}
+
+export const startBuildPreview = (body: BuildPreviewRequest) =>
+  apiClient.post<{ run_id: string; status: string }>("/api/v1/projects/build-preview", body);
+
+export const getBuildPreviewLogs = (runId: string) =>
+  apiClient.get<{ lines: string[] }>(`/api/v1/projects/build-preview/${runId}/logs`);
+
+export interface BuildPreviewResult {
+  status: "running" | "succeeded" | "failed";
+  updated_at: string;
+  stage?: string;
+  error?: string;
+  /** true = a repo/config problem the human must fix; false = a platform-side outage. */
+  human_side?: boolean;
+  dockerfile_path?: string;
+  /** Test command failed but never blocks the build — see build_preview.py. Present only when a test command was set and it failed. */
+  test_warning?: string | null;
+}
+
+export const getBuildPreviewResult = (runId: string) =>
+  apiClient.get<BuildPreviewResult>(`/api/v1/projects/build-preview/${runId}/result`);

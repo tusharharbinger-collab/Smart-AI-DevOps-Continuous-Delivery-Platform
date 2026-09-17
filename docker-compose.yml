@@ -217,6 +217,43 @@ services:
       GITHUB_OAUTH_REDIRECT_URI: ${GITHUB_OAUTH_REDIRECT_URI:-http://localhost:8000/api/v1/integrations/github/callback}
       FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:3000}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Real gap found live: a project's path_prefix was computed at
+      # onboarding and thrown away — never persisted or shown to the user,
+      # so there was no way to click a link and check "is my product truly
+      # live" the way Render/Vercel do. k8s/kind-config.yaml's own port
+      # mapping (hostPort 8080 -> control-plane:80) turned out to route
+      # nowhere real — nothing on the control-plane node actually listens
+      # on port 80; Envoy Gateway's real address only exists via its
+      # randomly-allocated NodePort. `cloud-provider-kind` (bin/, running
+      # as a background process) is what actually solves this: it gives
+      # the Gateway's LoadBalancer Service a genuine host-reachable address
+      # by publishing a real host port — 80 today (confirmed live: a
+      # deployed project's path now returns a real response through it,
+      # not a hang). Once a real cloud target exists (roadmap 9.5) this
+      # becomes that target's real load balancer DNS name instead.
+      GATEWAY_BASE_URL: ${GATEWAY_BASE_URL:-http://localhost}
+      # Module 8 — AWS ECS deploy target's real load-balancer DNS name (one
+      # shared ALB for every "aws_ecs" project, weighted target groups per
+      # project instead of one ALB each, to avoid per-project AWS cost).
+      # Only used for projects.deploy_target = 'aws_ecs'; a "kubernetes"
+      # project ignores this and uses GATEWAY_BASE_URL above instead. Blank
+      # by default so a fresh clone with no AWS account configured doesn't
+      # advertise a live_url that resolves nowhere; the real value below is
+      # this session's actually-provisioned ALB (see docs/roadmap/09-*.md).
+      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-smartcd-platform-alb-1806553190.us-east-1.elb.amazonaws.com}
+      # Phase 9.6 (P0 #1, 2026-09-16) — the real "git push -> cloud"
+      # trigger. Shared HMAC secret every registered repo's webhook signs
+      # deliveries with (X-Hub-Signature-256); blank by default so a fresh
+      # clone fails CLOSED (webhooks_router.py refuses to accept any
+      # delivery, real or not, until this is set) instead of silently
+      # accepting unsigned/forged requests.
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # The externally-reachable base URL GitHub's own servers can actually
+      # POST to — cannot be localhost for a real webhook (GitHub is not on
+      # this machine's network); same class of setting as GATEWAY_BASE_URL/
+      # AWS_ALB_BASE_URL above. A real deployment needs a real public
+      # domain or tunnel here for POST .../webhook/register to be useful.
+      API_GATEWAY_PUBLIC_URL: ${API_GATEWAY_PUBLIC_URL:-http://localhost:8000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -241,6 +278,16 @@ services:
       <<: *common-env
       SERVICE_NAME: pipeline-worker
       KUBECONFIG: /home/worker/.kube/config
+      # Real bug found live (2026-09-15): shared/opa_client.py's
+      # evaluate_policy_sync (the first-deployment freeze-window check)
+      # defaults to http://localhost:8181 when this is unset — inside this
+      # container that's itself, not OPA, so the call failed with
+      # "Connection refused" on every first deployment even though a direct
+      # curl to the real OPA container worked fine. api-gateway and
+      # policy-controller already set this; pipeline-worker never did
+      # because this env var didn't exist yet when its environment block
+      # was last written.
+      OPA_URL: http://opa:8181
       # Used by tasks/git_clone.py when a pipeline's build stage declares
       # `repoCredentialsEnvVar: GITHUB_TOKEN` (private repos only).
       # Deliberately the SERVER's token, not the end user's OAuth token:
@@ -256,12 +303,31 @@ services:
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # Guaranteed Live Web App CI/CD (2026-09-17) — real gap found live:
+      # this was only ever wired into api-gateway's environment block (for
+      # display purposes, _live_url()), never here even though worker.py's
+      # blue-green/first-deployment branches need it for a real post-
+      # cutover HTTP GET (shared/live_url_check.py::verify_live_url).
+      # Without it, verify_live_url always reports "not configured" and
+      # blue-green rolls back a cutover that actually succeeded. Same
+      # default as api-gateway's copy — must match exactly, since a
+      # mismatch would make one service verify against the wrong ALB.
+      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-smartcd-platform-alb-1806553190.us-east-1.elb.amazonaws.com}
+      # Gate 1 (P0, 2026-09-16) — the gate1 consumer calls back into this
+      # once a webhook-triggered push's real build+test dry run finishes
+      # (POST .../internal/{project_id}/gate1-result). Same Docker-network
+      # service name every other cross-service call in this compose file
+      # already uses (see PIPELINE_WORKER_URL/POLICY_CONTROLLER_URL on the
+      # other services) — no new discovery mechanism invented for this one.
+      API_GATEWAY_URL: http://api-gateway:8000
     ports:
       - "8001:8001"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      opa:
         condition: service_healthy
     networks:
       - default
@@ -307,6 +373,19 @@ services:
       SERVICE_NAME: verification-engine
       PROMETHEUS_URL: http://prometheus:9090
       # NOTE: No KUBECONFIG — structural boundary enforced here
+      # CloudWatch telemetry (P1, 2026-09-16) — telemetry/cloudwatch_client.py
+      # needs a real boto3 session to call cloudwatch:GetMetricData and
+      # elbv2:Describe* (read-only; see that module's own docstring for why
+      # this is safe under the same "verification-engine never touches
+      # Kubernetes" boundary — these are AWS read-only calls, not cluster
+      # mutations, and this service still has no kubernetes dependency at
+      # all). Same three vars pipeline-worker's block above already sets for
+      # its own AWS ECS actuation calls; blank by default so a fresh clone
+      # with no AWS account configured just gets CloudWatchQueryError on any
+      # AWS-target verify request instead of failing to start.
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     ports:
       - "8002:8002"
     depends_on:
@@ -337,6 +416,12 @@ services:
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # Guaranteed Live Web App CI/CD (2026-09-17) — same real gap as
+      # pipeline-worker's identical copy of this comment: never wired in
+      # here before, even though graduate_canary_ecs's post-graduation
+      # live-URL check (shared/live_url_check.py) needs it. Must match
+      # every other service's copy exactly.
+      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-smartcd-platform-alb-1806553190.us-east-1.elb.amazonaws.com}
     depends_on:
       redis:
         condition: service_healthy

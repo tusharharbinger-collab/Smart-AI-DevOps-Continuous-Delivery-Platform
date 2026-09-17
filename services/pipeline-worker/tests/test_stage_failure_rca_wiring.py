@@ -7,6 +7,11 @@ exception, with no explanation. worker.py's failure handler now asks
 explainability-service for one and stores it at `failure_rca:{run_id}`.
 Mirrors test_deploy_stage_tag_resolution.py's fake-Redis + monkeypatch
 pattern — no real Redis or explainability-service needed.
+
+Uses a "build" stage failure (monkeypatched run_build_task) to exercise
+this, not "test" — a test-stage failure is deliberately non-blocking now
+(see test_test_stage_non_blocking.py) and can no longer fail a pipeline at
+all, so it stopped being a valid way to trigger this RCA path.
 """
 import json
 import os
@@ -29,10 +34,11 @@ metadata:
 
 spec:
   stages:
-    - name: test
-      type: test
+    - name: build
+      type: build
       config:
-        command: "python -c \\"import sys; sys.exit(1)\\""
+        dockerfilePath: Dockerfile
+        imageTag: v1.0.0
 
   gates:
     blockedDeployWindows: []
@@ -112,9 +118,14 @@ def test_a_failed_stage_triggers_the_rca_call_with_the_real_error_and_logs(monke
     def _fake_post(url, json=None, timeout=None):
         captured["url"] = url
         captured["body"] = json
-        return _FakeRCAResponse({"likely_cause": "test exited non-zero", "evidence": [], "suggested_fix": "fix it"})
+        return _FakeRCAResponse({"likely_cause": "build exited non-zero", "evidence": [], "suggested_fix": "fix it"})
 
     monkeypatch.setattr(worker_module.requests, "post", _fake_post)
+
+    def _raise_build_error(*args, **kwargs):
+        raise RuntimeError("Build failed: COPY failed: file not found")
+
+    monkeypatch.setattr(worker_module, "run_build_task", _raise_build_error)
 
     orchestrator = PipelineOrchestrator(_FakeRedis())
     with pytest.raises(RuntimeError):
@@ -122,11 +133,11 @@ def test_a_failed_stage_triggers_the_rca_call_with_the_real_error_and_logs(monke
 
     assert captured["url"] == f"{worker_module.EXPLAINABILITY_SERVICE_URL}/stage-failure-rca"
     assert captured["body"]["run_id"] == "run-1"
-    assert captured["body"]["failed_stage"] == "test"
-    assert "Tests failed" in captured["body"]["error_message"]
+    assert captured["body"]["failed_stage"] == "build"
+    assert "Build failed" in captured["body"]["error_message"]
 
     stored = json.loads(orchestrator.redis.get("failure_rca:run-1"))
-    assert stored["likely_cause"] == "test exited non-zero"
+    assert stored["likely_cause"] == "build exited non-zero"
 
 
 def test_explainability_service_outage_does_not_prevent_the_run_from_being_marked_failed(monkeypatch, manifest_path):
@@ -134,6 +145,11 @@ def test_explainability_service_outage_does_not_prevent_the_run_from_being_marke
         raise ConnectionError("explainability-service unreachable")
 
     monkeypatch.setattr(worker_module.requests, "post", _raise)
+
+    def _raise_build_error(*args, **kwargs):
+        raise RuntimeError("Build failed: COPY failed: file not found")
+
+    monkeypatch.setattr(worker_module, "run_build_task", _raise_build_error)
 
     orchestrator = PipelineOrchestrator(_FakeRedis())
     with pytest.raises(RuntimeError):

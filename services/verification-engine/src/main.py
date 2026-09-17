@@ -32,6 +32,8 @@ from src.db import VerificationEngineDB
 from src.engine import VerificationEngine
 from src.health_router import router as health_router
 from src.publisher import publish_verdict
+from src.telemetry import cloudwatch_client as cw
+from src.telemetry.cloudwatch_client import CloudWatchQueryError
 from src.telemetry import prometheus_client as prom
 from src.telemetry.prometheus_client import PrometheusQueryError
 from src.promql_validator import PromQLValidationError, validate_metric_prometheus_config
@@ -81,6 +83,16 @@ class VerifyRequest(BaseModel):
     baseline_telemetry: dict = {}
     canary_telemetry: dict = {}
     use_prometheus: bool = False
+    # CloudWatch telemetry (P1, 2026-09-16) — the AWS ECS analog of
+    # use_prometheus. Each entry in `metrics` may carry a `cloudwatch: {}`
+    # block (see _fetch_metric_from_cloudwatch) instead of/alongside a
+    # `prometheus` one; unlike Prometheus, no per-metric query string is
+    # needed — this platform's fixed ALB/ECS-target-group naming
+    # convention is enough to derive the real CloudWatch query.
+    use_cloudwatch: bool = False
+    aws_region: str | None = None
+    ecs_service_name: str | None = None
+    ecs_cluster: str = cw.DEFAULT_ECS_CLUSTER
     elapsed_seconds: float = 0.0
     min_eval_seconds: float = 120.0
     # Phase 6 (§06-observability-platform-ops.md, 6.1): also accepted in the
@@ -185,6 +197,72 @@ def _fetch_metric_from_prometheus(
         logger.error("prometheus_fetch_failed", metric=name, error=str(e))
 
 
+def _fetch_metric_from_cloudwatch(
+    metric_cfg: dict,
+    window_seconds: float,
+    baseline_telemetry: dict,
+    canary_telemetry: dict,
+    aws_region: str,
+    ecs_service_name: str,
+    ecs_cluster: str,
+) -> None:
+    """
+    CloudWatch analog of _fetch_metric_from_prometheus — mutates
+    baseline_telemetry/canary_telemetry in place with real ALB/ECS metrics,
+    populating the exact same keys engine.py's dispatcher already reads.
+    See cloudwatch_client.py's own module docstring for why business_metric
+    has no real signal to fetch here and is deliberately skipped rather
+    than faked.
+    """
+    name = metric_cfg["name"]
+    category = metric_cfg.get("category", "latency")
+    cw_cfg = metric_cfg.get("cloudwatch")
+    # `cw_cfg` is legitimately `{}` for every metric the project-YAML generator
+    # emits (unlike Prometheus, no per-metric query config is needed — see this
+    # module's docstring) — checking truthiness instead of `is None` would treat
+    # that real, present-but-empty config as absent and skip every real fetch.
+    if cw_cfg is None:
+        logger.warning("no_cloudwatch_config_for_metric", metric=name)
+        return
+
+    try:
+        if category == "error_rate":
+            b = cw.fetch_error_rate_telemetry(aws_region, ecs_service_name, "baseline", window_seconds)
+            c = cw.fetch_error_rate_telemetry(aws_region, ecs_service_name, "canary", window_seconds)
+            baseline_telemetry[f"{name}_requests"] = b["requests"]
+            baseline_telemetry[f"{name}_errors"] = b["errors"]
+            canary_telemetry[f"{name}_requests"] = c["requests"]
+            canary_telemetry[f"{name}_errors"] = c["errors"]
+
+        elif category == "latency":
+            baseline_telemetry[name] = cw.fetch_latency_samples(
+                aws_region, ecs_service_name, "baseline", window_seconds
+            ).tolist()
+            canary_telemetry[name] = cw.fetch_latency_samples(
+                aws_region, ecs_service_name, "canary", window_seconds
+            ).tolist()
+
+        elif category == "saturation":
+            cw_metric_name = cw_cfg.get("metric_name", "CPUUtilization")
+            baseline_telemetry[name] = cw.fetch_saturation_samples(
+                aws_region, ecs_service_name, "baseline", window_seconds, cw_metric_name, ecs_cluster
+            ).tolist()
+            canary_telemetry[name] = cw.fetch_saturation_samples(
+                aws_region, ecs_service_name, "canary", window_seconds, cw_metric_name, ecs_cluster
+            ).tolist()
+
+        elif category == "business_metric":
+            # Deliberately unset, never fabricated — see cloudwatch_client.py's
+            # own module docstring for why no generic ALB/ECS-level signal
+            # exists for a business outcome. engine.py's dispatch already
+            # treats missing telemetry as "insufficient samples," the same
+            # fail-soft path a genuine Prometheus/CloudWatch outage takes.
+            logger.warning("cloudwatch_business_metric_not_supported", metric=name)
+
+    except CloudWatchQueryError as e:
+        logger.error("cloudwatch_fetch_failed", metric=name, error=str(e))
+
+
 @app.post("/verify")
 async def verify(body: VerifyRequest, request: Request):
     # Phase 6 (§06-observability-platform-ops.md, 6.1): prefer the header
@@ -205,10 +283,22 @@ async def verify(body: VerifyRequest, request: Request):
                     raise HTTPException(
                         status_code=422, detail=f"Invalid PromQL in metric '{metric_cfg.get('name')}': {e}"
                     )
+        elif body.use_cloudwatch:
+            if not body.aws_region or not body.ecs_service_name:
+                raise HTTPException(
+                    status_code=422,
+                    detail="aws_region and ecs_service_name are required when use_cloudwatch=true.",
+                )
+            window_seconds = max(body.elapsed_seconds, body.min_eval_seconds, 10.0)
+            for metric_cfg in body.metrics:
+                _fetch_metric_from_cloudwatch(
+                    metric_cfg, window_seconds, baseline_telemetry, canary_telemetry,
+                    body.aws_region, body.ecs_service_name, body.ecs_cluster,
+                )
         elif not baseline_telemetry and not canary_telemetry:
             raise HTTPException(
                 status_code=422,
-                detail="Provide baseline_telemetry/canary_telemetry, or set use_prometheus=true.",
+                detail="Provide baseline_telemetry/canary_telemetry, or set use_prometheus=true / use_cloudwatch=true.",
             )
 
         verdict = _engine.run_verification(

@@ -42,6 +42,50 @@ test_first_deployment_blocked_during_emergency_maintenance {
     }
 }
 
+test_health_gated_cutover_allowed_outside_freeze_window {
+    allow_action with input as {
+        "requested_action": "HEALTH_GATED_CUTOVER",
+        "runtime_context": {"current_day": "Tuesday", "current_time": "10:00", "cluster_maintenance_lock": false},
+        "pipeline_policy": {
+            "gates": {"blockedDeployWindows": [
+                {"days": ["Friday", "Saturday", "Sunday"], "startTime": "16:00", "endTime": "23:59"}
+            ]}
+        }
+    }
+}
+
+test_health_gated_cutover_blocked_during_freeze_window {
+    not allow_action with input as {
+        "requested_action": "HEALTH_GATED_CUTOVER",
+        "runtime_context": {"current_day": "Friday", "current_time": "17:00", "cluster_maintenance_lock": false},
+        "pipeline_policy": {
+            "gates": {"blockedDeployWindows": [
+                {"days": ["Friday", "Saturday", "Sunday"], "startTime": "16:00", "endTime": "23:59"}
+            ]}
+        }
+    }
+}
+
+test_health_gated_cutover_blocked_during_emergency_maintenance {
+    not allow_action with input as {
+        "requested_action": "HEALTH_GATED_CUTOVER",
+        "runtime_context": {"current_day": "Tuesday", "current_time": "10:00", "cluster_maintenance_lock": true},
+        "pipeline_policy": {"gates": {"blockedDeployWindows": []}}
+    }
+}
+
+# Critically, this must NOT be gated on a statistical verdict — a
+# health-gated cutover is requested precisely because no real traffic
+# (and therefore no verdict) exists yet. Deliberately omits
+# "verification_verdict" from input entirely to prove the rule never reads it.
+test_health_gated_cutover_allowed_with_no_verdict_at_all {
+    allow_action with input as {
+        "requested_action": "HEALTH_GATED_CUTOVER",
+        "runtime_context": {"current_day": "Tuesday", "current_time": "10:00", "cluster_maintenance_lock": false},
+        "pipeline_policy": {"gates": {"blockedDeployWindows": []}}
+    }
+}
+
 test_promotion_blocked_during_friday_freeze {
     not allow_action with input as {
         "requested_action": "PROMOTE_STEP",

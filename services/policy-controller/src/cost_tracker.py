@@ -30,12 +30,15 @@ actually measured.
 import os
 
 import structlog
+import httpx
 from kubernetes import client as k8s_client, config as k8s_config
 from kubernetes.client.rest import ApiException
 from shared import eks_auth
+from shared.cost_formulas import compute_cost_delta as _shared_compute_cost_delta
 
 logger = structlog.get_logger(__name__)
 
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
 CPU_COST_PER_VCPU_HOUR = float(os.environ.get("CPU_COST_PER_VCPU_HOUR", "0.0316"))
 MEM_COST_PER_GIB_HOUR = float(os.environ.get("MEM_COST_PER_GIB_HOUR", "0.0042"))
 
@@ -81,24 +84,79 @@ def _compute_cost_delta(
     baseline_mem_gib: float,
     max_permitted_delta_percent: float,
     duration_hours: float = 1.0,
+    cpu_rate: float | None = None,
+    mem_rate: float | None = None,
 ) -> dict:
-    canary_cost = canary_replicas * (
-        CPU_COST_PER_VCPU_HOUR * canary_cpu_vcpu + MEM_COST_PER_GIB_HOUR * canary_mem_gib
-    ) * duration_hours
-    baseline_cost = baseline_replicas * (
-        CPU_COST_PER_VCPU_HOUR * baseline_cpu_vcpu + MEM_COST_PER_GIB_HOUR * baseline_mem_gib
-    ) * duration_hours
+    """
+    cpu_rate/mem_rate default to this module's own Kubernetes-node-estimate
+    constants — overridable so cost_tracker_ecs.py can reuse this identical
+    formula against real AWS Fargate on-demand rates instead of a second
+    copy of the arithmetic (this is one service's internal boundary, not
+    the cross-service one this module's own docstring justifies duplicating
+    verification-engine's copy across).
+    """
+    cpu_rate = CPU_COST_PER_VCPU_HOUR if cpu_rate is None else cpu_rate
+    mem_rate = MEM_COST_PER_GIB_HOUR if mem_rate is None else mem_rate
+    return _shared_compute_cost_delta(
+        canary_replicas, canary_cpu_vcpu, canary_mem_gib,
+        baseline_replicas, baseline_cpu_vcpu, baseline_mem_gib,
+        max_permitted_delta_percent, duration_hours, cpu_rate, mem_rate,
+    )
 
-    delta = canary_cost - baseline_cost
-    delta_percent = (delta / baseline_cost * 100) if baseline_cost > 0 else 0.0
+
+def compute_rightsizing_recommendation(
+    observed_cpu_p95: float,
+    observed_mem_p95: float,
+    requested_cpu: float,
+    requested_mem: float,
+    headroom: float = 0.25,
+    min_cpu: float = 0.05,
+    min_mem: float = 0.064,
+    overprovisioned_threshold: float = 0.35,
+) -> dict:
+    """
+    eta = p95_usage / requested. eta < threshold (default 0.35) flags
+    over-provisioning. Duplicated from cost_analyzer.py to maintain boundary.
+    """
+    eta_cpu = observed_cpu_p95 / requested_cpu if requested_cpu > 0 else 1.0
+    eta_mem = observed_mem_p95 / requested_mem if requested_mem > 0 else 1.0
 
     return {
-        "canary_cost_usd": round(canary_cost, 6),
-        "baseline_cost_usd": round(baseline_cost, 6),
-        "delta_usd": round(delta, 6),
-        "delta_percent": round(delta_percent, 2),
-        "exceeds_policy_limit": delta_percent > max_permitted_delta_percent,
+        "efficiency_cpu": round(eta_cpu, 3),
+        "efficiency_mem": round(eta_mem, 3),
+        "is_overprovisioned": eta_cpu < overprovisioned_threshold or eta_mem < overprovisioned_threshold,
+        "recommended_cpu_vcpu": round(max(min_cpu, observed_cpu_p95 * (1 + headroom)), 3),
+        "recommended_mem_gib": round(max(min_mem, observed_mem_p95 * (1 + headroom)), 3),
+        "action": "SUBMIT_GITOPS_PR",
+        "requires_approval_role": "platform-admin",
     }
+
+
+def _fetch_p95_usage(deployment_name: str, namespace: str) -> tuple[float, float]:
+    """
+    Fetches the max/p95 CPU (cores) and Memory (bytes) for a given deployment from Prometheus.
+    Returns (cpu_cores, memory_bytes). Returns (0.0, 0.0) if Prometheus is unreachable.
+    """
+    try:
+        cpu_query = f'max(sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{namespace}", pod=~"{deployment_name}-.*", container!=""}}[2m])))'
+        mem_query = f'max(sum by (pod) (container_memory_usage_bytes{{namespace="{namespace}", pod=~"{deployment_name}-.*", container!=""}}))'
+        
+        cpu = 0.0
+        mem = 0.0
+        
+        with httpx.Client(timeout=3.0) as client:
+            resp = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": cpu_query})
+            if resp.status_code == 200 and resp.json()["data"]["result"]:
+                cpu = float(resp.json()["data"]["result"][0]["value"][1])
+                
+            resp = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": mem_query})
+            if resp.status_code == 200 and resp.json()["data"]["result"]:
+                mem = float(resp.json()["data"]["result"][0]["value"][1])
+                
+        return cpu, mem
+    except Exception as e:
+        logger.warning("prometheus_usage_fetch_failed", error=str(e), deployment=deployment_name)
+        return 0.0, 0.0
 
 
 def _read_deployment_footprint(apps_v1, name: str, namespace: str) -> dict | None:
@@ -157,12 +215,26 @@ async def compute_and_record_cost(
         baseline_mem_gib=baseline["mem_gib"],
         max_permitted_delta_percent=max_permitted_delta_percent,
     )
+    
+    # Generate right-sizing recommendation using real observed usage
+    observed_cpu, observed_mem_bytes = _fetch_p95_usage(canary_deployment_name, namespace)
+    rightsizing_rec = None
+    if observed_cpu > 0 or observed_mem_bytes > 0:
+        observed_mem_gib = observed_mem_bytes / (1024 ** 3)
+        rightsizing_rec = compute_rightsizing_recommendation(
+            observed_cpu_p95=observed_cpu,
+            observed_mem_p95=observed_mem_gib,
+            requested_cpu=canary["cpu_vcpu"],
+            requested_mem=canary["mem_gib"],
+        )
+
     logger.info(
         "cost_delta_computed",
         pipeline_run_id=pipeline_run_id,
         delta_percent=result["delta_percent"],
         canary_cost_usd=result["canary_cost_usd"],
         baseline_cost_usd=result["baseline_cost_usd"],
+        rightsizing_generated=rightsizing_rec is not None,
     )
 
     if db and tenant_id:
@@ -173,6 +245,7 @@ async def compute_and_record_cost(
                 baseline_cost=result["baseline_cost_usd"],
                 canary_cost=result["canary_cost_usd"],
                 delta_percent=result["delta_percent"],
+                rightsizing_rec=rightsizing_rec,
             )
         except Exception as e:
             logger.error("cost_analysis_db_write_failed", error=str(e), pipeline_run_id=pipeline_run_id)

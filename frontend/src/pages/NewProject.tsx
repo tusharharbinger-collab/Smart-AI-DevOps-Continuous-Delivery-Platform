@@ -21,17 +21,21 @@ import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  ArrowLeft, ArrowRight, Check, Container, FolderGit2, KeyRound, Link2, Loader2, Lock, LogOut,
-  Plus, Rocket, Search, Unlock,
+  AlertTriangle, ArrowLeft, ArrowRight, Ban, Check, Container, FolderGit2, Hammer,
+  KeyRound, Link2, Loader2, Lock, LogOut, Plus, RefreshCw, Rocket, Search, ShieldCheck, Sparkles,
+  Trash2, Unlock, XCircle,
 } from "lucide-react";
 import {
-  disconnectGitHub, getAuthorizeUrl, getGitHubStatus, listBranches, listRepos, parseRepoUrl,
-  type GitHubRepo, type GitHubStatus,
+  disconnectGitHub, getAuthorizeUrl, getBuildDetection, getGitHubStatus, getRepoReport, listBranches, listRepos,
+  parseRepoUrl, type BuildDetection, type GitHubRepo, type GitHubStatus, type RepoReport,
 } from "@/api/github";
 import {
   createRegistryCredential, listRegistryCredentials, parseImageRef, type RegistryCredential,
 } from "@/api/registry";
-import { createProject, type CreateProjectInput } from "@/api/projects";
+import {
+  createProject, getBuildPreviewLogs, getBuildPreviewResult, startBuildPreview,
+  type BuildPreviewResult, type CreateProjectInput,
+} from "@/api/projects";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -43,21 +47,10 @@ import {
 
 const STEPS = ["Choose Repository", "Configure Build & Test", "Progressive Policy & Deploy"] as const;
 const TRAFFIC_PRESET = [10, 25, 50, 100];
+const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const APPROVAL_ROLES = ["developer", "lead-sre", "platform-admin"];
 
 type SourceTab = "provider" | "public" | "image";
-
-// Real bug found live: a GitHub repo named "test-" (trailing hyphen)
-// produced the auto-suggested container_image "registry.internal/test-" —
-// already lowercase, so it passed the casing check, but Docker repository
-// name components must also START and END with an alphanumeric character.
-// `docker build -t` rejected it as "invalid reference format" deep inside
-// the build stage instead of at onboarding time. Lowercasing alone (the
-// original fix for the "RaktDoot" bug) isn't enough — strip any leading/
-// trailing non-alphanumeric characters too, matching the same rule
-// projects_router.py now validates server-side.
-function dockerSafeName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "") || "app";
-}
 
 export function NewProject() {
   const navigate = useNavigate();
@@ -89,7 +82,22 @@ export function NewProject() {
     branch: "main",
     root_directory: "./",
     dockerfile_path: "Dockerfile",
-    test_command: "pytest tests/",
+    language: "",
+    // Guaranteed Live Web App CI/CD — only ever set by auto-detection
+    // (see shared/repo_scanner.py's BuildDetection.framework), never a
+    // manual dropdown choice: "spa" | "nextjs" | "node-server" | "".
+    framework: "",
+    start_command: "",
+    manifest_path: "",
+    // Real gap found live: this used to default to a Python-specific
+    // "pytest tests/" regardless of the project's actual language — a JS
+    // (or any non-Python) repo would silently submit a command that could
+    // never find matching tests, and it ran in pipeline-worker's own
+    // container which may not even have the right runtime installed. Test
+    // commands are genuinely optional (blank = skip; the repo's own
+    // Dockerfile, if it has one, often already runs its real tests as a
+    // build layer) — never guessed here.
+    test_command: "",
     container_image: "",
     active_production_tag: "v1.0.0",
     canary_tag: "v1.1.0",
@@ -99,12 +107,53 @@ export function NewProject() {
   });
   const [branches, setBranches] = useState<string[]>([]);
 
+  // Step 2 — build method: which of the two backend-supported build paths
+  // (dockerfile vs. language+startCommand synthesis) is currently active,
+  // and whether the "Auto-detect" pill drove that choice (see
+  // shared/repo_scanner.py's deterministic, non-AI BuildDetection).
+  const [buildTab, setBuildTab] = useState<"dockerfile" | "language">("dockerfile");
+  const [autoMode, setAutoMode] = useState(true);
+  const [detection, setDetection] = useState<BuildDetection | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  const [detectionError, setDetectionError] = useState<string | null>(null);
+  const [detectedFor, setDetectedFor] = useState<string | null>(null);
+  const [repoReport, setRepoReport] = useState<RepoReport | null>(null);
+  const [loadingReport, setLoadingReport] = useState(false);
+
+  // Build & Test preview — a real, human-triggered clone->build->test dry
+  // run (build_preview.py) with live logs, so a failure surfaces during
+  // onboarding instead of three real pipeline stages deep into a rollout.
+  const [previewRunId, setPreviewRunId] = useState<string | null>(null);
+  const [previewLogs, setPreviewLogs] = useState<string[]>([]);
+  const [previewResult, setPreviewResult] = useState<BuildPreviewResult | null>(null);
+  const [previewStarting, setPreviewStarting] = useState(false);
+
   // Step 3 — guardrails
   const [confidenceFloor, setConfidenceFloor] = useState(0.8);
   const [minSampleSize, setMinSampleSize] = useState(100);
   const [maxCostDelta, setMaxCostDelta] = useState(15);
   const [provisionCluster, setProvisionCluster] = useState(true);
+  // Module 8 — real second deployment target. AWS ECS Fargate is the only
+  // one the wizard offers (2026-09-16 scope decision — see BACKLOG.md P3
+  // #9): Kind/Kubernetes is deprioritized, not deleted, so the type union
+  // and the api-gateway payload field stay "kubernetes" | "aws_ecs" for the
+  // pipelines that already run on Kind, but a NEW project always starts on
+  // "aws_ecs" with no user-facing toggle back to "kubernetes" anymore.
+  const [deployTarget] = useState<"kubernetes" | "aws_ecs">("aws_ecs");
+  const [awsRegion, setAwsRegion] = useState("us-east-1");
   const [submitting, setSubmitting] = useState(false);
+
+  // Step 3 — deploy policy: real gap found live — freeze windows and
+  // approver roles used to be hardcoded server-side for every project,
+  // never actually wizard-configurable. Blue-green is only real for AWS
+  // ECS (the server rejects blue_green + kubernetes with a 422) — since
+  // deployTarget is currently fixed to "aws_ecs" above, both are shown.
+  const [deployMode, setDeployMode] = useState<"canary" | "blue_green">("canary");
+  const [blockedWindows, setBlockedWindows] = useState<
+    { days: string[]; start_time: string; end_time: string }[]
+  >([]);
+  const [manualApprovalRequired, setManualApprovalRequired] = useState(true);
+  const [manualApprovalRoles, setManualApprovalRoles] = useState<string[]>(["lead-sre", "platform-admin"]);
 
   const repoUrl = selectedRepo?.clone_url ?? manualUrl;
   const repoPrivate = selectedRepo?.private ?? false;
@@ -229,10 +278,16 @@ export function NewProject() {
       ...f,
       name: repo.name,
       branch: repo.default_branch,
-      // Docker repository names must be lowercase (real bug found live:
-      // a GitHub repo named "RaktDoot" produced "registry.internal/RaktDoot",
-      // which `docker build -t` rejects outright as an invalid reference).
-      container_image: f.container_image || `registry.internal/${dockerSafeName(repo.name)}`,
+      // Real gap found live (2026-09-16): this used to auto-fill
+      // "registry.internal/{name}" unconditionally — a placeholder host
+      // that only resolves inside the local dev network. AWS ECS is now
+      // the only deploy target the wizard offers, and a real ECS Fargate
+      // task can never reach that host at all (a project silently shipped
+      // with it just retries a DNS lookup forever, never actually
+      // deploying). No safe default exists without knowing the caller's
+      // real AWS account id, so this is intentionally left for the human
+      // to fill in with a real ECR URI — see the field's own helper text.
+      container_image: f.container_image,
     }));
     const parsed = parseRepoUrl(repo.clone_url);
     if (parsed) {
@@ -243,6 +298,7 @@ export function NewProject() {
         setBranches([repo.default_branch]);
       }
     }
+    resetDetection();
   }
 
   function useManualUrl() {
@@ -251,10 +307,199 @@ export function NewProject() {
     setForm((f) => ({
       ...f,
       name: f.name || parsed?.repo || "",
-      container_image: f.container_image || (parsed ? `registry.internal/${dockerSafeName(parsed.repo)}` : ""),
+      // See selectRepo's comment above — never auto-guess a registry host.
+      container_image: f.container_image,
     }));
     setBranches([]);
+    resetDetection();
   }
+
+  function resetDetection() {
+    setDetection(null);
+    setDetectionError(null);
+    setDetectedFor(null);
+    setRepoReport(null);
+    setAutoMode(true);
+    resetPreview();
+  }
+
+  /**
+   * Calls shared/repo_scanner.py's deterministic build-method detection
+   * (Dockerfile / smartcd.yaml manifest / language-signature match — never
+   * an AI guess) and pre-fills whichever of the two backend-supported build
+   * paths it found. Every field it fills stays human-editable — a "high"
+   * confidence result pre-checks itself, a "low" one (or an outright
+   * "unsupported" verdict) still populates what it can and surfaces exactly
+   * what's missing via `issues`, matching the human-in-the-loop requirement
+   * that AI/automation only ever proposes, never silently finalizes.
+   */
+  async function runDetection() {
+    const parsed = parseRepoUrl(repoUrl);
+    if (!parsed) {
+      setDetectionError("Could not parse a GitHub owner/repo from this URL — pick a build method manually below.");
+      setDetection(null);
+      setRepoReport(null);
+      return;
+    }
+    const key = `${parsed.owner}/${parsed.repo}@${form.branch || "main"}`;
+    setDetecting(true);
+    setLoadingReport(true);
+    setDetectionError(null);
+    try {
+      const [buildRes, reportRes] = await Promise.allSettled([
+        getBuildDetection(parsed.owner, parsed.repo, form.branch || "main"),
+        getRepoReport(parsed.owner, parsed.repo, form.branch || "main"),
+      ]);
+
+      if (buildRes.status === "fulfilled") {
+        setDetection(buildRes.value);
+        setDetectedFor(key);
+        applyDetection(buildRes.value);
+      } else {
+        setDetectionError(buildRes.reason?.message || "Detection failed");
+        setDetection(null);
+      }
+
+      if (reportRes.status === "fulfilled") {
+        setRepoReport(reportRes.value);
+      } else {
+        setRepoReport(null);
+      }
+    } finally {
+      setDetecting(false);
+      setLoadingReport(false);
+    }
+  }
+
+  function applyDetection(d: BuildDetection) {
+    // Guaranteed Live Web App CI/CD — a static site and a Vite/CRA "spa"
+    // have no runtime start command at all (nginx just serves files), so
+    // a real detection for either is already complete without one.
+    const noStartCommandNeeded = d.language === "static" || d.framework === "spa";
+    // Only pre-fill Networking from the suggestion if the user hasn't
+    // already moved off the original hardcoded defaults — a real edit
+    // (manual or from a PRIOR detection) is never silently overwritten,
+    // matching this wizard's existing "never guess over a human's own
+    // input" rule elsewhere.
+    const networkingUntouched = form.health_check_path === "/healthz" && form.port === 8080;
+    if (d.dockerfile_path) {
+      setBuildTab("dockerfile");
+      setForm((f) => ({
+        ...f,
+        dockerfile_path: d.dockerfile_path!,
+        test_command: d.test_command ?? f.test_command,
+      }));
+    } else if (d.language && (d.start_command || noStartCommandNeeded)) {
+      setBuildTab("language");
+      setForm((f) => ({
+        ...f,
+        language: d.language!,
+        framework: d.framework ?? "",
+        start_command: d.start_command ?? "",
+        manifest_path: d.manifest_path ?? f.manifest_path,
+        test_command: d.test_command ?? f.test_command,
+        health_check_path: networkingUntouched ? d.suggested_health_check_path : f.health_check_path,
+        port: networkingUntouched ? d.suggested_port : f.port,
+      }));
+    }
+    // "unsupported" (or a language synthesis result missing startCommand):
+    // leave existing form values as-is and let the issues list explain why
+    // — the user picks Dockerfile or Language runtime manually below.
+  }
+
+  function addBlockedWindow() {
+    setBlockedWindows((w) => [...w, { days: ["Friday"], start_time: "16:00", end_time: "23:59" }]);
+  }
+
+  function updateBlockedWindow(index: number, patch: Partial<{ days: string[]; start_time: string; end_time: string }>) {
+    setBlockedWindows((w) => w.map((win, i) => (i === index ? { ...win, ...patch } : win)));
+  }
+
+  function removeBlockedWindow(index: number) {
+    setBlockedWindows((w) => w.filter((_, i) => i !== index));
+  }
+
+  function toggleWindowDay(index: number, day: string) {
+    setBlockedWindows((w) =>
+      w.map((win, i) =>
+        i === index
+          ? { ...win, days: win.days.includes(day) ? win.days.filter((d) => d !== day) : [...win.days, day] }
+          : win
+      )
+    );
+  }
+
+  function toggleApprovalRole(role: string) {
+    setManualApprovalRoles((roles) => (roles.includes(role) ? roles.filter((r) => r !== role) : [...roles, role]));
+  }
+
+  function resetPreview() {
+    setPreviewRunId(null);
+    setPreviewLogs([]);
+    setPreviewResult(null);
+  }
+
+  /**
+   * Kicks off the real build_preview.py dry run: clone -> build (real
+   * Dockerfile or synthesized) -> test, no deploy/cluster involvement.
+   * Human-triggered, never automatic — running `docker build` server-side
+   * is real work, unlike the free file-signature scan above. Polling (not
+   * SSE) matches this platform's own documented reason for that choice
+   * elsewhere: a preview run is short-lived and this keeps the client
+   * simple; see useLiveLogs.ts for why a long-running stream uses fetch+SSE
+   * instead when one actually needs to.
+   */
+  async function runBuildTestPreview() {
+    resetPreview();
+    setPreviewStarting(true);
+    try {
+      const res = await startBuildPreview({
+        repo_url: repoUrl,
+        ref: form.branch || "main",
+        repo_private: repoPrivate,
+        root_directory: form.root_directory,
+        dockerfile_path: buildTab === "dockerfile" ? form.dockerfile_path || null : null,
+        language: buildTab === "language" ? form.language || null : null,
+        framework: buildTab === "language" ? form.framework || null : null,
+        manifest_path: buildTab === "language" ? form.manifest_path || null : null,
+        start_command: buildTab === "language" ? form.start_command || null : null,
+        test_command: form.test_command || null,
+      });
+      setPreviewRunId(res.run_id);
+    } catch (err) {
+      toast.error("Could not start the build preview", { description: (err as Error).message });
+    } finally {
+      setPreviewStarting(false);
+    }
+  }
+
+  // Poll logs + result every 1.5s while a preview is running; stop the
+  // moment it reaches a terminal state (succeeded/failed).
+  useEffect(() => {
+    if (!previewRunId || previewResult?.status === "succeeded" || previewResult?.status === "failed") return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const [logsRes, resultRes] = await Promise.all([
+          getBuildPreviewLogs(previewRunId),
+          getBuildPreviewResult(previewRunId),
+        ]);
+        if (cancelled) return;
+        setPreviewLogs(logsRes.lines);
+        setPreviewResult(resultRes);
+      } catch {
+        // Transient — the next tick retries; the result endpoint 404ing
+        // permanently (expired/never-started) would mean previewRunId
+        // itself is stale, not worth surfacing mid-poll as an error.
+      }
+    };
+    tick();
+    const interval = setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [previewRunId, previewResult?.status]);
 
   async function handleDeploy() {
     setSubmitting(true);
@@ -266,8 +511,12 @@ export function NewProject() {
         repo_private: repoPrivate,
         branch: form.branch,
         root_directory: form.root_directory,
-        dockerfile_path: form.dockerfile_path,
-        test_command: form.test_command,
+        dockerfile_path: isImageSource || buildTab !== "dockerfile" ? null : form.dockerfile_path || null,
+        language: isImageSource || buildTab !== "language" ? null : form.language || null,
+        framework: isImageSource || buildTab !== "language" ? null : form.framework || null,
+        start_command: isImageSource || buildTab !== "language" ? null : form.start_command || null,
+        manifest_path: isImageSource || buildTab !== "language" ? null : form.manifest_path || null,
+        test_command: isImageSource ? null : form.test_command || null,
         container_image: form.container_image,
         active_production_tag: form.active_production_tag,
         canary_tag: form.canary_tag,
@@ -281,8 +530,16 @@ export function NewProject() {
           min_sample_size: minSampleSize,
           max_cost_delta_percent: maxCostDelta,
         },
+        deploy_policy: {
+          deploy_mode: deployMode,
+          blocked_deploy_windows: blockedWindows,
+          manual_approval_required: manualApprovalRequired,
+          manual_approval_roles: manualApprovalRequired ? manualApprovalRoles : [],
+        },
         traffic_steps: TRAFFIC_PRESET,
         provision_cluster: provisionCluster,
+        deploy_target: deployTarget,
+        aws_region: awsRegion,
       };
       const res = await createProject(payload);
       if (res.cluster_provisioning.attempted && !res.cluster_provisioning.succeeded) {
@@ -301,7 +558,30 @@ export function NewProject() {
   }
 
   const canContinueStep0 = isImageSource ? Boolean(form.container_image.trim()) : Boolean(repoUrl);
-  const canContinueStep1 = Boolean(form.name.trim() && form.container_image.trim());
+  // Guaranteed Live Web App CI/CD — a static site or a Vite/CRA "spa" has
+  // no start command at all (nginx just serves files), so requiring one
+  // here would block a perfectly buildable project from continuing.
+  const languageNeedsNoStartCommand = form.language === "static" || form.framework === "spa";
+  const hasBuildConfig =
+    isImageSource ||
+    (buildTab === "dockerfile" && Boolean(form.dockerfile_path.trim())) ||
+    (buildTab === "language" &&
+      Boolean(form.language.trim() && (form.start_command.trim() || languageNeedsNoStartCommand)));
+  const canContinueStep1 = Boolean(form.name.trim() && form.container_image.trim()) && hasBuildConfig;
+
+  // Auto-detect once per repo+branch combo the moment the user reaches
+  // step 2, so the checklist is already there instead of an empty form —
+  // a manual "Re-analyze" button below covers a branch change afterwards.
+  useEffect(() => {
+    if (step !== 1 || isImageSource || detecting) return;
+    const parsed = parseRepoUrl(repoUrl);
+    if (!parsed) return;
+    const key = `${parsed.owner}/${parsed.repo}@${form.branch || "main"}`;
+    if (autoMode && detectedFor !== key) {
+      runDetection();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, repoUrl, form.branch, autoMode]);
 
   return (
     <div className="mx-auto max-w-4xl space-y-5">
@@ -677,24 +957,347 @@ export function NewProject() {
                 </div>
               )}
               {!isImageSource && (
-                <div className="space-y-1">
-                  <Label htmlFor="new-project-dockerfile-path">Dockerfile path</Label>
-                  <Input
-                    id="new-project-dockerfile-path"
-                    value={form.dockerfile_path}
-                    onChange={(e) => setForm({ ...form, dockerfile_path: e.target.value })}
-                  />
-                </div>
-              )}
-              {!isImageSource && (
-                <div className="space-y-1">
-                  <Label htmlFor="new-project-test-command">Pre-flight test command</Label>
-                  <Input
-                    id="new-project-test-command"
-                    value={form.test_command}
-                    onChange={(e) => setForm({ ...form, test_command: e.target.value })}
-                    placeholder="pytest tests/  ·  npm test"
-                  />
+                <div className="space-y-3 sm:col-span-2 rounded-md border p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-medium">How does this repository build?</span>
+                    <div className="inline-flex overflow-hidden rounded-md border">
+                      <button
+                        type="button"
+                        onClick={() => { setAutoMode(true); if (!detecting) runDetection(); }}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          autoMode ? "bg-primary text-primary-foreground" : "hover:bg-accent"
+                        }`}
+                      >
+                        <Sparkles className="h-3 w-3" /> Auto-detect
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setAutoMode(false); setBuildTab("dockerfile"); }}
+                        className={`border-l px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          !autoMode && buildTab === "dockerfile" ? "bg-primary text-primary-foreground" : "hover:bg-accent"
+                        }`}
+                      >
+                        Dockerfile
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setAutoMode(false); setBuildTab("language"); }}
+                        className={`border-l px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          !autoMode && buildTab === "language" ? "bg-primary text-primary-foreground" : "hover:bg-accent"
+                        }`}
+                      >
+                        Language / smartcd.yaml
+                      </button>
+                    </div>
+                  </div>
+
+                  {autoMode && (
+                    <div className="rounded-md border bg-muted/30 p-2.5 text-[11px]">
+                      {detecting ? (
+                        <span className="flex items-center gap-1.5 text-muted-foreground">
+                          <Loader2 className="h-3 w-3 animate-spin" /> Scanning the repository for a Dockerfile,
+                          a smartcd.yaml manifest, or a known language signature…
+                        </span>
+                      ) : detectionError ? (
+                        <span className="flex items-start gap-1.5 text-destructive">
+                          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                          {detectionError}
+                        </span>
+                      ) : detection ? (
+                        <div className="space-y-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span
+                              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                                detection.confidence === "high"
+                                  ? "bg-success/20 text-success"
+                                  : "bg-warning/20 text-warning"
+                              }`}
+                            >
+                              {detection.confidence === "high" ? "HIGH CONFIDENCE" : "NEEDS YOUR INPUT"}
+                            </span>
+                            <span className="font-medium text-foreground">
+                              {detection.method === "yaml_manifest"
+                                ? "smartcd.yaml manifest found"
+                                : detection.method === "dockerfile"
+                                ? "Dockerfile found"
+                                : detection.method === "synthesized"
+                                ? "No Dockerfile — we'll generate one from the detected language"
+                                : "Could not determine a build method"}
+                            </span>
+                          </div>
+                          {detection.dockerfile_path && (
+                            <div className="flex items-center gap-1.5 text-muted-foreground">
+                              <Check className="h-3 w-3 text-success" /> Dockerfile at{" "}
+                              <span className="text-code">{detection.dockerfile_path}</span>
+                            </div>
+                          )}
+                          {detection.language && (
+                            <div className="flex items-center gap-1.5 text-muted-foreground">
+                              <Check className="h-3 w-3 text-success" /> Language:{" "}
+                              <span className="text-code">{detection.language}</span>
+                              {detection.framework && (
+                                <>
+                                  {" "}(<span className="text-code">{detection.framework}</span>)
+                                </>
+                              )}
+                              {detection.start_command && (
+                                <>
+                                  {" "}· start: <span className="text-code">{detection.start_command}</span>
+                                </>
+                              )}
+                              {!detection.start_command && detection.language === "static" && <> · served by nginx</>}
+                            </div>
+                          )}
+                          <div className="flex items-center gap-1.5 text-muted-foreground">
+                            {detection.test_config_found || detection.test_command ? (
+                              <Check className="h-3 w-3 text-success" />
+                            ) : (
+                              <AlertTriangle className="h-3 w-3 text-warning" />
+                            )}
+                            {detection.test_command
+                              ? `Test command declared: ${detection.test_command}`
+                              : detection.test_config_found
+                              ? "Test configuration detected"
+                              : "No test configuration detected — pre-flight tests will be skipped unless you add one"}
+                          </div>
+                          {detection.issues.map((issue) => (
+                            <div key={issue} className="flex items-start gap-1.5 text-warning">
+                              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" /> {issue}
+                            </div>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={runDetection}
+                            className="flex items-center gap-1 pt-1 font-medium text-primary hover:underline"
+                          >
+                            <RefreshCw className="h-3 w-3" /> Re-analyze
+                          </button>
+                        </div>
+                      ) : (
+                        <span className="text-muted-foreground">
+                          Select a repository above, then this will scan it automatically.
+                        </span>
+                      )}
+
+                      {repoReport && (
+                        <div className="mt-3 rounded-md border border-border/80 bg-background/60 p-3 space-y-2 text-[11px]">
+                          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/50 pb-2">
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-foreground text-xs">Repo Health & Cost Prediction</span>
+                              <span
+                                className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                                  repoReport.risk.risk_level === "low"
+                                    ? "bg-success/20 text-success"
+                                    : repoReport.risk.risk_level === "medium"
+                                    ? "bg-warning/20 text-warning"
+                                    : "bg-destructive/20 text-destructive"
+                                }`}
+                              >
+                                {repoReport.risk.risk_level} Risk ({Math.round((1 - repoReport.risk.risk_score) * 100)}% readiness)
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-3 text-muted-foreground font-mono text-[11px]">
+                              <span>
+                                Steady: <strong className="text-foreground">${repoReport.cost.steady_state_monthly_usd}/mo</strong>
+                              </span>
+                              <span>
+                                Canary: <strong className="text-foreground">+${repoReport.cost.estimated_rollout_window_usd}</strong>
+                              </span>
+                            </div>
+                          </div>
+
+                          {repoReport.narrative && (
+                            <p className="text-muted-foreground italic text-[11px] leading-relaxed">
+                              "{repoReport.narrative}"
+                            </p>
+                          )}
+
+                          {repoReport.risk.risk_flags.length > 0 ? (
+                            <div className="space-y-1 pt-1">
+                              <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Readiness Observations</div>
+                              {repoReport.risk.risk_flags.map((flag) => (
+                                <div key={flag} className="flex items-start gap-1.5 text-warning text-[11px]">
+                                  <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                                  <span>{flag}</span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-1.5 text-success text-[11px] pt-1">
+                              <Check className="h-3 w-3" /> All baseline hygiene standards met (tests, lockfile, CI configuration present).
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {buildTab === "dockerfile" ? (
+                    <div className="space-y-1">
+                      <Label htmlFor="new-project-dockerfile-path">Dockerfile path</Label>
+                      <Input
+                        id="new-project-dockerfile-path"
+                        value={form.dockerfile_path}
+                        onChange={(e) => setForm({ ...form, dockerfile_path: e.target.value })}
+                      />
+                    </div>
+                  ) : (
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="new-project-language">Language</Label>
+                        <select
+                          id="new-project-language"
+                          value={form.language}
+                          onChange={(e) => setForm({ ...form, language: e.target.value, framework: "" })}
+                          className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        >
+                          <option value="">Select…</option>
+                          <option value="python">Python</option>
+                          <option value="node">Node.js</option>
+                          <option value="go">Go</option>
+                          <option value="static">Static HTML</option>
+                        </select>
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="new-project-start-command">
+                          Start command{form.language === "static" ? " (not needed)" : ""}
+                        </Label>
+                        <Input
+                          id="new-project-start-command"
+                          value={form.start_command}
+                          onChange={(e) => setForm({ ...form, start_command: e.target.value })}
+                          placeholder={form.language === "static" ? "nginx serves the files directly" : "python main.py"}
+                          disabled={form.language === "static"}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="new-project-manifest-path">
+                          {form.language === "static" ? "Path to index.html" : "Manifest path"}
+                        </Label>
+                        <Input
+                          id="new-project-manifest-path"
+                          value={form.manifest_path}
+                          onChange={(e) => setForm({ ...form, manifest_path: e.target.value })}
+                          placeholder={form.language === "static" ? "index.html" : "requirements.txt"}
+                        />
+                      </div>
+                      <p className="text-[11px] text-muted-foreground sm:col-span-3">
+                        No Dockerfile needed — a Dockerfile is generated for you from this language at build time.
+                        Python, Node.js (including Vite/React and Next.js, auto-detected), Go, and static HTML are
+                        supported.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="space-y-1">
+                    <Label htmlFor="new-project-test-command">Pre-flight test command (optional)</Label>
+                    <Input
+                      id="new-project-test-command"
+                      value={form.test_command}
+                      onChange={(e) => setForm({ ...form, test_command: e.target.value })}
+                      placeholder="pytest tests/  ·  npm test"
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      Leave blank if your Dockerfile already runs your tests as a build step — that already
+                      gates the build for real. If set, this runs separately and never blocks build/deploy on
+                      its own (it may not match your project's language/runtime).
+                    </p>
+                  </div>
+
+                  {/*
+                    Build & Test preview — a real clone->build->test dry run
+                    (build_preview.py), the same code path a real rollout's
+                    build/test stages call. Human-triggered on purpose: this
+                    runs a real `docker build`, unlike the free scan above.
+                    Never blocks Continue — a project can still be created
+                    without running this first — but this is the fastest way
+                    to find out "does this actually build" before committing
+                    to guardrails in step 3.
+                  */}
+                  <div className="space-y-2 rounded-md border border-dashed p-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-medium">Build &amp; Test preview</span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={runBuildTestPreview}
+                        disabled={!hasBuildConfig || !repoUrl || previewStarting || previewResult?.status === "running" || (!!previewRunId && !previewResult)}
+                      >
+                        {previewStarting || previewResult?.status === "running" || (!!previewRunId && !previewResult) ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Hammer className="h-3.5 w-3.5" />
+                        )}
+                        {previewResult ? "Run again" : "Run build & test now"}
+                      </Button>
+                    </div>
+
+                    {!previewRunId && !previewStarting && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Actually clones the repo and runs a real <span className="text-code">docker build</span> plus
+                        your test command — no deploy, no cluster touched. Optional, but the fastest way to catch a
+                        broken build before you finish onboarding.
+                      </p>
+                    )}
+
+                    {previewRunId && (
+                      <div className="space-y-2">
+                        <div className="max-h-40 overflow-y-auto rounded bg-muted/50 p-2 font-mono text-[10.5px] leading-relaxed">
+                          {previewLogs.length === 0 ? (
+                            <span className="text-muted-foreground">Waiting for the first log line…</span>
+                          ) : (
+                            previewLogs.map((line, i) => <div key={i}>{line}</div>)
+                          )}
+                        </div>
+
+                        {(!previewResult || previewResult.status === "running") && (
+                          <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                            <Loader2 className="h-3 w-3 animate-spin" /> Running…
+                          </span>
+                        )}
+                        {previewResult?.status === "succeeded" && (
+                          <div className="flex items-start gap-1.5 rounded bg-success/10 p-2 text-[11px] text-success">
+                            <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span>
+                              Build succeeded
+                              {previewResult.dockerfile_path && (
+                                <> — built from <span className="text-code">{previewResult.dockerfile_path}</span></>
+                              )}
+                              .
+                            </span>
+                          </div>
+                        )}
+                        {previewResult?.status === "succeeded" && previewResult.test_warning && (
+                          <div className="flex items-start gap-1.5 rounded bg-warning/10 p-2 text-[11px] text-warning">
+                            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span>
+                              <span className="font-medium">Test command reported a failure (non-blocking):</span>{" "}
+                              {previewResult.test_warning} — this never blocks the build; leave the test command
+                              blank if your Dockerfile already runs your real tests as a build step.
+                            </span>
+                          </div>
+                        )}
+                        {previewResult?.status === "failed" && (
+                          <div
+                            className={`flex items-start gap-1.5 rounded p-2 text-[11px] ${
+                              previewResult.human_side ? "bg-warning/10 text-warning" : "bg-destructive/10 text-destructive"
+                            }`}
+                          >
+                            <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span>
+                              <span className="font-medium">
+                                {previewResult.human_side
+                                  ? `Failed at the ${previewResult.stage} stage — this looks fixable in your repo/config:`
+                                  : `Failed at the ${previewResult.stage} stage — this looks like a platform-side problem, not your repo:`}
+                              </span>{" "}
+                              {previewResult.error}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
               <div className="space-y-1 sm:col-span-2">
@@ -703,8 +1306,15 @@ export function NewProject() {
                   id="new-project-container-image"
                   value={form.container_image}
                   onChange={(e) => setForm({ ...form, container_image: e.target.value })}
-                  placeholder="registry.internal/checkout-service"
+                  placeholder="123456789012.dkr.ecr.us-east-1.amazonaws.com/checkout-service"
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  Use a real ECR repository URI in your own AWS account (
+                  <span className="text-code">&lt;account-id&gt;.dkr.ecr.&lt;region&gt;.amazonaws.com/&lt;name&gt;</span>
+                  ) — the build stage authenticates automatically and creates the repository itself if it
+                  doesn&apos;t exist yet, but the account id and region must be real. There is no safe
+                  default to suggest here, since that account id is yours, not the platform&apos;s.
+                </p>
               </div>
               <div className="space-y-1">
                 <Label htmlFor="new-project-baseline-tag">Baseline tag</Label>
@@ -726,7 +1336,8 @@ export function NewProject() {
               <div className="space-y-1 sm:col-span-2">
                 <span className="text-xs font-medium text-muted-foreground">Networking</span>
                 <p className="text-[11px] text-muted-foreground">
-                  Used for the generated Deployment, Service and HTTPRoute.
+                  Used for the ECS service, its ALB target group, and the listener rule that routes
+                  traffic to it.
                 </p>
               </div>
               <div className="space-y-1">
@@ -745,15 +1356,28 @@ export function NewProject() {
                   value={form.health_check_path}
                   onChange={(e) => setForm({ ...form, health_check_path: e.target.value })}
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  Hit directly by the ECS target group — a static site, a Vite/React app, or any web app without a
+                  dedicated health endpoint should use <span className="text-code">/</span>, not{" "}
+                  <span className="text-code">/healthz</span>.
+                </p>
               </div>
               <div className="space-y-1 sm:col-span-2">
-                <Label htmlFor="new-project-path-prefix">Traffic path prefix (routed through the Gateway)</Label>
+                <Label htmlFor="new-project-path-prefix">Traffic path prefix (routed through the shared ALB)</Label>
                 <Input
                   id="new-project-path-prefix"
                   value={form.path_prefix}
                   onChange={(e) => setForm({ ...form, path_prefix: e.target.value })}
                   placeholder={form.name ? `/api/v1/${form.name}` : "/api/v1/your-service"}
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  One ALB is shared across every project, so each one gets its own path prefix instead
+                  of its own load balancer. AWS ALBs forward the full request path as-is — they cannot
+                  strip a prefix before it reaches your container — so your app will receive requests at{" "}
+                  <span className="text-code">{form.path_prefix || "this prefix"}/...</span>, not at{" "}
+                  <span className="text-code">/...</span>. It needs to handle that (or match on the last
+                  path segment) rather than assume it owns the whole URL root.
+                </p>
               </div>
             </div>
           )}
@@ -798,6 +1422,45 @@ export function NewProject() {
                 </p>
               </div>
 
+              <div className="space-y-2 rounded-md border p-3">
+                <Label>Deploy mode</Label>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    onClick={() => setDeployMode("canary")}
+                    className={`rounded-md border p-3 text-left transition-colors ${
+                      deployMode === "canary" ? "border-primary bg-primary/5" : "border-border"
+                    }`}
+                  >
+                    <div className="text-sm font-medium">Canary (progressive)</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      Gradual traffic ramp, statistically verified at each step against real telemetry. Needs real
+                      traffic to accumulate evidence — best once the service has real visitors.
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeployMode("blue_green")}
+                    className={`rounded-md border p-3 text-left transition-colors ${
+                      deployMode === "blue_green" ? "border-primary bg-primary/5" : "border-border"
+                    }`}
+                  >
+                    <div className="text-sm font-medium">Blue-green (instant cutover)</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      Deploys the new version, confirms it's actually healthy (real ECS + ALB checks), then cuts
+                      100% of traffic over instantly. Works with zero real traffic — the guaranteed-live path for a
+                      brand-new service.
+                    </div>
+                  </button>
+                </div>
+                {deployMode === "blue_green" && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Confidence floor and min sample size below don't apply to blue-green rollouts — cutover is
+                    gated on real infrastructure health, not a statistical verdict.
+                  </p>
+                )}
+              </div>
+
               <div className="grid gap-4 sm:grid-cols-3">
                 <div className="space-y-1">
                   <Label htmlFor="new-project-confidence-floor">Confidence floor: {confidenceFloor.toFixed(2)}</Label>
@@ -836,6 +1499,131 @@ export function NewProject() {
                 </div>
               </div>
 
+              <div className="space-y-2 rounded-md border p-3">
+                <div className="flex items-center justify-between">
+                  <Label className="flex items-center gap-1.5">
+                    <Ban className="h-3.5 w-3.5 text-muted-foreground" /> Blocked deploy windows
+                  </Label>
+                  <Button type="button" variant="outline" size="sm" onClick={addBlockedWindow}>
+                    <Plus className="h-3.5 w-3.5" /> Add window
+                  </Button>
+                </div>
+                {blockedWindows.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground">
+                    None configured — automated promotions are allowed at any time.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {blockedWindows.map((window, i) => (
+                      <div key={i} className="space-y-1.5 rounded border bg-muted/30 p-2">
+                        <div className="flex flex-wrap gap-1">
+                          {WEEKDAYS.map((day) => (
+                            <button
+                              type="button"
+                              key={day}
+                              onClick={() => toggleWindowDay(i, day)}
+                              className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                                window.days.includes(day)
+                                  ? "bg-primary text-primary-foreground"
+                                  : "bg-background text-muted-foreground hover:bg-accent"
+                              }`}
+                            >
+                              {day.slice(0, 3)}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Input
+                            type="time"
+                            value={window.start_time}
+                            onChange={(e) => updateBlockedWindow(i, { start_time: e.target.value })}
+                            className="h-7 w-28 text-xs"
+                          />
+                          <span className="text-[11px] text-muted-foreground">to</span>
+                          <Input
+                            type="time"
+                            value={window.end_time}
+                            onChange={(e) => updateBlockedWindow(i, { end_time: e.target.value })}
+                            className="h-7 w-28 text-xs"
+                          />
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="ml-auto h-7 text-destructive"
+                            onClick={() => removeBlockedWindow(i)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  No autonomous rollback/promotion decision is ever affected — this only blocks new
+                  deployments from starting during the window.
+                </p>
+              </div>
+
+              <div className="space-y-2 rounded-md border p-3">
+                <label className="flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={manualApprovalRequired}
+                    onChange={(e) => setManualApprovalRequired(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 accent-primary"
+                  />
+                  <span>
+                    <span className="flex items-center gap-1.5 text-xs font-medium">
+                      <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" /> Require manual approval before 100% cutover
+                    </span>
+                    <span className="block text-[11px] text-muted-foreground">
+                      The final step pauses and waits for a human sign-off, even after a HEALTHY verdict.
+                    </span>
+                  </span>
+                </label>
+                {manualApprovalRequired && (
+                  <div className="ml-6 flex flex-wrap gap-3 pt-1">
+                    {APPROVAL_ROLES.map((role) => (
+                      <label key={role} className="flex items-center gap-1.5 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={manualApprovalRoles.includes(role)}
+                          onChange={() => toggleApprovalRole(role)}
+                          className="h-3 w-3 accent-primary"
+                        />
+                        {role}
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-2 rounded-md border p-3">
+                <span className="block text-xs font-medium">Deployment target</span>
+                <div className="rounded-md border border-primary bg-primary/5 p-2 text-left text-xs">
+                  <span className="block font-medium">AWS (ECS Fargate)</span>
+                  <span className="block text-[11px] text-muted-foreground">
+                    Real AWS deployment behind a shared Application Load Balancer
+                  </span>
+                </div>
+                <div className="pt-1">
+                  <label className="mb-1 block text-[11px] text-muted-foreground">AWS region</label>
+                  <input
+                    className="w-full rounded-md border bg-background px-2 py-1.5 text-xs"
+                    value={awsRegion}
+                    onChange={(e) => setAwsRegion(e.target.value)}
+                    placeholder="us-east-1"
+                  />
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    This provisions real, billable AWS resources (ECS Fargate tasks, a shared ALB, target
+                    groups) using the credentials configured on the platform. The image must already be
+                    pushed to an ECR repository this account can pull from.
+                  </p>
+                </div>
+              </div>
+
               <label className="flex items-start gap-2 rounded-md border p-3">
                 <input
                   type="checkbox"
@@ -844,10 +1632,10 @@ export function NewProject() {
                   className="mt-0.5 h-3.5 w-3.5 accent-primary"
                 />
                 <span>
-                  <span className="block text-xs font-medium">Apply Kubernetes objects now</span>
+                  <span className="block text-xs font-medium">Apply AWS resources now</span>
                   <span className="block text-[11px] text-muted-foreground">
-                    Generates the baseline/canary Deployments, Services and HTTPRoute. Needs a reachable
-                    cluster — if it fails, the service is still created and you can retry later.
+                    Creates the real ECS services, target groups and ALB listener rule. If it fails, the
+                    service is still created and you can retry later.
                   </span>
                 </span>
               </label>

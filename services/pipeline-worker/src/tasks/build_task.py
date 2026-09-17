@@ -41,6 +41,7 @@ def run_build_task(
     repo_config: dict | None = None,
     image_name: str | None = None,
     registry_credential: dict | None = None,
+    dockerfile_content: str | None = None,
 ) -> dict:
     """
     Builds the target service version via the `docker` Python SDK (talks to
@@ -98,6 +99,15 @@ def run_build_task(
     instead. The workspace is now returned in the result dict so the
     caller (worker.py) can run the test stage inside it, and is cleaned up
     once, at the end of the whole pipeline run, instead of immediately here.
+
+    `dockerfile_content` (build-preview feature): when a repo has no
+    Dockerfile of its own, shared/repo_scanner.py's deterministic detection
+    + tasks/dockerfile_synthesis.py produce one for a recognized language.
+    Writing it into the resolved `context_dir` right here — after cloning,
+    before `docker build` — means a synthesized Dockerfile funnels through
+    the EXACT same build call a human-authored one does; there is only ever
+    one build code path to keep correct. `dockerfile_path` in this case is
+    still required (e.g. "Dockerfile") to name where it gets written.
     """
     logger.info("build_task_started", pipeline_run_id=pipeline_run_id, image_tag=image_tag, image_name=image_name)
     image_ref = f"{image_name}:{image_tag}" if image_name else f"localhost:5001/payments:{image_tag}"
@@ -120,6 +130,12 @@ def run_build_task(
         base_dir = cloned_workspace or "."
         context_dir = os.path.join(base_dir, os.path.dirname(dockerfile_path) or ".")
         dockerfile_name = os.path.basename(dockerfile_path)
+
+        if dockerfile_content is not None:
+            os.makedirs(context_dir, exist_ok=True)
+            with open(os.path.join(context_dir, dockerfile_name), "w", encoding="utf-8") as f:
+                f.write(dockerfile_content)
+            logger.info("build_task_dockerfile_synthesized", pipeline_run_id=pipeline_run_id, context_dir=context_dir)
 
         client = docker.from_env()
         try:
@@ -156,10 +172,26 @@ def run_build_task(
     return {"status": "success", "image": image_ref, "workspace": cloned_workspace}
 
 
-def _find_requirements_file(repo_dir: str) -> str | None:
-    """Shallowest `requirements.txt` under the clone wins — prefers repo-root
-    or near-root over one that happens to be vendored/nested deeper."""
+def _find_requirements_file(repo_dir: str, preferred_subdir: str | None = None) -> str | None:
+    """
+    Real bug found live: a repo with more than one `requirements.txt` at
+    the SAME depth (e.g. two independent services in one repo, each in
+    their own top-level folder) made the old "shallowest wins" heuristic
+    genuinely ambiguous — it could silently install a completely unrelated
+    service's dependencies for this run's tests, and the failure it
+    produces (a plain ModuleNotFoundError) gives no hint that the wrong
+    file was ever picked. `preferred_subdir` — the same folder the BUILD
+    stage's own Dockerfile/manifest already resolved to for this exact run
+    — removes the ambiguity outright by checking there FIRST; the
+    shallowest-match search across the whole clone stays only as a
+    fallback for a pipeline that never declares a root_directory at all.
+    """
     import glob
+
+    if preferred_subdir:
+        candidate = os.path.join(repo_dir, preferred_subdir, "requirements.txt")
+        if os.path.isfile(candidate):
+            return candidate
 
     matches = glob.glob(os.path.join(repo_dir, "**", "requirements.txt"), recursive=True)
     if not matches:
@@ -203,7 +235,9 @@ def _create_test_venv_python(pipeline_run_id: str, repo_dir: str, requirements_f
     return venv_python
 
 
-def run_test_task(pipeline_run_id: str, test_command: str, cwd: str | None = None) -> dict:
+def run_test_task(
+    pipeline_run_id: str, test_command: str, cwd: str | None = None, requirements_subdir: str | None = None
+) -> dict:
     """
     Executes unit test command for stage validation.
 
@@ -222,12 +256,18 @@ def run_test_task(pipeline_run_id: str, test_command: str, cwd: str | None = Non
     own interpreter only when there's no requirements.txt to install (or no
     `cwd` at all), matching prior behavior exactly for the legacy demo
     pipelines.
+
+    `requirements_subdir` (real bug found live testing the build-preview
+    feature): the same folder the BUILD stage resolved its Dockerfile/
+    manifest to for THIS run — see `_find_requirements_file`'s docstring
+    for why a repo with more than one `requirements.txt` at equal depth is
+    genuinely ambiguous without it.
     """
     import sys
 
     python_bin = sys.executable
     if cwd:
-        requirements_file = _find_requirements_file(cwd)
+        requirements_file = _find_requirements_file(cwd, preferred_subdir=requirements_subdir)
         if requirements_file:
             python_bin = _create_test_venv_python(pipeline_run_id, cwd, requirements_file)
 

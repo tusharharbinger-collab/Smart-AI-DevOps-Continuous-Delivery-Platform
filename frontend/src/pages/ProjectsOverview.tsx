@@ -10,12 +10,19 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { useState } from "react";
 import { toast } from "sonner";
-import { GitBranch, FolderGit2, Plus, Rocket, Search, Timer, TrendingUp } from "lucide-react";
-import { listProjects, triggerRollout, type ProjectSummary } from "@/api/projects";
+import {
+  GitBranch, FolderGit2, Plus, Rocket, Search, Timer, Trash2, TrendingUp,
+} from "lucide-react";
+import { deleteProject, listProjects, triggerRollout, type ProjectSummary } from "@/api/projects";
+import { LiveUrlBadge } from "@/components/LiveUrlBadge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 
 function StatusBadge({ project }: { project: ProjectSummary }) {
   const run = project.latest_run_status;
@@ -67,7 +74,15 @@ function relativeTime(iso: string | null): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function ProjectCard({ project, onTrigger }: { project: ProjectSummary; onTrigger: (p: ProjectSummary) => void }) {
+function ProjectCard({
+  project,
+  onTrigger,
+  onDelete,
+}: {
+  project: ProjectSummary;
+  onTrigger: (p: ProjectSummary) => void;
+  onDelete: (p: ProjectSummary) => void;
+}) {
   // Adopted pre-project pipelines have no repository behind them — say so
   // rather than showing an empty badge or an invented URL.
   const repoLabel = project.repo_url
@@ -93,9 +108,73 @@ function ProjectCard({ project, onTrigger }: { project: ProjectSummary; onTrigge
                 <GitBranch className="h-2.5 w-2.5" />
                 {project.branch}
               </span>
+              {project.deploy_target === "aws_ecs" && (
+                <span className="inline-flex items-center gap-1 rounded border border-orange-400/40 bg-orange-400/10 px-1.5 text-orange-500">
+                  AWS
+                </span>
+              )}
+              {project.deploy_mode === "blue_green" && (
+                <span className="inline-flex items-center gap-1 rounded border border-primary/30 bg-primary/10 px-1.5 text-primary">
+                  Blue-Green
+                </span>
+              )}
+              {/* Real gap found live: this link never existed anywhere —
+                  a user had no way to click and check "is my product
+                  truly live," the way Render/Vercel show you one. Status-
+                  aware since 2026-09-17: a link alone doesn't prove the
+                  cutover actually produced a working response. */}
+              <LiveUrlBadge liveUrl={project.live_url} status={project.live_url_status} />
             </div>
           </div>
-          <StatusBadge project={project} />
+          <div className="flex shrink-0 items-center gap-1.5">
+            <StatusBadge project={project} />
+            {/* Real gap: deleting a project had no UI at all — only ever
+                done via a raw API call this whole session. Backend now
+                also tears down the real Deployments/Services/HTTPRoute it
+                onboarded (see delete_project's cluster_deprovisioning), so
+                this button genuinely removes everything, not just the DB
+                row — worth being explicit about in the confirmation since
+                it can't be undone. */}
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
+                  onClick={(e) => e.stopPropagation()}
+                  title="Delete service"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Permanently delete {project.name}?</AlertDialogTitle>
+                  <AlertDialogDescription asChild>
+                    <div className="space-y-2">
+                      <p>This cannot be undone. This removes:</p>
+                      <ul className="list-inside list-disc space-y-0.5">
+                        <li>The project record and its entire run/audit history</li>
+                        <li>
+                          Its real Kubernetes objects — Deployments, Services, and the HTTPRoute — so it stops
+                          serving traffic immediately
+                        </li>
+                      </ul>
+                    </div>
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    onClick={() => onDelete(project)}
+                  >
+                    Delete permanently
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2 border-y py-2.5">
@@ -165,6 +244,36 @@ export function ProjectsOverview() {
     }
   }
 
+  async function handleDelete(project: ProjectSummary) {
+    try {
+      const res = await deleteProject(project.project_id);
+      // Real bug found live: `pipeline_retained: true` means the backend hit
+      // a foreign-key violation trying to remove the underlying pipeline
+      // (it still has real historical run/audit rows attached) and rolled
+      // back the ENTIRE delete to avoid silently destroying that history —
+      // nothing was actually deleted. This used to fall through to the
+      // generic success toast below, lying to the user that the project was
+      // gone right before it reappeared on the next refetch. Must be
+      // checked first and reported honestly instead.
+      if (res.pipeline_retained) {
+        toast.error(`${project.name} could not be deleted`, {
+          description:
+            "Its pipeline still has real run/audit history attached, so nothing was removed. " +
+            "This protects that history from being silently destroyed.",
+        });
+      } else if (res.cluster_deprovisioning.attempted && !res.cluster_deprovisioning.succeeded) {
+        toast.warning(`${project.name} deleted, but its cluster objects may still be running`, {
+          description: res.cluster_deprovisioning.detail ?? "pipeline-worker could not reach the cluster.",
+        });
+      } else {
+        toast.success(`${project.name} deleted`);
+      }
+      queryClient.invalidateQueries({ queryKey: ["projects"] });
+    } catch (err) {
+      toast.error("Could not delete service", { description: (err as Error).message });
+    }
+  }
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
@@ -230,7 +339,12 @@ export function ProjectsOverview() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((project) => (
-            <ProjectCard key={project.project_id} project={project} onTrigger={handleTrigger} />
+            <ProjectCard
+              key={project.project_id}
+              project={project}
+              onTrigger={handleTrigger}
+              onDelete={handleDelete}
+            />
           ))}
         </div>
       )}
