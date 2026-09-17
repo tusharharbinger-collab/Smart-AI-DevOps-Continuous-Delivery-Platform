@@ -111,6 +111,7 @@ class _FakeElbv2TargetGroup:
 
     def __init__(self):
         self.created_kwargs = None
+        self.modified_attributes = None
 
     def describe_target_groups(self, Names):
         raise self.exceptions.TargetGroupNotFoundException("not found")
@@ -118,6 +119,9 @@ class _FakeElbv2TargetGroup:
     def create_target_group(self, **kwargs):
         self.created_kwargs = kwargs
         return {"TargetGroups": [{"TargetGroupArn": f"arn:aws:elasticloadbalancing:tg/{kwargs['Name']}"}]}
+
+    def modify_target_group_attributes(self, **kwargs):
+        self.modified_attributes = kwargs
 
 
 def test_ensure_target_group_accepts_2xx_and_3xx_as_healthy():
@@ -134,6 +138,20 @@ def test_ensure_target_group_still_passes_through_the_real_health_check_path():
     ecs_onboarding.ensure_target_group(elbv2, "checkout-baseline", "vpc-123", 80, "/")
     assert elbv2.created_kwargs["HealthCheckPath"] == "/"
     assert elbv2.created_kwargs["Port"] == 80
+
+
+def test_ensure_target_group_sets_a_short_deregistration_delay():
+    # Real gap found live (2026-09-17): AWS's 300s default deregistration
+    # delay left a wide window where an old task stays fully in-service
+    # alongside a newly-cutover one, letting the ALB round-robin real
+    # traffic to a stale target — see wait_for_target_group_healthy's own
+    # "no stray targets" fix for the full story.
+    elbv2 = _FakeElbv2TargetGroup()
+    arn = ecs_onboarding.ensure_target_group(elbv2, "checkout-baseline", "vpc-123", 8080, "/healthz")
+    assert elbv2.modified_attributes["TargetGroupArn"] == arn
+    assert elbv2.modified_attributes["Attributes"] == [
+        {"Key": "deregistration_delay.timeout_seconds", "Value": "30"}
+    ]
 
 
 # ─────────────────────────── ALB not-found handling ───────────────────────────

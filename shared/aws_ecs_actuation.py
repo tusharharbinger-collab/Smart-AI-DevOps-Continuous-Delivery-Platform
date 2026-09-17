@@ -258,22 +258,102 @@ def scale_service(ecs, cluster: str, service_name: str, desired_count: int) -> N
     logger.info("ecs_service_scaled", service_name=service_name, desired_count=desired_count)
 
 
+def _get_current_deployment_task_private_ips(ecs, cluster: str, service_name: str) -> list[str]:
+    """
+    Real gap this closes: during an ECS rolling deployment, the OLD task
+    from the previous deployment stays registered (state `draining`, not yet
+    fully deregistered) alongside the NEW task while ECS confirms the new
+    one is healthy — the service's target group can carry both at once for
+    a real, non-trivial window. Identifying "the deployment's own task(s)"
+    by which task definition revision is currently PRIMARY (not just
+    "whatever's running") is what lets the health/live-URL gate tell the
+    difference between the new task and a stale one still winding down.
+    Returns an empty list (not an error) when the new task hasn't
+    registered an ENI yet — the caller's poll loop treats that as "not
+    ready", not a failure.
+    """
+    services = ecs.describe_services(cluster=cluster, services=[service_name])["services"]
+    if not services:
+        return []
+    primary = next((d for d in services[0]["deployments"] if d["status"] == "PRIMARY"), None)
+    if primary is None:
+        return []
+    current_task_def_arn = primary["taskDefinition"]
+
+    task_arns = ecs.list_tasks(cluster=cluster, serviceName=service_name, desiredStatus="RUNNING")["taskArns"]
+    if not task_arns:
+        return []
+    tasks = ecs.describe_tasks(cluster=cluster, tasks=task_arns)["tasks"]
+
+    ips: list[str] = []
+    for task in tasks:
+        if task["taskDefinitionArn"] != current_task_def_arn:
+            continue
+        for attachment in task.get("attachments", []):
+            for detail in attachment.get("details", []):
+                if detail.get("name") == "privateIPv4Address":
+                    ips.append(detail["value"])
+    return ips
+
+
 def wait_for_target_group_healthy(
-    region: str, target_group_name: str, timeout_seconds: int = 120, poll_interval_seconds: float = 5.0
+    region: str,
+    target_group_name: str,
+    cluster: str,
+    service_name: str,
+    timeout_seconds: int = 180,
+    poll_interval_seconds: float = 5.0,
 ) -> dict:
     """
     Real ALB-driven HTTP health check — the direct target-group-level
     equivalent of `wait_for_service_stable`'s ECS-level check above, and the
     "HTTP liveness probe" half of blue-green's guaranteed-cutover gate. The
     ALB itself performs the real GET against the target's declared
-    `health_check_path`; this just polls `describe_target_health` until
-    every registered target reports "healthy", or raises on timeout. This
-    catches a task that's RUNNING (passes `wait_for_service_stable`) but
-    never becomes routable — a crashing app after startup, a wrong
-    `health_check_path`, or a container listening on the wrong port — none
-    of which ECS's own runningCount/desiredCount check alone would catch.
+    `health_check_path`.
+
+    Real gap found live (2026-09-17), confirmed by a deliberate
+    break-and-drill against a real project: this used to require EVERY
+    currently-registered target to be healthy, which is wrong two ways at
+    once. (1) A still-draining OLD target from the previous deployment can
+    never become "healthy" again — it's on its way out — so a fast enough
+    redeploy could make this wait forever on a target that was never going
+    to recover, timing out even though the new task was genuinely fine. (2)
+    The far more dangerous direction: if the OLD target was still the ONLY
+    one registered as "healthy" at poll time (the new task hadn't finished
+    ENI/health-check registration yet), `all(...)` was trivially true —
+    this function reported "healthy" without the new deployment's task
+    having been checked AT ALL, which is exactly how a real drill this
+    session got a broken app cut into 100% production traffic: the
+    post-cutover live-URL check ran 2 seconds after cutover and happened to
+    hit the still-healthy old task, not the new broken one, so rollback
+    never fired.
+
+    Fixed by identifying the SPECIFIC task(s) belonging to the service's
+    current (PRIMARY) deployment via `_get_current_deployment_task_private_ips`
+    and requiring THOSE targets — matched by private IP — to report
+    healthy. If the new task hasn't registered a target yet, that's "not
+    ready", not a failure of the old target's state.
+
+    Second real gap found live in the SAME drill, after fixing the above:
+    confirming the new task's OWN health-check path is healthy isn't
+    enough on its own — an OLD target from the previous deployment stays
+    fully "InService" (not just draining) for AWS's target-group
+    `deregistration_delay` (default 300s; `ensure_target_group` now sets
+    this to 30s at creation for exactly this reason), and the ALB
+    round-robins real requests across BOTH targets during that whole
+    window. A caller doing a real end-to-end check right after this
+    function returns (e.g. `verify_live_url` hitting the actual app path,
+    not just the health-check path) can still land on the stale old task
+    by pure chance and get a false "it's fine" reading — which is exactly
+    what let a deliberately-broken app go live undetected even after the
+    first fix above. So this now ALSO waits for every OTHER target (any
+    target whose IP isn't the new deployment's own) to be gone from the
+    target group entirely — not just draining — before declaring healthy,
+    so a live traffic check run immediately after this returns is
+    guaranteed to reach the new task, never a leftover old one.
     """
     elbv2 = boto3.client("elbv2", region_name=region)
+    ecs = boto3.client("ecs", region_name=region)
     tg_name = target_group_name[:32]
     try:
         target_group_arn = elbv2.describe_target_groups(Names=[tg_name])["TargetGroups"][0]["TargetGroupArn"]
@@ -282,18 +362,27 @@ def wait_for_target_group_healthy(
 
     deadline = time.monotonic() + timeout_seconds
     last_states: list[dict] = []
+    last_new_task_ips: list[str] = []
     while time.monotonic() < deadline:
+        last_new_task_ips = _get_current_deployment_task_private_ips(ecs, cluster, service_name)
         descriptions = elbv2.describe_target_health(TargetGroupArn=target_group_arn)["TargetHealthDescriptions"]
-        last_states = [
+        all_states = [
             {"target": d["Target"]["Id"], "state": d["TargetHealth"]["State"], "reason": d["TargetHealth"].get("Reason")}
             for d in descriptions
         ]
-        if last_states and all(s["state"] == "healthy" for s in last_states):
-            logger.info("ecs_target_group_healthy", target_group_name=tg_name, targets=last_states)
-            return {"healthy": True, "targets": last_states}
+        last_states = all_states
+        matched = [s for s in all_states if s["target"] in last_new_task_ips]
+        stray = [s for s in all_states if s["target"] not in last_new_task_ips]
+        if last_new_task_ips and matched and all(s["state"] == "healthy" for s in matched) and not stray:
+            logger.info(
+                "ecs_target_group_healthy", target_group_name=tg_name, new_task_targets=matched, all_targets=all_states
+            )
+            return {"healthy": True, "targets": matched}
         time.sleep(poll_interval_seconds)
     raise RuntimeError(
-        f"Target group '{tg_name}' did not report all targets healthy within {timeout_seconds}s "
-        f"(last observed: {last_states or 'no registered targets'}) — check the container's real "
+        f"Target group '{tg_name}' did not confirm the new deployment's own task(s) exclusively healthy "
+        f"(no stray targets left from the previous deployment) within "
+        f"{timeout_seconds}s (new task private IPs: {last_new_task_ips or 'not registered yet'}; "
+        f"all registered targets: {last_states or 'none'}) — check the container's real "
         f"health_check_path and that it's actually listening on the declared port before retrying."
     )

@@ -172,7 +172,7 @@ def test_healthy_blue_green_rollout_cuts_over_verifies_and_graduates_without_any
     )
     monkeypatch.setattr(
         worker_module, "wait_for_target_group_healthy",
-        lambda region, tg_name: calls["wait_healthy"].append(tg_name) or {"healthy": True},
+        lambda region, tg_name, cluster, service_name: calls["wait_healthy"].append(tg_name) or {"healthy": True},
     )
     monkeypatch.setattr(
         worker_module, "cutover_blue_green_ecs_weights",
@@ -249,8 +249,8 @@ def test_unhealthy_target_group_fails_the_pipeline_and_never_cuts_over(monkeypat
 
     monkeypatch.setattr(worker_module, "wait_for_ecs_service_ready", lambda *a, **k: None)
 
-    def fake_wait_healthy(region, tg_name):
-        raise RuntimeError(f"Target group '{tg_name}' did not report all targets healthy within 120s")
+    def fake_wait_healthy(region, tg_name, cluster, service_name):
+        raise RuntimeError(f"Target group '{tg_name}' did not confirm the new deployment's own task healthy within 120s")
 
     monkeypatch.setattr(worker_module, "wait_for_target_group_healthy", fake_wait_healthy)
     monkeypatch.setattr(
@@ -260,7 +260,7 @@ def test_unhealthy_target_group_fails_the_pipeline_and_never_cuts_over(monkeypat
 
     fake_db = _FakeDB()
     orchestrator = PipelineOrchestrator(_FakeRedis(), db=fake_db)
-    with pytest.raises(RuntimeError, match="did not report all targets healthy"):
+    with pytest.raises(RuntimeError, match="did not confirm the new deployment's own task healthy"):
         orchestrator.start_pipeline(manifest_path, pipeline_run_id="run-2", pipeline_id="pipe-1", tenant_id="tenant-1")
 
     assert cutover_calls == []

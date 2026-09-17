@@ -623,7 +623,10 @@ class PipelineOrchestrator:
                         self._log(run_id, "Blue-green rollout — waiting for the new (green) ECS service to stabilize...")
                         wait_for_ecs_service_ready(aws_region, ecs_service_name, "canary")
                         self._log(run_id, "Waiting for the green target group to report healthy via a real ALB health check...")
-                        wait_for_target_group_healthy(aws_region, f"{ecs_service_name}-canary")
+                        wait_for_target_group_healthy(
+                            aws_region, f"{ecs_service_name}-canary",
+                            cluster="smartcd-platform", service_name=f"{ecs_service_name}-canary",
+                        )
                         self._log(run_id, "Green is healthy — cutting over 100% of traffic (no statistical verification needed).")
                         cutover_blue_green_ecs_weights(
                             run_id, service_name=ecs_service_name, path_prefix=path_prefix,

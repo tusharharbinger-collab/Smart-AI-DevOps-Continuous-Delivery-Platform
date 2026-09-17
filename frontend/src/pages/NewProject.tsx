@@ -21,9 +21,9 @@ import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  AlertTriangle, ArrowLeft, ArrowRight, Ban, Check, Container, FolderGit2, Hammer,
-  KeyRound, Link2, Loader2, Lock, LogOut, Plus, RefreshCw, Rocket, Search, ShieldCheck, Sparkles,
-  Trash2, Unlock, XCircle,
+  AlertTriangle, ArrowLeft, ArrowRight, Ban, Check, Container, DollarSign, FolderGit2, Hammer,
+  KeyRound, Link2, Loader2, Lock, LogOut, Plus, RefreshCw, Rocket, Search, ShieldAlert, ShieldCheck,
+  ShieldX, Sparkles, Trash2, Unlock, XCircle,
 } from "lucide-react";
 import {
   disconnectGitHub, getAuthorizeUrl, getBuildDetection, getGitHubStatus, getRepoReport, listBranches, listRepos,
@@ -1079,56 +1079,81 @@ export function NewProject() {
                         </span>
                       )}
 
-                      {repoReport && (
-                        <div className="mt-3 rounded-md border border-border/80 bg-background/60 p-3 space-y-2 text-[11px]">
-                          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/50 pb-2">
-                            <div className="flex items-center gap-2">
-                              <span className="font-semibold text-foreground text-xs">Repo Health & Cost Prediction</span>
-                              <span
-                                className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
-                                  repoReport.risk.risk_level === "low"
-                                    ? "bg-success/20 text-success"
-                                    : repoReport.risk.risk_level === "medium"
-                                    ? "bg-warning/20 text-warning"
-                                    : "bg-destructive/20 text-destructive"
-                                }`}
-                              >
-                                {repoReport.risk.risk_level} Risk ({Math.round((1 - repoReport.risk.risk_score) * 100)}% readiness)
-                              </span>
+                      {repoReport && (() => {
+                        const level = repoReport.risk.risk_level;
+                        const tone =
+                          level === "low"
+                            ? { text: "text-success", bg: "bg-success/10", border: "border-success/30", ring: "ring-success/20", Icon: ShieldCheck }
+                            : level === "medium"
+                            ? { text: "text-warning", bg: "bg-warning/10", border: "border-warning/30", ring: "ring-warning/20", Icon: ShieldAlert }
+                            : { text: "text-destructive", bg: "bg-destructive/10", border: "border-destructive/30", ring: "ring-destructive/20", Icon: ShieldX };
+                        const readiness = Math.round((1 - repoReport.risk.risk_score) * 100);
+                        return (
+                          <div className={`mt-3 overflow-hidden rounded-lg border ${tone.border} ${tone.bg}`}>
+                            <div className="flex flex-wrap items-center justify-between gap-3 p-3.5">
+                              <div className="flex items-center gap-3">
+                                <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${tone.bg} ring-4 ${tone.ring}`}>
+                                  <tone.Icon className={`h-5 w-5 ${tone.text}`} />
+                                </div>
+                                <div>
+                                  <div className="text-xs font-medium text-muted-foreground">Repo Health & Cost Prediction</div>
+                                  <div className="flex items-baseline gap-1.5">
+                                    <span className={`text-sm font-bold uppercase tracking-wide ${tone.text}`}>{level} risk</span>
+                                    <span className="text-xs text-muted-foreground">· {readiness}% readiness</span>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="rounded-md border border-border/60 bg-background/80 px-3 py-1.5 text-right">
+                                  <div className="flex items-center justify-end gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                                    <DollarSign className="h-3 w-3" /> Steady-state
+                                  </div>
+                                  <div className="text-base font-bold text-foreground">
+                                    ${repoReport.cost.steady_state_monthly_usd}<span className="text-xs font-medium text-muted-foreground">/mo</span>
+                                  </div>
+                                </div>
+                                <div className="rounded-md border border-border/60 bg-background/80 px-3 py-1.5 text-right">
+                                  <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Per rollout</div>
+                                  <div className="text-base font-bold text-foreground">
+                                    +${repoReport.cost.estimated_rollout_window_usd}
+                                  </div>
+                                </div>
+                              </div>
                             </div>
-                            <div className="flex items-center gap-3 text-muted-foreground font-mono text-[11px]">
-                              <span>
-                                Steady: <strong className="text-foreground">${repoReport.cost.steady_state_monthly_usd}/mo</strong>
-                              </span>
-                              <span>
-                                Canary: <strong className="text-foreground">+${repoReport.cost.estimated_rollout_window_usd}</strong>
-                              </span>
+
+                            {repoReport.narrative && (
+                              <p className="border-t border-border/40 bg-background/40 px-3.5 py-2 text-xs italic leading-relaxed text-muted-foreground">
+                                "{repoReport.narrative}"
+                              </p>
+                            )}
+
+                            <div className="border-t border-border/40 bg-background/40 p-3.5">
+                              {repoReport.risk.risk_flags.length > 0 ? (
+                                <div className="space-y-1.5">
+                                  <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                                    Readiness Observations
+                                  </div>
+                                  <div className="grid gap-1.5 sm:grid-cols-2">
+                                    {repoReport.risk.risk_flags.map((flag) => (
+                                      <div
+                                        key={flag}
+                                        className="flex items-start gap-1.5 rounded-md border border-warning/20 bg-warning/5 px-2 py-1.5 text-xs text-warning"
+                                      >
+                                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                        <span className="text-foreground/80">{flag}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-1.5 rounded-md border border-success/20 bg-success/5 px-2 py-1.5 text-xs text-success">
+                                  <Check className="h-3.5 w-3.5" /> All baseline hygiene standards met (tests, lockfile, CI configuration present).
+                                </div>
+                              )}
                             </div>
                           </div>
-
-                          {repoReport.narrative && (
-                            <p className="text-muted-foreground italic text-[11px] leading-relaxed">
-                              "{repoReport.narrative}"
-                            </p>
-                          )}
-
-                          {repoReport.risk.risk_flags.length > 0 ? (
-                            <div className="space-y-1 pt-1">
-                              <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Readiness Observations</div>
-                              {repoReport.risk.risk_flags.map((flag) => (
-                                <div key={flag} className="flex items-start gap-1.5 text-warning text-[11px]">
-                                  <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-                                  <span>{flag}</span>
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <div className="flex items-center gap-1.5 text-success text-[11px] pt-1">
-                              <Check className="h-3 w-3" /> All baseline hygiene standards met (tests, lockfile, CI configuration present).
-                            </div>
-                          )}
-                        </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   )}
 

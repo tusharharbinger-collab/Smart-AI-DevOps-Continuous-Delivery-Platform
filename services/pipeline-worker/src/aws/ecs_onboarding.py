@@ -239,6 +239,22 @@ def ensure_target_group(elbv2, name: str, vpc_id: str, port: int, health_check_p
         # typical web app.
         Matcher={"HttpCode": "200-399"},
     )["TargetGroups"][0]
+    # Real gap found live (2026-09-17), via a deliberate break-and-drill:
+    # AWS's default deregistration delay is 300s — during that whole window
+    # after a rolling deployment starts, the OLD task stays fully
+    # "InService" (not yet draining) alongside the newly-healthy one, and
+    # the ALB round-robins real requests across BOTH. A post-cutover
+    # live-URL check (or a real visitor) can hit the still-good old task by
+    # pure chance and get a false "everything's fine" reading even when the
+    # new task is genuinely broken. 30s bounds that window to something a
+    # pipeline stage can actually wait out (see
+    # wait_for_target_group_healthy's own now-stricter "no stray targets"
+    # requirement) instead of the 5-minute AWS default silently leaving the
+    # door open.
+    elbv2.modify_target_group_attributes(
+        TargetGroupArn=tg["TargetGroupArn"],
+        Attributes=[{"Key": "deregistration_delay.timeout_seconds", "Value": "30"}],
+    )
     logger.info("ecs_target_group_created", name=name, arn=tg["TargetGroupArn"])
     return tg["TargetGroupArn"]
 
