@@ -139,6 +139,20 @@ All of the above driven headlessly in a real browser or against the real
 running AWS account, not just code-reviewed. Full detail in
 `PROJECT_STATUS.md`.
 
+**Also done (2026-09-18):** the ChatOps query interface (the assignment's
+own named bonus item — a grounded query interface over real comparison
+data) — `POST /{project_id}/ask` (api-gateway) proxies to
+`POST /chatops/ask` (explainability-service), which assembles real
+run/verdict/audit evidence and answers via Groq with the same
+hard-timeout + deterministic-fallback discipline as the existing RCA/
+digest integrations; a `ChatOpsPanel` on the Pipeline View tab is the UI.
+Read-only by construction — touches no pipeline/verification/actuation
+code. Full detail in `PROJECT_STATUS.md` §9.7. Also fixed the same
+session: a pipeline run rejected by the per-tenant concurrency lock used
+to vanish as a ghost `PENDING` run the crash-recovery reconciler could
+never find — it now writes a real terminal `FAILED` execution state with
+an explicit reason.
+
 Next up per this ordering: **#1 (Blue-green — OPA rule)**. Say the number
 or name of whichever you actually want built first — this list is
 priority-ranked, not a mandated sequence.

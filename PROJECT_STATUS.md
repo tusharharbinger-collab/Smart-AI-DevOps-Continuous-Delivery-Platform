@@ -100,6 +100,7 @@ works exactly as documented above.
 | Celery for `pipeline-worker` | ⚠️ Deviation — sync function calls + Redis Streams consumer groups instead (functionally equivalent, spec names Celery) |
 | MinIO | ⚠️ Container up, nothing in the app writes to it |
 | RCA generation (Groq) | ⚠️ Real, but only verified via deterministic fallback unless `GROQ_API_KEY` is configured live |
+| ChatOps query interface (bonus item — "a query interface that still grounds its answer in the real comparison data") | ✅ **Done 2026-09-18.** See 9.7 below. |
 
 ## Part 2 — Product roadmap, Phases 1–8
 
@@ -207,6 +208,17 @@ in this document was.
 | **Gate 1: build+test on the new commit before any deploy attempt** | ✅ **Done and live-verified 2026-09-16.** New `stream:gate1:check` Redis Stream — the webhook receiver now queues a check instead of triggering directly; pipeline-worker's new consumer (`_process_gate1_check_message`, `_consume_gate1_check`, `_reclaim_stale_gate1_pending_loop`, mirroring the existing pipeline-start consumer's reliability shape) runs the real `build_preview.py` dry run and calls back into new `POST /internal/{project_id}/gate1-result`, which triggers the real rollout only on `passed=True` (`_trigger_rollout_internal`, byte-identical to a human trigger) — a `passed=False` result never touches the real pipeline, matching `build_preview.py`'s own "never confused for a real pipeline_execution" invariant. 9 new tests (api-gateway + pipeline-worker), full suites 87/87 and 141/141 passing. **Live-verified against the real `test-` project**: a real webhook push → real gate1 consumer clone+build+pytest run (genuinely passed) → real callback → real new `pipeline_executions` row (`trigger_type='GITHUB_PUSH'`) → the real existing canary pipeline picked it up and began executing — confirmed the gate1 check's own run_id never appears in `pipeline_executions` (by design). |
 | Gate 2: statistical verification vs. live version, auto-promote/auto-rollback | ✅ Already real — the existing verification+OPA+actuation chain, unmodified, now reachable from a webhook-triggered run too, live-verified as part of the above |
 | `UNVERIFIABLE` → wait, don't guess (traffic-floor protection) | ✅ Already an existing invariant (`minSampleSize`/`minDuration`) |
+
+### 9.7 — ChatOps query interface (2026-09-18)
+
+| Item | Status |
+|---|---|
+| `explainability-service`: `POST /chatops/ask` — assembles real grounding context (last N `pipeline_executions` joined via `COALESCE(execution_state.status, pipeline_executions.status)`, `verification_records`+`cost_analysis`, `audit_ledger`) and answers via Groq, structurally identical to `report_generator.py`'s established pattern (hard 30s timeout, deterministic non-fabricated fallback, JSON-object response contract) | ✅ Done — `chatops_answerer.py` + `chatops_context.py`, `services/explainability-service/tests/test_chatops_answerer.py` |
+| `api-gateway`: `POST /{project_id}/ask` — thin proxy, `tenant_id` resolved from the authenticated session (never the request body), `_load_project` 404s a cross-tenant project id | ✅ Done — `projects_router.py`, `services/api-gateway/tests/test_project_chatops.py` |
+| Frontend: `ChatOpsPanel` on the Pipeline View tab | ✅ Done — `frontend/src/components/pipeline/ChatOpsPanel.tsx`, `frontend/src/api/chatops.ts` |
+| Read-only by construction — assembles context from already-computed verdicts/audit rows only, never touches pipeline/verification/actuation code, cannot influence a real rollout decision | ✅ By design |
+
+**Also fixed same session:** a pipeline run rejected by the per-tenant concurrency lock (`worker.py`) used to vanish — no `execution_state` row was ever written, so it stayed `PENDING` in the UI forever with nothing for the crash-recovery reconciler to find. It now writes a real terminal `FAILED` execution state with an explicit reason the moment the lock is denied. Covered by `services/pipeline-worker/tests/test_tenant_lock_rejection_writes_terminal_state.py`.
 
 ---
 
