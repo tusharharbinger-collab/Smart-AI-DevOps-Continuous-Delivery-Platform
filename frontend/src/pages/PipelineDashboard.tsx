@@ -11,6 +11,7 @@ import { usePipelineEvents } from "@/hooks/usePipelineEvents";
 import { useLiveLogs } from "@/hooks/useLiveLogs";
 import { useAppContext } from "@/hooks/useAppContext";
 import { StageTimeline } from "@/components/pipeline/StageTimeline";
+import { ChatOpsPanel } from "@/components/pipeline/ChatOpsPanel";
 import { filterLogsForStage } from "@/lib/pipelineStageSteps";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -276,6 +277,8 @@ export function PipelineDashboard() {
           </CardContent>
         </Card>
       )}
+
+      {projectId && <ChatOpsPanel projectId={projectId} />}
     </div>
   );
 }

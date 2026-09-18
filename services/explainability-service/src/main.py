@@ -20,6 +20,8 @@ import os
 
 import structlog
 
+from src.chatops_answerer import answer_chatops_question
+from src.chatops_context import assemble_chatops_context
 from src.citation_builder import build_citations_from_engine_evidence
 from src.db import get_db
 from src.decision_report import build_decision_report
@@ -135,3 +137,26 @@ async def get_digest(tenant_id: str, days: int = 7, db: AsyncSession = Depends(g
         logger.warning("digest_ai_summary_failed", tenant_id=tenant_id, error=str(e))
         digest["ai_summary"] = None
     return digest
+
+
+@app.post("/chatops/ask")
+async def post_chatops_ask(body: dict, db: AsyncSession = Depends(get_db)):
+    """
+    ChatOps query interface — the assignment's own named bonus item.
+    body: {"tenant_id": str, "project_id": str, "question": str}. Same
+    same-transaction SET LOCAL requirement as /digest/{tenant_id} above —
+    assemble_chatops_context's queries must run under the same RLS scoping
+    this sets.
+    """
+    from sqlalchemy import text
+
+    tenant_id = body.get("tenant_id")
+    project_id = body.get("project_id")
+    question = body.get("question")
+    if not tenant_id or not project_id or not question:
+        raise HTTPException(status_code=422, detail="tenant_id, project_id, and question are required")
+
+    await db.execute(text("SELECT set_config('app.active_tenant_id', :tid, true)"), {"tid": tenant_id})
+    context = await assemble_chatops_context(db, tenant_id, project_id)
+    context["project_id"] = project_id
+    return await answer_chatops_question(context, question)

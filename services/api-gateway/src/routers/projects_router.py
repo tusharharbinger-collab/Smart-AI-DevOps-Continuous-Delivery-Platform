@@ -257,6 +257,10 @@ class GeneratePipelineRequest(BaseModel):
     prompt: str
 
 
+class AskProjectQuestionRequest(BaseModel):
+    question: str
+
+
 # ─────────────────────────── helpers ───────────────────────────
 
 
@@ -1520,6 +1524,40 @@ async def get_run_failure_analysis(
 
     raw = await request.app.state.redis.get(f"failure_rca:{run_id}")
     return {"failure_analysis": json.loads(raw) if raw else None}
+
+
+@router.post("/{project_id}/ask")
+async def ask_project_question(
+    project_id: str,
+    body: AskProjectQuestionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_request_db),
+):
+    """
+    ChatOps query interface — the assignment's own named bonus item ("a
+    query interface that still grounds its answer in the real comparison
+    data"). A thin, auth-checked proxy: tenant_id comes from the
+    authenticated session (never the request body), `_load_project`
+    404s if the project isn't this tenant's — same guard every other
+    project-scoped endpoint in this file already uses. The real work
+    (assembling grounded context, calling Groq) happens in
+    explainability-service, mirroring how /pipeline/generate above proxies
+    to the same service.
+    """
+    tenant_id = _get_tenant_id(request)
+    await _load_project(db, project_id, tenant_id)
+
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            resp = await client.post(
+                f"{EXPLAINABILITY_SERVICE_URL}/chatops/ask",
+                json={"tenant_id": tenant_id, "project_id": project_id, "question": body.question},
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"ChatOps assistant unavailable: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"ChatOps assistant failed: {resp.text}")
+    return resp.json()
 
 
 @router.get("/{project_id}/runs")

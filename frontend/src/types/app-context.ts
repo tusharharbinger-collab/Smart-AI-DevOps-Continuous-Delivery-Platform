@@ -26,4 +26,12 @@ export interface AppContext {
    * so without this it would show every other project's actuations too.
    */
   projectId?: string;
+  /**
+   * "blue_green" | "canary" — lets a screen explain an empty state
+   * correctly. Blue-green deliberately never produces a verification
+   * verdict for ANY run (not just the first), unlike canary mode, so a
+   * generic "no verdict yet" message is misleading without knowing which
+   * strategy this project actually runs.
+   */
+  deployMode?: string;
 }

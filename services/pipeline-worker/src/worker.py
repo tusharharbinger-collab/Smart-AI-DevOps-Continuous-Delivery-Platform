@@ -318,6 +318,35 @@ class PipelineOrchestrator:
             acquired = self.state_store.acquire_tenant_lock(resolved_tenant_id, service_name)
             if not acquired:
                 logger.warning("tenant_concurrency_lock_held", tenant_id=resolved_tenant_id, service=service_name)
+                # Real gap found live (2026-09-18): this REJECTED return value
+                # was never actually checked by anything — main.py's stream
+                # consumer discards start_pipeline's return and ACKs the
+                # message regardless. pipeline_executions.status stays
+                # 'PENDING' forever (written once at trigger time, per this
+                # codebase's own documented trap) and NO execution_state row
+                # is ever created, so the reconciler — which only resumes
+                # rows that already have one — can never find or retry it
+                # either. The UI shows this identically to "about to start,"
+                # permanently, with no way for a human to tell it already
+                # silently died. No DB status the schema allows means
+                # "rejected" specifically (execution_state.status's CHECK
+                # constraint), so this is recorded as a real, terminal FAILED
+                # with a reason that says exactly why — never left as a
+                # ghost PENDING a human has no way to distinguish from real
+                # progress.
+                self.state_store.save_state_sync(
+                    PipelineExecutionState(
+                        pipeline_run_id=run_id,
+                        tenant_id=resolved_tenant_id,
+                        pipeline_id=pipeline_id,
+                        service_name=service_name,
+                        current_stage="none",
+                        current_traffic_weight=0,
+                        status=StageStatus.FAILED,
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                        stages=[],
+                    )
+                )
                 return {
                     "status": "REJECTED",
                     "reason": f"Concurrent pipeline already running for tenant={resolved_tenant_id}, service={service_name}",

@@ -456,6 +456,7 @@ export function ProjectWorkspace() {
             tenantId: session?.tenant_id ?? "",
             hideRunControls: true,
             projectId,
+            deployMode: project.deploy_mode,
           } satisfies AppContext
         }
       />

@@ -65,6 +65,21 @@ def register_task_definition(
                     {"name": "DEPLOYMENT_COHORT", "value": cohort},
                     {"name": "APP_VERSION", "value": app_version},
                     {"name": "PATH_PREFIX", "value": path_prefix or ""},
+                    # Real gap found live (2026-09-18): a project declares its
+                    # real listen port in the wizard, and that port is
+                    # already used to configure the ALB target group's
+                    # health check and this task's own portMapping — but it
+                    # was never actually told to the CONTAINER. Any app using
+                    # the extremely common `process.env.PORT || <default>`
+                    # idiom (Node/Express, most PaaS-style apps) silently
+                    # listened on its own hardcoded default instead,
+                    # mismatching whatever port ECS/the ALB actually expect —
+                    # confirmed live: a real app's own container logs showed
+                    # it running on 3000 while the target group health-
+                    # checked port 8080, causing a real, repeated
+                    # "Task failed ELB health checks" cycle with no code bug
+                    # on the app's side at all.
+                    {"name": "PORT", "value": str(port)},
                 ],
                 "logConfiguration": {
                     "logDriver": "awslogs",
