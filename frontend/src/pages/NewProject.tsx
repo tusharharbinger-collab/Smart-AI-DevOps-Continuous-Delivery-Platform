@@ -36,6 +36,12 @@ import {
   createProject, getBuildPreviewLogs, getBuildPreviewResult, startBuildPreview,
   type BuildPreviewResult, type CreateProjectInput,
 } from "@/api/projects";
+import { useCopilotStore } from "@/lib/copilot-store";
+import { emptyIntentSpec, normalizeIntentSpec, type DeploymentReadiness, type IntentSpec } from "@/api/intentSpec";
+import { generateAiTunedPipeline, previewPipelineTemplate, type AiTunedPipelineResult } from "@/api/pipelinePreview";
+import { RequirementsForm } from "@/components/wizard/RequirementsForm";
+import type { InfraDraft } from "@/api/infraDrafts";
+import { suggestGuardrails } from "@/lib/guardrailSuggestions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -45,7 +51,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 
-const STEPS = ["Choose Repository", "Configure Build & Test", "Progressive Policy & Deploy"] as const;
+const STEPS = ["Choose Repository", "Configure Build & Test", "Requirements", "Progressive Policy & Deploy"] as const;
 const TRAFFIC_PRESET = [10, 25, 50, 100];
 const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const APPROVAL_ROLES = ["developer", "lead-sre", "platform-admin"];
@@ -55,6 +61,7 @@ type SourceTab = "provider" | "public" | "image";
 export function NewProject() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const openCopilot = useCopilotStore((s) => s.openCopilot);
   const [step, setStep] = useState(0);
 
   // Step 1 — repository
@@ -127,6 +134,33 @@ export function NewProject() {
   const [previewLogs, setPreviewLogs] = useState<string[]>([]);
   const [previewResult, setPreviewResult] = useState<BuildPreviewResult | null>(null);
   const [previewStarting, setPreviewStarting] = useState(false);
+
+  // Step 2 (new) — Requirements Form (AI_AGENTIC_ORCHESTRATION_PLAN.md
+  // §2.1/§2.5) — locks the IntentSpec the future Infra Architect Agent
+  // will parameterize a golden-path archetype from. Pre-filled from
+  // `detection.infra_signals`/`detection.archetype` inside RequirementsForm
+  // itself; kept here so it survives navigating back/forward between steps.
+  const [intentSpec, setIntentSpec] = useState<IntentSpec>(emptyIntentSpec());
+  // Lifted from RequirementsForm (via onDraftChange) so its draft_id can
+  // ride along in the final POST /projects call — see
+  // CreateProjectInput.infra_draft_id and create_project()'s linking UPDATE.
+  const [infraDraft, setInfraDraft] = useState<InfraDraft | null>(null);
+  // Phase 3 (§2.4) — the tiered outcome from normalizeIntentSpec, computed
+  // once when leaving the Requirements step. `null` until normalization
+  // succeeds at least once (a network failure leaves it null and the
+  // wizard proceeds unblocked, per the same "don't let this step become a
+  // hard dependency" rule as the normalization call itself).
+  const [readiness, setReadiness] = useState<DeploymentReadiness | null>(null);
+  const [readinessAcknowledged, setReadinessAcknowledged] = useState(false);
+
+  // Phase 6 — the Pipeline Architect Agent, wired for real. `aiTunedPipeline`
+  // is null until the human explicitly asks for a preview; useAiTunedPipeline
+  // is the human's explicit choice to actually use it at Deploy time (never
+  // auto-applied — Ground Rule 0a).
+  const [aiTunedPipeline, setAiTunedPipeline] = useState<AiTunedPipelineResult | null>(null);
+  const [pipelinePreviewLoading, setPipelinePreviewLoading] = useState(false);
+  const [pipelinePreviewError, setPipelinePreviewError] = useState<string | null>(null);
+  const [useAiTunedPipeline, setUseAiTunedPipeline] = useState(false);
 
   // Step 3 — guardrails
   const [confidenceFloor, setConfidenceFloor] = useState(0.8);
@@ -501,45 +535,69 @@ export function NewProject() {
     };
   }, [previewRunId, previewResult?.status]);
 
+  function buildProjectPayload(): CreateProjectInput {
+    return {
+      name: form.name,
+      source_type: isImageSource ? "existing_image" : "repository",
+      repo_url: isImageSource ? null : repoUrl,
+      repo_private: repoPrivate,
+      branch: form.branch,
+      root_directory: form.root_directory,
+      dockerfile_path: isImageSource || buildTab !== "dockerfile" ? null : form.dockerfile_path || null,
+      language: isImageSource || buildTab !== "language" ? null : form.language || null,
+      framework: isImageSource || buildTab !== "language" ? null : form.framework || null,
+      start_command: isImageSource || buildTab !== "language" ? null : form.start_command || null,
+      manifest_path: isImageSource || buildTab !== "language" ? null : form.manifest_path || null,
+      test_command: isImageSource ? null : form.test_command || null,
+      container_image: form.container_image,
+      active_production_tag: form.active_production_tag,
+      canary_tag: form.canary_tag,
+      registry_credential_id:
+        isImageSource && selectedCredentialId !== "none" ? selectedCredentialId : null,
+      port: form.port,
+      health_check_path: form.health_check_path,
+      path_prefix: form.path_prefix.trim() || null,
+      guardrails: {
+        confidence_floor: confidenceFloor,
+        min_sample_size: minSampleSize,
+        max_cost_delta_percent: maxCostDelta,
+      },
+      deploy_policy: {
+        deploy_mode: deployMode,
+        blocked_deploy_windows: blockedWindows,
+        manual_approval_required: manualApprovalRequired,
+        manual_approval_roles: manualApprovalRequired ? manualApprovalRoles : [],
+      },
+      traffic_steps: TRAFFIC_PRESET,
+      provision_cluster: provisionCluster,
+      deploy_target: deployTarget,
+      aws_region: awsRegion,
+      infra_draft_id: infraDraft?.draft_id ?? null,
+    };
+  }
+
+  async function handlePreviewPipeline() {
+    setPipelinePreviewLoading(true);
+    setPipelinePreviewError(null);
+    try {
+      const { policy_yaml: baseYaml } = await previewPipelineTemplate(buildProjectPayload());
+      const tuned = await generateAiTunedPipeline(baseYaml, intentSpec, infraDraft?.infra_proposal);
+      setAiTunedPipeline(tuned);
+    } catch (err) {
+      const message = (err as Error).message;
+      setPipelinePreviewError(message);
+      toast.error("Could not generate an AI-tuned pipeline", { description: message });
+    } finally {
+      setPipelinePreviewLoading(false);
+    }
+  }
+
   async function handleDeploy() {
     setSubmitting(true);
     try {
       const payload: CreateProjectInput = {
-        name: form.name,
-        source_type: isImageSource ? "existing_image" : "repository",
-        repo_url: isImageSource ? null : repoUrl,
-        repo_private: repoPrivate,
-        branch: form.branch,
-        root_directory: form.root_directory,
-        dockerfile_path: isImageSource || buildTab !== "dockerfile" ? null : form.dockerfile_path || null,
-        language: isImageSource || buildTab !== "language" ? null : form.language || null,
-        framework: isImageSource || buildTab !== "language" ? null : form.framework || null,
-        start_command: isImageSource || buildTab !== "language" ? null : form.start_command || null,
-        manifest_path: isImageSource || buildTab !== "language" ? null : form.manifest_path || null,
-        test_command: isImageSource ? null : form.test_command || null,
-        container_image: form.container_image,
-        active_production_tag: form.active_production_tag,
-        canary_tag: form.canary_tag,
-        registry_credential_id:
-          isImageSource && selectedCredentialId !== "none" ? selectedCredentialId : null,
-        port: form.port,
-        health_check_path: form.health_check_path,
-        path_prefix: form.path_prefix.trim() || null,
-        guardrails: {
-          confidence_floor: confidenceFloor,
-          min_sample_size: minSampleSize,
-          max_cost_delta_percent: maxCostDelta,
-        },
-        deploy_policy: {
-          deploy_mode: deployMode,
-          blocked_deploy_windows: blockedWindows,
-          manual_approval_required: manualApprovalRequired,
-          manual_approval_roles: manualApprovalRequired ? manualApprovalRoles : [],
-        },
-        traffic_steps: TRAFFIC_PRESET,
-        provision_cluster: provisionCluster,
-        deploy_target: deployTarget,
-        aws_region: awsRegion,
+        ...buildProjectPayload(),
+        ai_tuned_policy_yaml: useAiTunedPipeline && aiTunedPipeline ? aiTunedPipeline.pipeline_yaml : null,
       };
       const res = await createProject(payload);
       if (res.cluster_provisioning.attempted && !res.cluster_provisioning.succeeded) {
@@ -568,6 +626,11 @@ export function NewProject() {
     (buildTab === "language" &&
       Boolean(form.language.trim() && (form.start_command.trim() || languageNeedsNoStartCommand)));
   const canContinueStep1 = Boolean(form.name.trim() && form.container_image.trim()) && hasBuildConfig;
+  // The Requirements Form only hard-requires a chosen environment tier —
+  // every other field has a safe "unsure" default (see FARGATE_TIER_DEFAULTS
+  // in shared/intent_spec.py), so this step never blocks someone who
+  // genuinely doesn't know their sizing/budget answers yet.
+  const canContinueStep2 = Boolean(intentSpec.environment_tier);
 
   // Auto-detect once per repo+branch combo the moment the user reaches
   // step 2, so the checklist is already there instead of an empty form —
@@ -583,6 +646,36 @@ export function NewProject() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, repoUrl, form.branch, autoMode]);
 
+  // Keep active wizard context synchronized with Copilot store for split view
+  useEffect(() => {
+    const parsed = repoUrl ? parseRepoUrl(repoUrl) : null;
+    const owner = selectedRepo?.full_name ? selectedRepo.full_name.split("/")[0] : (parsed?.owner || "");
+    const repo = selectedRepo?.name || parsed?.repo || form.name || "";
+
+    useCopilotStore.getState().setWizardContext({
+      page: "New Service Wizard",
+      step: STEPS[step],
+      step_index: step,
+      repo_url: repoUrl || selectedRepo?.clone_url || "",
+      owner,
+      repo,
+      branch: form.branch || "main",
+      name: form.name,
+      language: form.language,
+      framework: form.framework,
+      port: form.port,
+      start_command: form.start_command,
+      dockerfile_path: form.dockerfile_path,
+      deploy_target: deployTarget,
+      deploy_mode: deployMode,
+      path_prefix: form.path_prefix,
+    });
+
+    return () => {
+      useCopilotStore.getState().setWizardContext(null);
+    };
+  }, [step, repoUrl, selectedRepo, form, deployTarget, deployMode]);
+
   return (
     <div className="mx-auto max-w-4xl space-y-5">
       <div>
@@ -596,7 +689,7 @@ export function NewProject() {
       </div>
 
       {/* Breadcrumb stepper */}
-      <div className="grid grid-cols-3 overflow-hidden rounded-md border text-center text-code text-[11px]">
+      <div className="grid grid-cols-4 overflow-hidden rounded-md border text-center text-code text-[11px]">
         {STEPS.map((label, i) => (
           <div
             key={label}
@@ -618,6 +711,42 @@ export function NewProject() {
             <span className="hidden sm:inline">{label}</span>
           </div>
         ))}
+      </div>
+
+      {/* AI Copilot Guidance Banner */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/20 bg-primary/5 p-3 text-xs">
+        <div className="flex items-center gap-2.5">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
+            <Sparkles className="h-4 w-4 animate-pulse" />
+          </div>
+          <div>
+            <span className="font-medium text-foreground">Need guidance configuring your container or deployment?</span>
+            <p className="text-muted-foreground text-[11px]">
+              DevOps Copilot can recommend container ports, start/build commands, and choose between Canary vs Blue-Green.
+            </p>
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          type="button"
+          onClick={() =>
+            openCopilot(
+              `I am creating a service named "${form.name || selectedRepo?.name || "my-service"}" (${form.language || "runtime not set"}). Which container port, start command, and deployment mode should I choose?`,
+              {
+                language: form.language,
+                port: form.port,
+                deploy_target: deployTarget,
+                deploy_mode: deployMode,
+                path_prefix: form.path_prefix,
+              }
+            )
+          }
+          className="h-8 gap-1.5 border-primary/30 text-primary hover:bg-primary/10"
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+          Ask Copilot
+        </Button>
       </div>
 
       <Card>
@@ -1407,9 +1536,57 @@ export function NewProject() {
             </div>
           )}
 
-          {/* ── Step 3 ── */}
+          {/* ── Step 3 (new) — Requirements Form ── */}
           {step === 2 && (
+            <RequirementsForm
+              detection={detection}
+              value={intentSpec}
+              onChange={setIntentSpec}
+              onDraftChange={setInfraDraft}
+              deployTarget={deployTarget}
+              projectNameHint={form.name}
+            />
+          )}
+
+          {/* ── Step 4 ── */}
+          {step === 3 && (
             <div className="space-y-5">
+              {readiness && readiness.outcome !== "auto_advance" && (
+                <div
+                  className={`space-y-2 rounded-md border p-3 text-xs ${
+                    readiness.outcome === "require_approval"
+                      ? "border-destructive/40 bg-destructive/5"
+                      : "border-warning/40 bg-warning/5"
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 font-medium">
+                    {readiness.outcome === "require_approval" ? (
+                      <ShieldX className="h-3.5 w-3.5 text-destructive" />
+                    ) : (
+                      <ShieldAlert className="h-3.5 w-3.5 text-warning" />
+                    )}
+                    {readiness.outcome === "require_approval"
+                      ? "Review required before deploying"
+                      : "Worth a look before you deploy"}
+                  </div>
+                  <ul className="list-inside list-disc space-y-0.5 text-muted-foreground">
+                    {readiness.reasons.map((r) => (
+                      <li key={r}>{r}</li>
+                    ))}
+                  </ul>
+                  {readiness.outcome === "require_approval" && (
+                    <label className="flex items-start gap-2 pt-1">
+                      <input
+                        type="checkbox"
+                        checked={readinessAcknowledged}
+                        onChange={(e) => setReadinessAcknowledged(e.target.checked)}
+                        className="mt-0.5 h-3.5 w-3.5 accent-primary"
+                      />
+                      <span>I've reviewed the above and want to deploy anyway.</span>
+                    </label>
+                  )}
+                </div>
+              )}
               <div>
                 <Label>Traffic shifting strategy</Label>
                 <div className="mt-1.5 flex items-center gap-1.5">
@@ -1484,6 +1661,27 @@ export function NewProject() {
                     gated on real infrastructure health, not a statistical verdict.
                   </p>
                 )}
+              </div>
+
+              <div className="flex items-center justify-between">
+                <p className="text-[11px] text-muted-foreground">
+                  Guardrails below are always human-editable — this only fills in a starting point.
+                </p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    const suggestion = suggestGuardrails(intentSpec, infraDraft?.infra_proposal);
+                    setConfidenceFloor(suggestion.confidence_floor);
+                    setMinSampleSize(suggestion.min_sample_size);
+                    setMaxCostDelta(suggestion.max_cost_delta_percent);
+                    setManualApprovalRequired(suggestion.manual_approval_required);
+                    toast.success("Applied AI-suggested guardrails", { description: suggestion.rationale.join(" ") });
+                  }}
+                >
+                  <Sparkles className="h-3.5 w-3.5" /> Apply AI-suggested guardrails
+                </Button>
               </div>
 
               <div className="grid gap-4 sm:grid-cols-3">
@@ -1664,6 +1862,46 @@ export function NewProject() {
                   </span>
                 </span>
               </label>
+
+              {/* ── Phase 6: Pipeline Architect Agent, wired for real ── */}
+              <div className="space-y-2 rounded-md border p-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label className="text-xs font-semibold uppercase text-muted-foreground">
+                      AI-tuned pipeline (optional)
+                    </Label>
+                    <p className="text-[11px] text-muted-foreground">
+                      Asks the Pipeline Architect Agent to tune the canary policy for your locked requirements —
+                      never applied automatically.
+                    </p>
+                  </div>
+                  <Button size="sm" variant="secondary" onClick={handlePreviewPipeline} disabled={pipelinePreviewLoading}>
+                    {pipelinePreviewLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                    Preview Pipeline (AI)
+                  </Button>
+                </div>
+                {pipelinePreviewError && !pipelinePreviewLoading && (
+                  <p className="text-xs text-destructive">{pipelinePreviewError}</p>
+                )}
+                {aiTunedPipeline && (
+                  <div className="space-y-2">
+                    <p className="text-xs text-muted-foreground">{aiTunedPipeline.summary_of_changes}</p>
+                    <details className="text-xs">
+                      <summary className="cursor-pointer text-muted-foreground">View AI-tuned pipeline YAML</summary>
+                      <pre className="mt-1 max-h-40 overflow-auto rounded bg-muted p-2 text-[10px]">{aiTunedPipeline.pipeline_yaml}</pre>
+                    </details>
+                    <label className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={useAiTunedPipeline}
+                        onChange={(e) => setUseAiTunedPipeline(e.target.checked)}
+                        className="h-3.5 w-3.5 accent-primary"
+                      />
+                      Use this AI-tuned pipeline instead of the default template
+                    </label>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -1676,16 +1914,45 @@ export function NewProject() {
             >
               <ArrowLeft className="h-3.5 w-3.5" /> Back
             </Button>
-            {step < 2 ? (
+            {step < 3 ? (
               <Button
                 size="sm"
-                onClick={() => setStep((s) => s + 1)}
-                disabled={step === 0 ? !canContinueStep0 : !canContinueStep1}
+                onClick={() => {
+                  if (step === 2) {
+                    // Locks the IntentSpec: validates + fills any "use the
+                    // tier default" field via the same apply_tier_defaults
+                    // the backend would apply anyway, so the form already
+                    // shows the real values before the Progressive Policy
+                    // step. A network hiccup here must not block the wizard
+                    // — the raw (un-normalized) spec is still perfectly
+                    // usable, just without the defaults filled in yet.
+                    normalizeIntentSpec(intentSpec)
+                      .then((normalized) => {
+                        const { readiness: r, ...spec } = normalized;
+                        setIntentSpec(spec);
+                        setReadiness(r);
+                      })
+                      .catch(() => undefined)
+                      .finally(() => setStep((s) => s + 1));
+                    return;
+                  }
+                  setStep((s) => s + 1);
+                }}
+                disabled={step === 0 ? !canContinueStep0 : step === 1 ? !canContinueStep1 : !canContinueStep2}
               >
                 Continue <ArrowRight className="h-3.5 w-3.5" />
               </Button>
             ) : (
-              <Button size="sm" onClick={handleDeploy} disabled={submitting || !canContinueStep1}>
+              <Button
+                size="sm"
+                onClick={handleDeploy}
+                disabled={
+                  submitting ||
+                  !canContinueStep1 ||
+                  !canContinueStep2 ||
+                  (readiness?.outcome === "require_approval" && !readinessAcknowledged)
+                }
+              >
                 {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
                 Deploy Service &amp; Start Canary Loop
               </Button>

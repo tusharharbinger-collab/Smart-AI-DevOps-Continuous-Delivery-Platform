@@ -40,6 +40,7 @@ import {
 const TABS = [
   { to: "pipeline", label: "Pipeline View" },
   { to: "verification", label: "Verification Inspector" },
+  { to: "ai-hygiene", label: "AI Log Hygiene" },
   { to: "policy", label: "Policy & Gates" },
   { to: "audit", label: "Audit Ledger" },
   { to: "reports", label: "Reports" },
@@ -457,6 +458,8 @@ export function ProjectWorkspace() {
             hideRunControls: true,
             projectId,
             deployMode: project.deploy_mode,
+            deployTarget: project.deploy_target,
+            projectName: project.name,
           } satisfies AppContext
         }
       />

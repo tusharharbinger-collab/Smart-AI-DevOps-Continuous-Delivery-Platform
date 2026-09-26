@@ -8,6 +8,7 @@ import { PolicyManager } from "@/pages/PolicyManager";
 import { AuditLedger } from "@/pages/AuditLedger";
 import { ReportsTab } from "@/pages/ReportsTab";
 import { CostTab } from "@/pages/CostTab";
+import { AiHygieneTab } from "@/pages/AiHygieneTab";
 import { ProjectsOverview } from "@/pages/ProjectsOverview";
 import { NewProject } from "@/pages/NewProject";
 import { ProjectWorkspace } from "@/pages/ProjectWorkspace";
@@ -29,6 +30,7 @@ export default function App() {
             <Route index element={<Navigate to="pipeline" replace />} />
             <Route path="pipeline" element={<PipelineDashboard />} />
             <Route path="verification" element={<VerificationInspector />} />
+            <Route path="ai-hygiene" element={<AiHygieneTab />} />
             <Route path="policy" element={<PolicyManager />} />
             <Route path="audit" element={<AuditLedger />} />
             <Route path="reports" element={<ReportsTab />} />

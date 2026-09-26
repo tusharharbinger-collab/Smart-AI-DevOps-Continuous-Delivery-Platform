@@ -98,6 +98,36 @@ export interface BuildDetection {
    */
   suggested_health_check_path: string;
   suggested_port: number;
+  /**
+   * File-signature inference of what this repo likely needs to deploy
+   * (database/cache/object storage clients found in its dependency
+   * manifest, and whether it produces static output only) — feeds the
+   * Requirements Form pre-fill described in AI_AGENTIC_ORCHESTRATION_PLAN.md
+   * §2.2/§2.5. `null` fields mean "no signal found," never "confirmed not
+   * needed" — the form always shows these as editable, not locked.
+   */
+  infra_signals: {
+    needs_database: boolean;
+    database_hint: string | null;
+    needs_cache: boolean;
+    cache_hint: string | null;
+    needs_object_storage: boolean;
+    storage_hint: string | null;
+    is_static_site: boolean;
+  } | null;
+  /**
+   * One of the six golden-path archetypes (AI_AGENTIC_ORCHESTRATION_PLAN.md
+   * §2.3) this repo was matched to — bounds what the (future) Infra
+   * Architect Agent parameterizes instead of inventing a topology freehand.
+   */
+  archetype:
+    | "static_site"
+    | "stateless_web_service"
+    | "web_service_with_database"
+    | "web_service_with_database_and_cache"
+    | "background_worker"
+    | "multi_service"
+    | null;
 }
 
 export const getBuildDetection = (owner: string, repo: string, ref: string, token?: string) =>

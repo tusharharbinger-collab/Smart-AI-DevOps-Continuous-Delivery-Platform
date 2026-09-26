@@ -13,6 +13,8 @@ import { TrafficWeightChart } from "@/components/pipeline/TrafficWeightChart";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { HelpTooltip } from "@/components/help-tooltip";
+import { RcaDiffViewer, StructuredRca } from "@/components/verification/RcaDiffViewer";
+import { LogHygieneCard } from "@/components/verification/LogHygieneCard";
 
 // Real gap found live (2026-09-18): a non-technical user looking at
 // "Composite score 100.0/100.0" sitting right next to a "DEGRADED" badge
@@ -68,7 +70,7 @@ function plainLanguageSummary(
 }
 
 export function VerificationInspector() {
-  const { pipelineRunId, deployMode } = useAppContext();
+  const { pipelineRunId, deployMode, projectId } = useAppContext();
   const { verdict, metrics, rcaReport, rcaPending, isLoading, error } = useVerificationResult(pipelineRunId);
   // Phase 4: the canary ramp is only meaningful WHILE progressive_verify is
   // the active stage — same live WebSocket state Pipeline View already
@@ -76,6 +78,22 @@ export function VerificationInspector() {
   // back to the other screen to see what traffic level this verdict
   // actually corresponds to.
   const { currentStage, trafficWeight, weightHistory, status: pipelineStatus } = usePipelineEvents(pipelineRunId);
+
+  let structuredRca: StructuredRca | null = null;
+  let summaryText = rcaReport;
+  if (rcaReport) {
+    try {
+      if (rcaReport.trim().startsWith("{")) {
+        const parsed = JSON.parse(rcaReport);
+        if (parsed && typeof parsed === "object" && parsed.executive_summary) {
+          structuredRca = parsed;
+          summaryText = parsed.executive_summary;
+        }
+      }
+    } catch {
+      // fallback to raw string
+    }
+  }
 
   if (!pipelineRunId) {
     return <p className="text-sm text-muted-foreground">Select a pipeline run to inspect its verdict.</p>;
@@ -138,17 +156,34 @@ export function VerificationInspector() {
         );
       }
       return (
-        <Card className="mx-auto mt-8 max-w-lg text-center">
-          <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
-            <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
-            No verdict published yet for this run — verification hasn't completed (or hasn't started).
-          </CardContent>
-        </Card>
+        <div className="space-y-4">
+          <Card className="mx-auto max-w-lg text-center">
+            <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
+              <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
+              <p className="font-medium text-foreground">Verification In Progress or Pending</p>
+              <p>No statistical verdict published yet for this run — verification is collecting telemetry or awaiting traffic.</p>
+            </CardContent>
+          </Card>
+          {projectId && <LogHygieneCard projectId={projectId} />}
+        </div>
       );
     }
     return <p className="text-sm text-destructive">Error: {error.message}</p>;
   }
-  if (!verdict) return <p className="text-sm text-muted-foreground">No verification run yet.</p>;
+  if (!verdict) {
+    return (
+      <div className="space-y-4">
+        <Card className="mx-auto max-w-lg text-center">
+          <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
+            <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
+            <p className="font-medium text-foreground">No Verification Run Yet</p>
+            <p>Verification runs automatically during deployment canaries. Once traffic is evaluated, statistical verdicts, confidence gauges, and AI diagnostics will appear here.</p>
+          </CardContent>
+        </Card>
+        {projectId && <LogHygieneCard projectId={projectId} />}
+      </div>
+    );
+  }
 
   const plain = plainLanguageSummary(verdict.status);
   const PlainIcon = plain.icon;
@@ -161,7 +196,7 @@ export function VerificationInspector() {
           <div>
             <p className={`font-semibold ${plain.classes.headline}`}>{plain.headline}</p>
             <p className="mt-1 text-sm text-muted-foreground">{plain.body}</p>
-            {rcaReport && <p className="mt-2 text-sm leading-relaxed">{rcaReport}</p>}
+            {summaryText && <p className="mt-2 text-sm leading-relaxed">{summaryText}</p>}
             {!rcaReport && rcaPending && (
               <p className="mt-2 text-xs text-muted-foreground">Generating a detailed explanation…</p>
             )}
@@ -240,27 +275,33 @@ export function VerificationInspector() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Sparkles className="h-4 w-4 text-primary" />
-            AI Root Cause Analysis
-            <HelpTooltip>
-              Generated after the platform has already acted on this verdict — this explains WHY, it never
-              delays or gates the actual promote/rollback decision.
-            </HelpTooltip>
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {rcaReport ? (
-            <p className="text-sm leading-relaxed">{rcaReport}</p>
-          ) : rcaPending ? (
-            <p className="text-sm text-muted-foreground">Generating explanation…</p>
-          ) : (
-            <p className="text-sm text-muted-foreground">No explanation available for this run.</p>
-          )}
-        </CardContent>
-      </Card>
+      {structuredRca ? (
+        <RcaDiffViewer rca={structuredRca} />
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-primary" />
+              AI Root Cause Analysis
+              <HelpTooltip>
+                Generated after the platform has already acted on this verdict — this explains WHY, it never
+                delays or gates the actual promote/rollback decision.
+              </HelpTooltip>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {summaryText ? (
+              <p className="text-sm leading-relaxed">{summaryText}</p>
+            ) : rcaPending ? (
+              <p className="text-sm text-muted-foreground">Generating explanation…</p>
+            ) : (
+              <p className="text-sm text-muted-foreground">No explanation available for this run.</p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {projectId && <LogHygieneCard projectId={projectId} />}
     </div>
   );
 }

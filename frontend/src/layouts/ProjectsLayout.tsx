@@ -8,7 +8,7 @@
  * and run from the project itself.
  */
 import { Link, Navigate, Outlet, useNavigate } from "react-router-dom";
-import { ChevronDown, LogOut, Plus, ShieldCheck } from "lucide-react";
+import { ChevronDown, LogOut, Plus, ShieldCheck, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
@@ -16,11 +16,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { HowItWorksDialog } from "@/components/how-it-works-dialog";
+import { DevOpsCopilotPanel } from "@/components/copilot/DevOpsCopilotPanel";
 import { useAuthStore } from "@/lib/auth-store";
+import { useCopilotStore } from "@/lib/copilot-store";
 import { logout } from "@/api/auth";
 
 export function ProjectsLayout() {
   const session = useAuthStore((s) => s.session);
+  const { isOpen, toggleCopilot } = useCopilotStore();
   const navigate = useNavigate();
 
   if (!session) return <Navigate to="/login" replace />;
@@ -44,6 +47,22 @@ export function ProjectsLayout() {
           </div>
 
           <div className="flex items-center gap-2">
+            <Button
+              variant={isOpen ? "default" : "outline"}
+              size="sm"
+              onClick={toggleCopilot}
+              className={`gap-1.5 shadow-sm transition-all ${
+                isOpen
+                  ? "bg-primary text-primary-foreground font-semibold"
+                  : "border-primary/40 hover:border-primary text-primary hover:bg-primary/10"
+              }`}
+              title={isOpen ? "Close AI Copilot split view" : "Open AI Copilot split view"}
+            >
+              <Sparkles className="h-3.5 w-3.5 animate-pulse" />
+              <span className="hidden sm:inline font-medium">
+                {isOpen ? "Copilot Active" : "AI Copilot"}
+              </span>
+            </Button>
             <Button size="sm" onClick={() => navigate("/projects/new")}>
               <Plus className="h-3.5 w-3.5" /> New Service
             </Button>
@@ -83,6 +102,13 @@ export function ProjectsLayout() {
           </span>
         </div>
       </footer>
+
+      {/* Separate Floating AI Copilot Companion Window */}
+      {isOpen && (
+        <aside className="fixed top-16 right-4 bottom-4 w-[440px] max-w-[calc(100vw-2rem)] z-50 flex flex-col rounded-2xl border border-border/90 bg-background/98 shadow-2xl overflow-hidden animate-in slide-in-from-right-8 duration-200">
+          <DevOpsCopilotPanel />
+        </aside>
+      )}
     </div>
   );
 }

@@ -180,6 +180,21 @@ export interface CreateProjectInput {
    */
   deploy_target: "kubernetes" | "aws_ecs";
   aws_region: string;
+  /**
+   * Phase 6 (AI_AGENTIC_ORCHESTRATION_PLAN.md §5) — an AI-tuned candidate
+   * the human previewed (POST /pipeline-preview/generate) and explicitly
+   * chose to use, in place of the deterministic template. Re-validated
+   * server-side regardless — see create_project's ai_tuned_policy_yaml handling.
+   */
+  ai_tuned_policy_yaml?: string | null;
+  /**
+   * Links this project back to the infra_build_state row the Requirements
+   * Form / infra-draft flow produced during onboarding (see
+   * RequirementsForm.tsx), so the persistent project view can later fetch
+   * getProjectInfraDraft() and render its topology. Null/omitted for a
+   * project created without ever going through that flow.
+   */
+  infra_draft_id?: string | null;
 }
 
 export interface CreateProjectResult {

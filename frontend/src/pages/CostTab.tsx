@@ -7,14 +7,10 @@
  * GET /{project_id}/cost-history endpoint (the one new backend piece this
  * work added), never a second cost computation.
  *
- * Right-sizing note: `rightsizing_rec` is genuinely NULL for every row
- * today — cost_analyzer.py::compute_rightsizing_recommendation is real and
- * unit-tested, but needs observed p95 CPU/memory utilization, which
- * nothing in this platform queries yet (see BACKLOG.md P2 — CloudWatch/
- * in-cluster-Prometheus telemetry is still open work). This deliberately
- * renders an honest "not enough usage data yet" state instead of
- * fabricating a number — see get_project_cost_history's own docstring for
- * why that's a hard line, not an oversight.
+ * Right-sizing: ECS projects get a recommendation built from real CloudWatch utilization of the
+ * baseline service (cost_tracker_ecs.py::compute_ecs_rightsizing), shown here with the evidence behind it
+ * (samples, window, measured p95) and a caveat. It only appears once there are enough datapoints - below
+ * that, an honest "not enough usage data yet" state is rendered instead of an estimated number.
  */
 import { useQuery } from "@tanstack/react-query";
 import { DollarSign, Gauge, TrendingDown, TrendingUp } from "lucide-react";
@@ -69,8 +65,18 @@ export function CostTab() {
         />
         <StatCard
           label="Value (Latency Impact)"
-          value={latestPerf ? `${latestPerf.latency_delta_percent > 0 ? "+" : ""}${latestPerf.latency_delta_percent}%` : "—"}
-          icon={latestPerf && latestPerf.latency_delta_percent < 0 ? TrendingDown : TrendingUp}
+          value={
+            latestPerf?.latency_delta_percent != null
+              ? `${latestPerf.latency_delta_percent > 0 ? "+" : ""}${latestPerf.latency_delta_percent}%`
+              : latestPerf?.status === "insufficient_samples"
+              ? "Awaiting traffic"
+              : "—"
+          }
+          icon={
+            latestPerf?.latency_delta_percent != null && latestPerf.latency_delta_percent < 0
+              ? TrendingDown
+              : TrendingUp
+          }
         />
       </div>
 
@@ -93,16 +99,30 @@ export function CostTab() {
               </div>
               {latestRec.is_overprovisioned && (
                 <p className="text-xs text-muted-foreground">
-                  Suggested: {latestRec.recommended_cpu_vcpu} vCPU / {latestRec.recommended_mem_gib} GiB — requires a{" "}
-                  <span className="font-medium">{latestRec.requires_approval_role}</span> approval to apply (never
-                  auto-applied).
+                  Suggested:{" "}
+                  {latestRec.recommended_fargate_size
+                    ? `${latestRec.recommended_fargate_size.cpu_vcpu} vCPU / ${latestRec.recommended_fargate_size.mem_gib} GiB (a real Fargate size)`
+                    : `${latestRec.recommended_cpu_vcpu} vCPU / ${latestRec.recommended_mem_gib} GiB`}
+                  {latestRec.requested_cpu_vcpu != null &&
+                    ` instead of ${latestRec.requested_cpu_vcpu} vCPU / ${latestRec.requested_mem_gib} GiB`}
+                  {" "}— requires a <span className="font-medium">{latestRec.requires_approval_role}</span> approval to
+                  apply (never auto-applied).
                 </p>
               )}
+              {latestRec.source === "cloudwatch" && (
+                <p className="text-[11px] text-muted-foreground">
+                  Based on {latestRec.sample_count} one-minute CloudWatch samples over{" "}
+                  {Math.round((latestRec.window_seconds ?? 0) / 60)} min of <span className="text-code">{latestRec.measured_service}</span>:
+                  p95 CPU {latestRec.observed_cpu_p95_percent}% · p95 memory {latestRec.observed_mem_p95_percent}%.
+                </p>
+              )}
+              {latestRec.caveat && <p className="text-[11px] text-warning">{latestRec.caveat}</p>}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
-              Not enough usage data yet — a real recommendation needs observed CPU/memory utilization telemetry,
-              which isn't wired into this platform yet. No number is shown rather than an estimated one.
+              Not enough usage data yet — a recommendation needs at least 10 one-minute CloudWatch samples of the
+              running service (it appears after a service has been up and reporting for a few minutes). No number is
+              shown rather than an estimated one.
             </p>
           )}
         </CardContent>
@@ -132,21 +152,35 @@ export function CostTab() {
                   <TableCell className="text-code text-xs">${h.baseline_cost.toFixed(4)}</TableCell>
                   <TableCell className="text-code text-xs">${h.canary_cost.toFixed(4)}</TableCell>
                   <TableCell>
-                    <Badge variant={h.delta_percent > 15 ? "destructive" : "secondary"} className="text-[10px]">
+                    <Badge
+                      variant={h.delta_percent > 15 ? "destructive" : "secondary"}
+                      className="text-[10px]"
+                      title={h.delta_percent === 0 ? "Identical task allocations (both 0.25 vCPU / 0.5 GiB RAM)" : undefined}
+                    >
                       {h.delta_percent > 0 ? "+" : ""}
                       {h.delta_percent.toFixed(1)}%
                     </Badge>
                   </TableCell>
                   <TableCell>
                     {h.performance_correlation ? (
-                      <div className="flex flex-col text-[10px]">
-                        <span className={h.performance_correlation.latency_delta_percent < 0 ? "text-emerald-500 font-medium" : "text-destructive font-medium"}>
-                          Latency {h.performance_correlation.latency_delta_percent > 0 ? "+" : ""}{h.performance_correlation.latency_delta_percent}%
-                        </span>
-                        {h.delta_percent > 0 && h.performance_correlation.latency_delta_percent < 0 && (
-                          <span className="text-muted-foreground mt-0.5">(Worth the cost)</span>
-                        )}
-                      </div>
+                      h.performance_correlation.latency_delta_percent != null ? (
+                        <div className="flex flex-col text-[10px]">
+                          <span className={h.performance_correlation.latency_delta_percent < 0 ? "text-emerald-500 font-medium" : "text-destructive font-medium"}>
+                            Latency {h.performance_correlation.latency_delta_percent > 0 ? "+" : ""}{h.performance_correlation.latency_delta_percent}%
+                          </span>
+                          {h.delta_percent > 0 && h.performance_correlation.latency_delta_percent < 0 && (
+                            <span className="text-muted-foreground mt-0.5">(Worth the cost)</span>
+                          )}
+                        </div>
+                      ) : (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] text-muted-foreground font-normal border-dashed"
+                          title="Insufficient request volume during verification window (needs ≥2 samples for Mann-Whitney U test)"
+                        >
+                          Awaiting traffic (N &lt; 2)
+                        </Badge>
+                      )
                     ) : (
                       "—"
                     )}

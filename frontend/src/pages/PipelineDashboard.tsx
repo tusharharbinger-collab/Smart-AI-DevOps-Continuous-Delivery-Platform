@@ -12,7 +12,11 @@ import { useLiveLogs } from "@/hooks/useLiveLogs";
 import { useAppContext } from "@/hooks/useAppContext";
 import { StageTimeline } from "@/components/pipeline/StageTimeline";
 import { ChatOpsPanel } from "@/components/pipeline/ChatOpsPanel";
+import { ProjectDeliveryGraph } from "@/components/pipeline/ProjectDeliveryGraph";
+import { BlueGreenCutoverPanel } from "@/components/pipeline/BlueGreenCutoverPanel";
 import { filterLogsForStage } from "@/lib/pipelineStageSteps";
+import { synthesizeRealInfraTopology } from "@/lib/syntheticInfraTopology";
+import { getProjectInfraDraft, type InfraTopology } from "@/api/infraDrafts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,12 +29,36 @@ import { pausePipeline, resumePipeline, triggerRollback } from "@/api/pipeline";
 import { getRunFailureAnalysis, type StageFailureAnalysis } from "@/api/projects";
 
 export function PipelineDashboard() {
-  const { pipelineRunId, hideRunControls, projectId } = useAppContext();
+  const { pipelineRunId, hideRunControls, projectId, deployTarget, projectName, deployMode } = useAppContext();
   const { stages, currentStage, trafficWeight, status, weightHistory } = usePipelineEvents(pipelineRunId);
   const { logLines } = useLiveLogs(pipelineRunId);
   const [selectedStage, setSelectedStage] = useState<string | null>(null);
   const visibleLogLines = useMemo(() => filterLogsForStage(logLines, selectedStage), [logLines, selectedStage]);
   const [failureAnalysis, setFailureAnalysis] = useState<StageFailureAnalysis | null>(null);
+
+  // n8n-style visualization: fetch this project's linked infra topology (if
+  // any — a project created without ever going through the Requirements
+  // Form / infra-draft flow has none, which is expected and not an error)
+  // once per project, not once per run, since the underlying infra doesn't
+  // change from run to run.
+  const [infraTopology, setInfraTopology] = useState<InfraTopology | null>(null);
+  useEffect(() => {
+    if (!projectId) {
+      setInfraTopology(null);
+      return;
+    }
+    let cancelled = false;
+    getProjectInfraDraft(projectId)
+      .then((draft) => {
+        if (!cancelled) setInfraTopology(draft?.infra_proposal?.topology ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setInfraTopology(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
 
   // Real gap found live (2026-09-15): a project's first-ever deployment
   // skips statistical verification entirely (worker.py's canary_loop
@@ -202,6 +230,27 @@ export function PipelineDashboard() {
         </div>
       )}
 
+      {deployMode === "blue_green" && <BlueGreenCutoverPanel logLines={logLines} status={status} />}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Infrastructure &amp; pipeline</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ProjectDeliveryGraph
+            infraTopology={infraTopology ?? (projectName ? synthesizeRealInfraTopology(projectName, deployTarget) : null)}
+            stages={stages}
+            currentStage={currentStage}
+            status={status}
+          />
+          <p className="mt-2 text-xs text-muted-foreground">
+            {infraTopology
+              ? "AI-generated infrastructure proposal linked to this project."
+              : "Real infrastructure boxes derived from this project's deploy target — no AI-generated proposal is linked."}
+          </p>
+        </CardContent>
+      </Card>
+
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <Card className="md:col-span-2">
           <CardHeader>
@@ -244,7 +293,11 @@ export function PipelineDashboard() {
             <div className="h-72 overflow-y-auto bg-slate-950 p-3 text-code text-xs leading-relaxed text-green-400">
               {visibleLogLines.length === 0 ? (
                 <span className="text-slate-500">
-                  {selectedStage ? `No log lines yet for stage "${selectedStage}".` : "Waiting for log output…"}
+                  {selectedStage
+                    ? `No log lines yet for stage "${selectedStage}".`
+                    : ["COMPLETED", "FAILED", "ROLLED_BACK"].includes(status)
+                    ? "No execution logs retained for this historical run (logs expire after 24h)."
+                    : "Waiting for log output…"}
                 </span>
               ) : (
                 visibleLogLines.map((line, i) => <div key={i}>{line}</div>)

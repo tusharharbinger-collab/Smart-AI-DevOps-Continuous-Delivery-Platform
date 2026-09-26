@@ -65,6 +65,19 @@ export interface RightsizingRecommendation {
   recommended_mem_gib: number;
   action: string;
   requires_approval_role: string;
+  /** Present on ECS recommendations built from real CloudWatch usage (policy-controller/cost_tracker_ecs.py). */
+  source?: "cloudwatch";
+  measured_service?: string;
+  window_seconds?: number;
+  /** How many one-minute datapoints the p95 is based on. */
+  sample_count?: number;
+  observed_cpu_p95_percent?: number;
+  observed_mem_p95_percent?: number;
+  requested_cpu_vcpu?: number;
+  requested_mem_gib?: number;
+  /** A size Fargate really offers (the raw recommended_* can be e.g. 0.05 vCPU, which cannot be deployed). */
+  recommended_fargate_size?: { cpu: number; memory: number; cpu_vcpu: number; mem_gib: number } | null;
+  caveat?: string;
 }
 
 export interface CostHistoryEntry {
@@ -80,7 +93,9 @@ export interface CostHistoryEntry {
   commit_message: string | null;
   performance_correlation?: {
     metric_name: string;
-    latency_delta_percent: number;
+    latency_delta_percent: number | null;
+    status?: "available" | "insufficient_samples";
+    detail?: string;
   } | null;
 }
 

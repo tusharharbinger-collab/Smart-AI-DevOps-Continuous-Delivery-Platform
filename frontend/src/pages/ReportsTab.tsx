@@ -21,6 +21,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { RcaDiffViewer, StructuredRca } from "@/components/verification/RcaDiffViewer";
 
 const TREND_STYLE: Record<string, { icon: typeof TrendingUp; className: string; label: string }> = {
   improving: { icon: TrendingUp, className: "text-success", label: "Improving" },
@@ -52,6 +53,22 @@ function DeploymentReportView({ runId }: { runId: string }) {
   if (isLoading) return <Skeleton className="h-48" />;
   if (!data) return <p className="text-sm text-muted-foreground">No verification record for this run yet.</p>;
 
+  let structuredRca: StructuredRca | null = null;
+  let summaryText = data.rca_summary;
+  if (data.rca_summary) {
+    try {
+      if (data.rca_summary.trim().startsWith("{")) {
+        const parsed = JSON.parse(data.rca_summary);
+        if (parsed && typeof parsed === "object" && parsed.executive_summary) {
+          structuredRca = parsed;
+          summaryText = parsed.executive_summary;
+        }
+      }
+    } catch {
+      // fallback to plain text
+    }
+  }
+
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-3">
@@ -61,14 +78,16 @@ function DeploymentReportView({ runId }: { runId: string }) {
         </span>
       </div>
 
-      {data.rca_summary && (
+      {structuredRca ? (
+        <RcaDiffViewer rca={structuredRca} />
+      ) : summaryText ? (
         <Card>
           <CardContent className="space-y-1 p-3">
             <span className="text-[11px] uppercase tracking-wide text-muted-foreground">Root cause</span>
-            <p className="text-sm">{data.rca_summary}</p>
+            <p className="text-sm">{summaryText}</p>
           </CardContent>
         </Card>
-      )}
+      ) : null}
 
       {data.cost_analysis && (
         <Card>

@@ -34,4 +34,15 @@ export interface AppContext {
    * strategy this project actually runs.
    */
   deployMode?: string;
+  /**
+   * "kubernetes" | "aws_ecs" — lets the Pipeline View synthesize a real
+   * infrastructure topology (shared ALB/HTTPRoute + baseline/canary
+   * service boxes) for a project that never went through the AI
+   * Requirements Form / infra-draft flow, instead of showing nothing.
+   * Every onboarded project HAS real infra regardless of whether it was
+   * AI-drafted — see ProjectDeliveryGraph.tsx / syntheticInfraTopology.ts.
+   */
+  deployTarget?: string;
+  /** The project's display name — used to label the synthesized infra boxes and slugged into real resource names (see projects_router.py's `_k8s_name`). */
+  projectName?: string;
 }
