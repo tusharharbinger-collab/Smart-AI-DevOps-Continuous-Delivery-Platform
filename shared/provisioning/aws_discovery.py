@@ -33,18 +33,20 @@ SLOT_CFN_TYPES = {
     SLOT_LOAD_BALANCER: "AWS::ElasticLoadBalancingV2::LoadBalancer",
 }
 
+# Only what the platform does NOT build itself can be attached. The shared ALB, the ECS cluster and the services are
+# created by the platform for every project (shared/infra_needs.py), so they are never offered here. Databases and
+# caches are attachable for EVERY archetype: whether an app needs one is decided by the human-locked requirement flags
+# (the UI shows only the ones turned on), not by the archetype the repo happened to match.
+_DATA_SLOTS = [SLOT_DATABASE, SLOT_CACHE]
 ARCHETYPE_SLOTS: dict[str, list[str]] = {
-    "static_site": [SLOT_LOAD_BALANCER],
-    "stateless_web_service": [SLOT_ECS_CLUSTER, SLOT_LOAD_BALANCER],
-    "web_service_with_database": [SLOT_ECS_CLUSTER, SLOT_LOAD_BALANCER, SLOT_DATABASE],
-    "web_service_with_database_and_cache": [SLOT_ECS_CLUSTER, SLOT_LOAD_BALANCER, SLOT_DATABASE, SLOT_CACHE],
-    "background_worker": [SLOT_ECS_CLUSTER, SLOT_DATABASE, SLOT_CACHE],
-    "multi_service": [SLOT_ECS_CLUSTER, SLOT_LOAD_BALANCER, SLOT_DATABASE, SLOT_CACHE],
+    a: list(_DATA_SLOTS)
+    for a in ("static_site", "stateless_web_service", "web_service_with_database",
+              "web_service_with_database_and_cache", "background_worker", "multi_service")
 }
 
 
 def slots_for_archetype(archetype: str) -> list[str]:
-    return ARCHETYPE_SLOTS.get(archetype, [SLOT_ECS_CLUSTER, SLOT_LOAD_BALANCER])
+    return ARCHETYPE_SLOTS.get(archetype, list(_DATA_SLOTS))
 
 
 def _list_databases(region: str, connection: dict | None = None) -> list[dict]:

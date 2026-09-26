@@ -193,6 +193,11 @@ export function RequirementsForm({ detection, value, onChange, onDraftChange, de
   // synthesizeRealInfraTopology.ts) next to the AI proposal, so the human
   // can see exactly what the AI added (a database, a cache, etc.) rather
   // than taking the proposal on faith.
+  // Only data stores can be attached (the platform builds the ALB/cluster/services itself), and only the ones this app needs.
+  const nothingToAttach = !value.needs_database && !value.needs_cache;
+  const visibleSlots = Object.entries(discovered ?? {}).filter(
+    ([slot]) => (slot === "database" && value.needs_database) || (slot === "cache" && value.needs_cache),
+  );
   const policyBlockers = draft?.infra_proposal?.policy_evaluation?.allowed === false
     ? draft.infra_proposal.policy_evaluation.deny
     : [];
@@ -515,15 +520,31 @@ export function RequirementsForm({ detection, value, onChange, onDraftChange, de
                   Read-only lookup of your account in {value.aws_region}. Imported resources are kept
                   (DeletionPolicy: Retain) — this platform can never delete them.
                 </p>
-                <Button size="sm" variant="outline" onClick={handleDiscover} disabled={discovering || !value.archetype}>
+                <Button size="sm" variant="outline" onClick={handleDiscover} disabled={discovering || !value.archetype || nothingToAttach}>
                   {discovering && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                   {discovered ? "Refresh" : "Find existing resources"}
                 </Button>
               </div>
+              {nothingToAttach && (
+                <p className="rounded-md border border-dashed p-2 text-[11px] text-muted-foreground" data-testid="nothing-to-attach">
+                  Nothing to attach: this app needs no database or cache, and the platform builds the load balancer, cluster
+                  and services itself. Turn on "Needs a database" or "Needs a cache" above if you want to attach an
+                  existing one.
+                </p>
+              )}
               {discoverError && <p className="text-xs text-destructive">{discoverError}</p>}
-              {discovered && (
+              {discovered && !nothingToAttach && visibleSlots.length === 0 && (
+                <p className="text-xs text-muted-foreground">No attachable resource types for this setup.</p>
+              )}
+              {discovered && !nothingToAttach && visibleSlots.length > 0 && visibleSlots.every(([, c]) => c.length === 0) && (
+                <p className="rounded-md border border-dashed p-2 text-xs text-muted-foreground" data-testid="nothing-found">
+                  Nothing found in {value.aws_region}: your AWS account has no matching resources there, so there is nothing to
+                  attach. Switch back to AI-created and the agent will design a new one.
+                </p>
+              )}
+              {discovered && !nothingToAttach && (
                 <div className="grid gap-2 sm:grid-cols-2">
-                  {Object.entries(discovered).map(([slot, candidates]) => (
+                  {visibleSlots.map(([slot, candidates]) => (
                     <div key={slot} className="space-y-1">
                       <Label htmlFor={`existing-${slot}`} className="text-xs">{SLOT_LABELS[slot] ?? slot}</Label>
                       <select

@@ -25,8 +25,16 @@ class _FakeEcs:
         return {"clusters": [{"clusterName": "prod", "status": "ACTIVE"}]}
 
 
+class _FakeElasticache:
+    def describe_cache_clusters(self):
+        return {"CacheClusters": [{"CacheClusterId": "sessions", "Engine": "redis", "CacheNodeType": "cache.t3.micro"}]}
+
+
 class _Boom:
     def describe_load_balancers(self):
+        raise RuntimeError("access denied")
+
+    def describe_cache_clusters(self):
         raise RuntimeError("access denied")
 
 
@@ -34,20 +42,26 @@ def _patch_clients(monkeypatch, **clients):
     monkeypatch.setattr(aws_discovery, "aws_client", lambda name, region, connection=None: clients[name])
 
 
-def test_archetype_scopes_which_slots_are_listed(monkeypatch):
-    # web_service_with_database never asks for ElastiCache - 'elasticache' isn't even mocked.
-    _patch_clients(monkeypatch, rds=_FakeRds(), ecs=_FakeEcs(), elbv2=_Boom())
-    out = aws_discovery.discover_existing("web_service_with_database", "us-east-1")
-    assert set(out) == {"ecs_cluster", "load_balancer", "database"}
+def test_only_data_stores_are_ever_listed_whatever_the_archetype(monkeypatch):
+    # ecs/elbv2 would blow up if touched: the platform builds the ALB, cluster and services itself.
+    _patch_clients(monkeypatch, rds=_FakeRds(), elasticache=_FakeElasticache(), ecs=_Boom(), elbv2=_Boom())
+    for archetype in ("stateless_web_service", "static_site", "web_service_with_database", "something_new"):
+        out = aws_discovery.discover_existing(archetype, "us-east-1")
+        assert set(out) == {"database", "cache"}
     assert out["database"][0]["id"] == "orders-db"
     assert out["database"][0]["details"]["engine"] == "postgres"
 
 
+def test_platform_owned_resources_are_never_attachable():
+    for slots in aws_discovery.ARCHETYPE_SLOTS.values():
+        assert "ecs_cluster" not in slots and "load_balancer" not in slots
+
+
 def test_one_unreadable_service_does_not_hide_the_rest(monkeypatch):
-    _patch_clients(monkeypatch, rds=_FakeRds(), ecs=_FakeEcs(), elbv2=_Boom())
-    out = aws_discovery.discover_existing("web_service_with_database", "us-east-1")
-    assert out["load_balancer"] == []
-    assert out["ecs_cluster"][0]["id"] == "prod"
+    _patch_clients(monkeypatch, rds=_FakeRds(), elasticache=_Boom())
+    out = aws_discovery.discover_existing("web_service_with_database_and_cache", "us-east-1")
+    assert out["cache"] == []
+    assert out["database"][0]["id"] == "orders-db"
 
 
 def test_describe_selected_returns_real_details(monkeypatch):
@@ -63,10 +77,17 @@ def test_describe_selected_rejects_an_identifier_aws_does_not_list(monkeypatch):
         aws_discovery.describe_selected({"database": "ghost"}, "web_service_with_database", "us-east-1")
 
 
-def test_describe_selected_rejects_a_slot_the_archetype_does_not_use(monkeypatch):
+def test_describe_selected_rejects_platform_owned_slots_for_every_archetype(monkeypatch):
+    _patch_clients(monkeypatch, ecs=_Boom(), elbv2=_Boom())
+    for slot in ("ecs_cluster", "load_balancer"):
+        with pytest.raises(ValueError, match="not valid for archetype"):
+            aws_discovery.describe_selected({slot: "x"}, "stateless_web_service", "us-east-1")
+
+
+def test_a_database_can_be_attached_to_any_archetype(monkeypatch):
     _patch_clients(monkeypatch, rds=_FakeRds())
-    with pytest.raises(ValueError, match="not valid for archetype"):
-        aws_discovery.describe_selected({"database": "orders-db"}, "stateless_web_service", "us-east-1")
+    out = aws_discovery.describe_selected({"database": "orders-db"}, "stateless_web_service", "us-east-1")
+    assert out["database"]["id"] == "orders-db"
 
 
 class _FakeCfn:
