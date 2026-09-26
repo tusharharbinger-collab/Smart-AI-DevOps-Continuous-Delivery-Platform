@@ -651,3 +651,44 @@ def test_a_daily_quota_reset_fails_fast_instead_of_burning_useless_waits(monkeyp
         asyncio.run(generate_infra_proposal(intent_spec=SAMPLE_INTENT_SPEC, archetype="stateless_web_service"))
 
     assert sleeps == [] and len(client.bodies) == 1
+
+
+# ───────── "Extra data" repair (found live, intermittent) ─────────
+
+import json as _json
+import pytest as _pytest
+
+from src.infra_generator import InfraGenerationError as _Err, _repair_or_reject_cloudformation_json as _repair
+
+_TEMPLATE = {"Resources": {"A": {"Type": "AWS::S3::Bucket"}, "B": {"Type": "AWS::SQS::Queue"}}}
+
+
+def test_stray_closing_brackets_after_a_complete_template_are_dropped():
+    out = _repair(_json.dumps(_TEMPLATE) + "}}]")
+    assert _json.loads(out) == _TEMPLATE
+
+
+def test_trailing_whitespace_and_commas_are_dropped():
+    assert _json.loads(_repair(_json.dumps(_TEMPLATE) + " ,\n }")) == _TEMPLATE
+
+
+def test_trailing_content_that_could_be_dropped_resources_is_still_rejected():
+    """A continuation like `,"C":{...}` means resources may have been cut off - never silently accept that."""
+    with _pytest.raises(_Err) as e:
+        _repair(_json.dumps(_TEMPLATE) + ',"C":{"Type":"AWS::SNS::Topic"}}')
+    assert "trailing text" in str(e.value)
+
+
+def test_a_trailing_word_is_rejected():
+    with _pytest.raises(_Err):
+        _repair(_json.dumps(_TEMPLATE) + " and more")
+
+
+def test_a_non_template_object_with_stray_closers_is_rejected():
+    with _pytest.raises(_Err):
+        _repair('{"foo": 1}}}')
+
+
+def test_a_valid_template_is_returned_unchanged():
+    raw = _json.dumps(_TEMPLATE)
+    assert _repair(raw) == raw

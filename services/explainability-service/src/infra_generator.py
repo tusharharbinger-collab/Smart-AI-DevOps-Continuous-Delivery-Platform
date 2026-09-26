@@ -164,14 +164,42 @@ def _repair_or_reject_cloudformation_json(raw: str) -> str:
             return candidate
         except json.JSONDecodeError as e:
             last_error = e
+            salvaged = _drop_stray_closers(candidate)
+            if salvaged is not None:
+                return salvaged
         try:
             candidate = json.loads('"' + candidate + '"')
         except json.JSONDecodeError:
             candidate = candidate.replace('\\"', '"').replace("\\\\", "\\")
+    tail = ""
+    if isinstance(last_error, json.JSONDecodeError) and "Extra data" in str(last_error):
+        tail = f" (trailing text: {raw[last_error.pos:last_error.pos + 60]!r})"
     raise InfraGenerationError(
         f"AI generated a cloudformation_template that is not valid JSON even after a repair "
-        f"attempt — refusing to pass a malformed template forward: {last_error}"
+        f"attempt — refusing to pass a malformed template forward: {last_error}{tail}"
     )
+
+
+_STRAY_CLOSERS = set("}] ,\n\r\t")
+
+
+def _drop_stray_closers(text: str) -> str | None:
+    """
+    Found live (intermittent, Groq): a complete, valid CloudFormation object followed by a few extra closing
+    brackets ("Extra data"). Accept the leading object ONLY when everything after it is closers/commas/whitespace
+    - text that could be dropped content (a quote, a colon, a letter) means resources may have been cut off, so
+    that is still rejected. Returns the re-serialized object, or None when it does not apply.
+    """
+    stripped = text.lstrip()
+    try:
+        obj, end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    rest = stripped[end:]
+    if not isinstance(obj, dict) or "Resources" not in obj or (rest and not set(rest) <= _STRAY_CLOSERS):
+        return None
+    logger.warning("infra_template_stray_closers_dropped", dropped=repr(rest[:40]))
+    return json.dumps(obj)
 
 
 # Mirrors shared/provisioning/aws_discovery.py's SLOT_CFN_TYPES by value (this service has no
