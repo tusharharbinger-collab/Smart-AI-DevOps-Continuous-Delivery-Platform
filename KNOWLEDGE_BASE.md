@@ -269,8 +269,7 @@ most important first:
   (currently wizard-step panels); Phase 7 (hosting the platform itself
   publicly, not just projects it deploys); ongoing visual refresh.
 - **P4 — Deferred/operational:** TLS + real secrets store, OpenTelemetry
-  tracing, `stage_logs` persistence, `tests/e2e/*.py` and
-  `scripts/demo/*.sh` (both missing per the original assignment spec),
+  tracing, `tests/e2e/*.py` (missing per the original assignment spec),
   MinIO (running, unused), Celery migration (spec names it; the
   sync+Redis-Streams implementation is functionally equivalent).
 

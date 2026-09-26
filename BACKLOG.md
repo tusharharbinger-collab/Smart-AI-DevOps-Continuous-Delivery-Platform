@@ -6,6 +6,8 @@ work, and real bugs/patches — ordered **most important/must-have first,
 descending to lowest priority**. Update `PROJECT_STATUS.md` first when
 something here gets done, then delete its row from here.
 
+**Update 2026-09-26:** infra-agent items (independent cost, OPA infra policy, BYO-AWS, failure RCA, right-sizing) are done and live-verified - see `PROJECT_STATUS.md` 9.10. Remaining from that batch: browser checks and the blue-green UI live check (row 7 below).
+
 **Scope decision (2026-09-16): AWS ECS only, going forward.** Every
 Kubernetes/Kind/EKS-specific item and every non-AWS cloud target has been
 removed from this list — not deferred, removed, per an explicit choice to
@@ -41,13 +43,7 @@ yet.** Per this file's own convention, none of it moves to `PROJECT_STATUS.md`'s
 | 4 | **Live-verify Dockerfile synthesis for real Vite/Next.js/static repos** | An actual `docker build` against each new template (`dockerfile_synthesis.py`'s spa/nextjs/static) — confirm the nginx SPA-fallback config and the multi-stage build actually produce a working image, not just correct-looking template text |
 | 5 | **Live-verify health-check defaults + ALB matcher** | Onboard a real static/SPA project via the wizard, confirm the pre-filled `/` health-check path and the `200-399` target-group matcher actually keep ECS from killing a healthy task |
 | 6 | **Live-verify live-URL verification** | Confirm `verify_live_url` actually catches the "healthy target group, 404 through the real URL" class of bug (ALB path-prefix trap) on a real deploy, and that `live_url_status` renders correctly in a real browser |
-| 7 | **Blue-green UI cutover view** | Not started — health-check-in-progress/atomic-switch/old-service-termination as distinct visible phases; today the wizard shows deploy-mode + a post-hoc live-URL badge only, not a step-by-step cutover view |
-
-## P1 — Right-sizing follow-through (last piece of Reports & Cost)
-
-| # | Task | What it takes | Source |
-|---|---|---|---|
-| 5 | **Wire AI right-sizing to the now-real CloudWatch saturation data** | `cost_analyzer.py::compute_rightsizing_recommendation` and `cloudwatch_client.py::fetch_saturation_samples` (done + live-verified 2026-09-16) both exist and are both tested — nothing yet calls the first with the second's real output and persists `cost_analysis.rightsizing_rec`. AWS ECS only — no equivalent exists for Kubernetes projects, whose in-cluster-Prometheus telemetry work was removed from scope entirely under the AWS-ECS-only decision, not deferred | 9.1 |
+| 7 | **Blue-green UI cutover view** | Built + unit-tested (2026-09-26, `BlueGreenCutoverPanel`); still needs a live browser check against a real blue-green run. Original scope: — health-check-in-progress/atomic-switch/old-service-termination as distinct visible phases; today the wizard shows deploy-mode + a post-hoc live-URL badge only, not a step-by-step cutover view |
 
 ## P2 — Real bugs / patches (undone, not hypothetical, AWS-relevant)
 
@@ -69,9 +65,7 @@ yet.** Per this file's own convention, none of it moves to `PROJECT_STATUS.md`'s
 |---|---|---|
 | 12 | TLS termination + migrating off plaintext `.env` to a real secrets store | Explicitly deferred to Phase 7 |
 | 13 | Full OpenTelemetry tracing spans | Explicitly deferred, labeled stretch goal |
-| 14 | `stage_logs` persistence | Explicitly deferred (Phase 8) |
 | 15 | `tests/e2e/*.py` | Missing per assignment spec |
-| 16 | `scripts/demo/*.sh` (`make demo-healthy`/`make demo-fail`) | Missing per assignment spec |
 | 17 | MinIO — container runs, nothing writes to it | Either wire a real use or drop it |
 | 18 | Celery migration for `pipeline-worker` | Spec names Celery; current sync+Redis-Streams implementation is functionally equivalent — low value to change |
 | 19 | Root AWS account password rotation | Operational, your own action — flagged after being pasted in chat by mistake |
@@ -151,7 +145,13 @@ code. Full detail in `PROJECT_STATUS.md` §9.7. Also fixed the same
 session: a pipeline run rejected by the per-tenant concurrency lock used
 to vanish as a ghost `PENDING` run the crash-recovery reconciler could
 never find — it now writes a real terminal `FAILED` execution state with
-an explicit reason.
+an explicit reason. And, closing this file's own long-tracked #14: a
+historical (>24h old) run's Pipeline View used to show "Waiting for
+pipeline DAG…"/"Waiting for log output…" forever, since both the stage
+list and the log lines only ever lived in Redis (24h TTL) with nothing
+durable behind either — `stage_logs` now actually gets written to, and
+both the stage-DAG and log-replay reads fall back to Postgres once Redis
+expires. Full detail in `PROJECT_STATUS.md` §9.8.
 
 Next up per this ordering: **#1 (Blue-green — OPA rule)**. Say the number
 or name of whichever you actually want built first — this list is

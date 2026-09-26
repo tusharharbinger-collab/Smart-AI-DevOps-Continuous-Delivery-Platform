@@ -162,6 +162,8 @@ The only service that mutates the cluster.
 ### `services/explainability-service` (port 8004)
 Turns a verdict into prose, grounded in its evidence. Calls Groq (`llama-3.3-70b-versatile` by default) with a 30-second budget and a deterministic fallback. Runs **after** the decision — it can never delay or influence a safety action.
 
+It also serves the **ChatOps query interface** (the spec's bonus item): `POST /chatops/ask` assembles a project's last few runs (status via `COALESCE(execution_state.status, pipeline_executions.status)`, verification records, cost, audit rows) into one bounded context and asks Groq to answer strictly from it, returning `{answer, cited_run_ids, confidence}` — `insufficient_data` and a plain "assistant unavailable" fallback rather than a guess. api-gateway exposes it as `POST /api/v1/projects/{project_id}/ask`, resolving the tenant from the session (never the request body) and 404ing a foreign project id. It is read-only and never touches pipeline, verification or actuation code.
+
 ### Infrastructure
 | Component | Purpose |
 |---|---|
@@ -232,7 +234,7 @@ Tested by `policies/tests/guardrails_test.rego` (`opa test policies/ -v`), plus 
 | `pipelines` | ✅ | The declarative policy YAML the worker executes. |
 | `pipeline_executions` | ✅ | One row per run. Carries `project_id`, `trigger_type`, `commit_sha`, `commit_message`. |
 | `execution_state` | ✅ | Durable live state for crash recovery — **the authoritative final status** (see the trap in §16). |
-| `stage_logs` | ✅ | Durable per-stage output. **Table exists; nothing writes to it yet.** |
+| `stage_logs` | ✅ | Durable per-line run output, one row per line with its stage name. Written by `worker.py`'s `_log()` (2026-09-18); the SSE log stream falls back to it once the 24h Redis list expires. Runs that finished before that date have no rows. |
 | `verification_records` | ✅ | Every verdict + evidence JSONB + HMAC + RCA summary. The source of truth for verdicts. |
 | `audit_ledger` | ✅ | Every actuation, written **before** the action executes. |
 | `policy_rules` | ✅ | Versioned Rego snapshots per pipeline. |
@@ -476,7 +478,6 @@ This section exists so nobody is misled by a demo.
 - **Charts** — built from the summary statistics the verdict actually carries. A true empirical CDF or full LLR trajectory would need the backend to return raw per-request samples.
 
 ### Not built
-- `stage_logs` table exists and is indexed, but **nothing writes to it** — Redis remains the log path (24h TTL).
 - **MinIO** is running but unused.
 - **`GIT_PUSH_WEBHOOK`** is a valid `trigger_type` value, but nothing produces it — that needs a GitHub App.
 - **Celery** — the spec names it for `pipeline-worker`; the implementation runs stages as synchronous calls behind a Redis Streams consumer group.
@@ -544,6 +545,10 @@ docker compose exec policy-controller  env | grep VERDICT_SIGNING_KEY
 **Every finished run shows `PENDING`, every success rate 0%.** `pipeline_executions.status` is written once at trigger time and never updated; the durable final status lives in `execution_state`. Read `COALESCE(execution_state.status, pipeline_executions.status)`.
 
 **The live log panel shows "Waiting for log output…" forever.** `EventSource` cannot send an `Authorization` header, so the SSE stream was rejected 401. Stream over `fetch` instead. Also: `sse_starlette` emits CRLF, so frames are separated by `\r\n\r\n` — a parser splitting on `\n\n` matches nothing and buffers forever.
+
+**An old run's Pipeline View shows "Waiting for pipeline DAG…" / "Waiting for log output…" forever.** Both the stage list (`state:{run_id}`) and the log lines (`logs:{run_id}`) lived only in Redis with a 24h TTL. Fixed 2026-09-18: `GET /pipelines/runs/{id}` falls back to the declared `PROJECT_STAGES`, and `_log()` persists to `stage_logs`, which `logs/stream` replays once Redis is empty. The replay query must run before the `EventSourceResponse` is built — inside its generator the request-scoped transaction is already closed. Runs older than the fix still replay empty.
+
+**Every `execution_state`/`stage_logs` write fails when testing `start_pipeline` by hand.** Calling it directly skips the trigger endpoint, so no `pipeline_executions` row exists and the foreign key rejects every write (logged only as an empty `error=` warning). Trigger via `POST /api/v1/projects/{id}/rollout` instead.
 
 **A public repo fails to clone.** The generated build stage named `repoCredentialsEnvVar` unconditionally, and `git_clone.py` correctly refuses when that variable is unset rather than silently cloning anonymously. Only emit it for private repos.
 

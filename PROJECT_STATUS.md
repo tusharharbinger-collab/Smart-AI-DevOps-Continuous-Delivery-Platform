@@ -96,7 +96,7 @@ works exactly as documented above.
 | Signed verdicts (HMAC), OPA guardrails, adversarial tests | ✅ Done |
 | Postgres RLS multi-tenancy | ✅ Done |
 | `tests/e2e/*.py` | ❌ Missing (spec Phase 10) |
-| `scripts/demo/*.sh` (`make demo-healthy` / `make demo-fail`) | ❌ Missing — `connect_kind_network.sh` exists, scripted demo triggers don't |
+| `scripts/demo/*.sh` (`make demo-healthy` / `make demo-fail`) | ✅ **Done and live-verified 2026-09-18** — `demo_failed_rollout.sh` flips the v1.1.0 sample-app's real `INJECT_ERRORS` env var on the live Kind canary Deployment (genuine 2.0% error rate + 65ms latency spike, built to trip SPRT/CUSUM for real), `demo_healthy_rollout.sh` resets it; both verify the change against the live Deployment spec, not just that `kubectl` returned 0. Deliberately does **not** trigger the rollout itself — that stays a manual "Trigger New Rollout" click so a live audience sees a real click start it. |
 | Celery for `pipeline-worker` | ⚠️ Deviation — sync function calls + Redis Streams consumer groups instead (functionally equivalent, spec names Celery) |
 | MinIO | ⚠️ Container up, nothing in the app writes to it |
 | RCA generation (Groq) | ⚠️ Real, but only verified via deterministic fallback unless `GROQ_API_KEY` is configured live |
@@ -114,7 +114,7 @@ works exactly as documented above.
 | 5 | Reliability & Scale (Redis Streams, crash recovery) | ✅ Done |
 | 6 | Platform Observability (Loki/Promtail/Grafana, tracing, self-health alerts) | ✅ Done — OpenTelemetry spans deferred (stretch goal) |
 | 7 | Deployment (Local → Global) — hosting the *platform itself* publicly | ❌ Not started |
-| 8 | Project Workspaces & GitHub Delivery | ✅ Done — `stage_logs` persistence deferred |
+| 8 | Project Workspaces & GitHub Delivery | ✅ Done — `stage_logs` persistence and the historical stage-DAG fallback fixed and live-verified 2026-09-18 (see §9.7's sibling note below) |
 
 ## Part 3 — Phase 9: Universal Delivery Platform (active work)
 
@@ -219,6 +219,52 @@ in this document was.
 | Read-only by construction — assembles context from already-computed verdicts/audit rows only, never touches pipeline/verification/actuation code, cannot influence a real rollout decision | ✅ By design |
 
 **Also fixed same session:** a pipeline run rejected by the per-tenant concurrency lock (`worker.py`) used to vanish — no `execution_state` row was ever written, so it stayed `PENDING` in the UI forever with nothing for the crash-recovery reconciler to find. It now writes a real terminal `FAILED` execution state with an explicit reason the moment the lock is denied. Covered by `services/pipeline-worker/tests/test_tenant_lock_rejection_writes_terminal_state.py`.
+
+### 9.8 — Historical Pipeline View: stage timeline + log replay (2026-09-18)
+
+Found live: opening a run older than 24h (both `state:{run_id}` and `logs:{run_id}`'s Redis keys carry a 24h TTL) showed "Waiting for pipeline DAG…" and "Waiting for log output…" forever — indistinguishable from a run that genuinely never started. Root cause was two separate gaps, both now fixed and live-verified against a real triggered run (build → test → canary_deploy → progressive_verify, HEALTHY verdict) with its Redis keys deliberately deleted to simulate expiry:
+
+| Item | Status |
+|---|---|
+| Stage-DAG fallback — `execution_state` never persisted `stages` (only a single `current_stage` string), so `GET /pipelines/runs/{id}`'s Postgres fallback had nothing to return once Redis expired | ✅ Fixed — falls back to `PROJECT_STAGES`, the same declared-stage-list fallback `projects_router.py`'s own `/{project_id}/runs/{run_id}/stages` endpoint already used |
+| `stage_logs` (`db/schema.sql`, real schema + RLS since Phase 8) had never actually been written to by anything | ✅ Fixed — `worker.py`'s `_log()` now persists every line (tenant-scoped, per-stage) via a new `PipelineWorkerDB.save_stage_log`; verified 14 real rows for one full run, correctly attributed per stage |
+| `logs/stream` SSE endpoint had no replay source once Redis's list expired, and would poll an eternally-empty key forever for an already-terminal run | ✅ Fixed — falls back to `stage_logs`, ordered, then closes the stream (nothing further can ever arrive for a terminal run) instead of polling forever. **Real bug hit and fixed while verifying this**: the historical query must run *before* `EventSourceResponse` is constructed, not inside the generator — `db` is the request-scoped session, and the generator runs after the route handler returns, by which point its transaction is already closed (`InvalidRequestError: Can't operate on closed transaction`, confirmed live) |
+
+Full pipeline-worker (196 passed, 5 skipped) and api-gateway (148 passed) suites green — no regressions.
+
+---
+
+### 9.9 — AI infra: existing-vs-AI-created + prompt-driven editing (2026-09-26/27)
+
+Design and research in `AI_INFRA_IMPORT_AND_PROMPT_EDIT_PLAN.md`. All of it live-verified (real AWS, real Groq, real browser).
+
+| Item | Status |
+|---|---|
+| "Existing vs AI-created" source choice; read-only, archetype-scoped discovery of real AWS resources (`shared/provisioning/aws_discovery.py`); every pick re-verified against AWS server-side | ✅ Live-verified |
+| Real import: `ImportExistingResources` change set showed `Import DBInstance`; the import **executed** (`CREATE_COMPLETE`); deleting the importing stack **left the DB running** (`DeletionPolicy: Retain`) | ✅ Live-verified against a throwaway RDS instance (deleted afterwards; account confirmed clean) |
+| `DeletionPolicy: Retain` on imports and "an edit can never remove/un-retain one" enforced in code (`infra_generator.py` validators), not just prompted | ✅ Live-verified — an edit told to remove the DB was rejected, corrected on retry, DB still retained |
+| Prompt-driven edit (`POST /infra-drafts/{id}/edit`): new linked draft (`parent_draft_id`, migration `0018`), re-enters the approval gate, inherits the parent's stack so the change set is an UPDATE of the same stack | ✅ Live-verified |
+| Wizard UI: source toggle, discovery picklists, "Edit with AI", "Revised" badge | ✅ Verified in Chromium (topology 4 → 5 nodes with the cache added) |
+| Live-only bugs found and fixed: edit ignored because the base prompt forbade off-archetype resources; unchanged edit now rejected; hard 413 (edit request > the whole 8,000 TPM cap) fixed by slimming the prompt; `json_validate_failed` 400 retried once; multi-level over-escaped template JSON repaired; 150s gateway budget; empty timeout message | ✅ Fixed + unit-tested. Rejected approaches (don't retry): lowering edit `max_tokens` truncates larger edits; `reasoning_effort=low` breaks strict JSON |
+
+Not run: an execute of the agent-generated FULL stack (ALB + ECS + DB) — deliberately, it creates billable resources; only its change-set preview ran.
+
+Tests: api-gateway 265, pipeline-worker 214 (5 skipped), explainability `test_infra_generator.py` 32 — all green.
+
+### 9.10 - Infra agent hardening: independent cost, policy, BYO-AWS, failure RCA, cutover UI, right-sizing (2026-09-26)
+
+| Item | Status |
+|---|---|
+| **Independent infra policy** - `policies/infra_guardrails.rego` (`infra.guardrails`) evaluates the REAL CloudFormation template (encryption, public access, Retain on imports, budget); api-gateway blocks approval (409) on a deny; fail-closed if OPA is down | Live-verified; OPA 39/39. A model that omitted `StorageEncrypted` was blocked, then the generator prompt was fixed |
+| **Independent cost** - `shared/provisioning/aws_pricing.py` prices the template from the AWS Price List API, never trusting the model's number; falls back to a labelled `ai_estimate_unverified` | Live-verified end to end: a real draft priced $46.72/month from the AWS Price List vs the model's own $43.00 (both kept, labelled separately); OPA allowed it. Also verified across regions (found and fixed Multi-AZ / ElastiCache / regional-prefix selector bugs) |
+| **Cross-account (BYO-AWS)** - `aws_connections` table (migration `0019`), platform-generated ExternalId, customer-run CloudFormation role, verified by a real `sts:AssumeRole`; every provisioning call takes the connection | Live-verified end to end: real role, confused-deputy denial, least-privilege denials, and a real draft whose change set (9 Adds) was created through the assumed role. Live-only bug found and fixed: a draft row returns `aws_connection_id` as `uuid.UUID`, which the loader rejected as 'not found'. UI built (`AwsAccountPicker`), not yet browser-verified. Test stacks and rows deleted |
+| **Failure RCA** - `POST /infra-drafts/{id}/failure-analysis`: real CloudFormation events (`fetch_failure_events`) -> deterministic root-cause selection -> Groq explanation whose evidence is verified verbatim against the events, with a rule-based fallback; UI card can hand the fix to "Edit with AI" | Live-verified on a real failing stack (S3 name conflict) - real cause retrieved and correctly explained. `pipeline-worker` now pins boto3 1.43.103 (CloudFormation `DescribeEvents`, where early-validation failures put their real reason) |
+| **Blue-green cutover panel** (`BlueGreenCutoverPanel.tsx`, log-derived phases) | Unit-tested (12); not yet browser-verified |
+| **CloudWatch right-sizing** (`compute_ecs_rightsizing`, Fargate size snapping, baseline-only) | Live-verified on a temporary Fargate service (torn down) |
+
+Traps found: api-gateway has no boto3 (shared modules it imports must stay boto3-free - `aws_arn.py`); `aws_connection_id` FK is `ON DELETE RESTRICT`; the ExternalId travels only in request bodies, never URLs; Groq's daily token quota and `Retry-After` parsing (`56m57s` is not 57s).
+
+Tests: gateway 340, pipeline-worker 280 (5 skipped), explainability 91, policy-controller 132, OPA 39, vitest 36 - all green.
 
 ---
 

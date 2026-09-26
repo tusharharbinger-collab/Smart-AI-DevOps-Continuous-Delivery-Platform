@@ -78,7 +78,7 @@ Token resolution order for API calls: `X-GitHub-Token` header → the signed-in 
 
 ### 8.7 — Execution hook
 - [x] Generated pipeline YAML wires the wizard inputs into the worker's existing stage types: `build` (with `repoUrl`/`repoRef`/`dockerfilePath`), `test` (with `command`), `deploy`, `canary_loop`.
-- [ ] Worker persists per-stage logs to `stage_logs` at stage completion (Redis stays the live fast path — matching the existing `execution_state` Redis+Postgres pattern).
+- [x] Worker persists logs to `stage_logs` (Redis stays the live fast path — matching the existing `execution_state` Redis+Postgres pattern). Done 2026-09-18, and per line rather than per stage completion: `worker.py`'s `_log()` writes each line with its stage name, and `logs/stream` plus `GET /pipelines/runs/{id}` fall back to Postgres once the 24h Redis keys expire. Live-verified against a real triggered run.
 
 ## Acceptance criteria
 - [x] Schema applied cleanly to the running database; existing rows unaffected. **Note:** applied as idempotent DDL inside the postgres container rather than via `alembic upgrade head`, because this database's `alembic_version` table already contained two rows (`0001` and `0003`) — pre-existing inconsistent bookkeeping, untouched here. `0006_add_projects_and_stage_logs.py` and `schema.sql` both carry the same statements for fresh environments.
@@ -143,7 +143,7 @@ A third finding was environmental, not a bug in this code: a *freshly pulled* mu
 ## Known limitations (deliberate, not oversights)
 - **Cost delta is not shown on project cards.** `cost_analysis` rows are only written when a cost stage runs, which these pipelines don't have — so there is no real number to display, and a placeholder would be a fabricated metric.
 - **`GET /{project_id}/runs/{run_id}/logs/stream`** exists and supports `?stage=` filtering, but the UI reuses the pipeline-scoped log endpoint with client-side stage filtering (instant filter changes, no stream reconnect).
-- **`stage_logs` is created and indexed but not yet written to.** Redis remains the live log path; persisting per-stage output at stage completion is the remaining piece of 8.7.
+- ~~`stage_logs` is created and indexed but not yet written to.~~ Fixed 2026-09-18 — see 8.7's checklist above. Runs that finished before that date have no rows and replay empty.
 
 ## Depends on
 Phases 1–6 (done) and 1b (visual refresh) — this builds the project layer on top of them.
