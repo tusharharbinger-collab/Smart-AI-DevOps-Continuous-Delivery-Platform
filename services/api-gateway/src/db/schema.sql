@@ -143,6 +143,86 @@ CREATE POLICY tenant_isolation_projects ON projects
     USING (tenant_id = current_setting('app.active_tenant_id', true)::uuid);
 
 -- ─────────────────────────────────────────────────────────────────
+-- INFRA BUILD STATE  (migration 0016 — Phase 4; extended by migration 0017 — Phase 7,
+-- both of AI_AGENTIC_ORCHESTRATION_PLAN.md / AI_INFRA_PROVISIONING_EXECUTION_PLAN.md)
+--
+-- The Infra Architect Agent's state machine. A dedicated table, not a
+-- column on `projects`: this is PRE-provisioning state (INTENT_LOCKED
+-- through INFRA_APPROVED) with no pipeline_run_id, and often no `projects`
+-- row yet either — the Requirements Form flow can run before a project is
+-- ever created via POST /api/v1/projects. project_id is nullable for
+-- exactly that reason, the same pattern projects.repo_url already uses for
+-- a genuinely-doesn't-exist-yet case. Migration 0017 adds the states and
+-- columns for actually EXECUTING an approved proposal via a real AWS
+-- CloudFormation Change Set — cloud_provider is a real column from day one
+-- (not hardcoded 'aws' in application code) so a future second cloud is a
+-- data value, not a schema migration.
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS aws_connections (
+    connection_id  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      UUID        NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    name           TEXT        NOT NULL,
+    external_id    TEXT        NOT NULL,           -- platform-generated per connection: the confused-deputy guard
+    role_arn       TEXT,                           -- NULL until the customer created the role and it was verified
+    aws_account_id TEXT,
+    default_region TEXT        NOT NULL DEFAULT 'us-east-1',
+    status         TEXT        NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'VERIFIED', 'FAILED')),
+    status_reason  TEXT,
+    verified_at    TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, name)
+);
+
+ALTER TABLE aws_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE aws_connections FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_aws_connections ON aws_connections
+    FOR ALL
+    USING (tenant_id = current_setting('app.active_tenant_id', true)::uuid);
+
+CREATE TABLE IF NOT EXISTS infra_build_state (
+    draft_id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id            UUID        NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    project_id           UUID        REFERENCES projects(project_id) ON DELETE CASCADE,
+    status               TEXT        NOT NULL DEFAULT 'INTENT_LOCKED'
+                             CHECK (status IN ('INTENT_LOCKED', 'INFRA_DRAFTING', 'INFRA_DRAFT_FAILED',
+                                               'INFRA_PENDING_APPROVAL', 'INFRA_APPROVED',
+                                               'INFRA_CHANGE_SET_CREATING', 'INFRA_CHANGE_SET_READY',
+                                               'INFRA_CHANGE_SET_FAILED', 'INFRA_EXECUTION_APPROVED',
+                                               'INFRA_PROVISIONING', 'INFRA_PROVISIONED',
+                                               'INFRA_PROVISIONING_FAILED')),
+    intent_spec          JSONB       NOT NULL,
+    archetype            TEXT,
+    infra_proposal       JSONB,
+    readiness_outcome    TEXT,
+    readiness_reasons    JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    error_message        TEXT,
+    cloud_provider       TEXT        NOT NULL DEFAULT 'aws',
+    change_set_id        TEXT,
+    stack_name           TEXT,
+    stack_arn            TEXT,
+    change_set_changes   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    provisioning_error   TEXT,
+    provisioning_outputs JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    source               TEXT        NOT NULL DEFAULT 'ai_created'
+                             CHECK (source IN ('ai_created', 'existing')),
+    existing_resources   JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    parent_draft_id      UUID        REFERENCES infra_build_state(draft_id) ON DELETE SET NULL,
+    -- RESTRICT, not SET NULL: NULL means "the platform's own account", so SET NULL would repoint a deleted
+    -- connection's drafts at the WRONG account (see migration 0019).
+    aws_connection_id    UUID        REFERENCES aws_connections(connection_id) ON DELETE RESTRICT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE infra_build_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE infra_build_state FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_infra_build_state ON infra_build_state
+    FOR ALL
+    USING (tenant_id = current_setting('app.active_tenant_id', true)::uuid);
+
+-- ─────────────────────────────────────────────────────────────────
 -- PIPELINE EXECUTIONS
 --
 -- project_id/trigger_type/commit_* (Phase 8) are nullable on purpose: a

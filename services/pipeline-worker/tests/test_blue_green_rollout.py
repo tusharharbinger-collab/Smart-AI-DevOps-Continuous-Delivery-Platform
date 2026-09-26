@@ -146,6 +146,15 @@ class _FakeDB:
         )
 
 
+def _logged(redis, run_id):
+    """Every line the worker logged for this run, in order (the Pipeline View's cutover panel is derived from these)."""
+    return [line if isinstance(line, str) else line.decode() for line in redis.store.get(f"logs:{run_id}", [])]
+
+
+def _index_of(lines, fragment):
+    return next(i for i, line in enumerate(lines) if fragment in line)
+
+
 @pytest.fixture
 def manifest_path(tmp_path):
     path = tmp_path / "blue-green-test.yaml"
@@ -209,12 +218,27 @@ def test_healthy_blue_green_rollout_cuts_over_verifies_and_graduates_without_any
     monkeypatch.setattr(worker_module, "AWS_ALB_BASE_URL", "smartcd-platform-alb-123.us-east-1.elb.amazonaws.com")
 
     fake_db = _FakeDB()
-    orchestrator = PipelineOrchestrator(_FakeRedis(), db=fake_db)
+    fake_redis = _FakeRedis()
+    orchestrator = PipelineOrchestrator(fake_redis, db=fake_db)
     result = orchestrator.start_pipeline(
         manifest_path, pipeline_run_id="run-1", pipeline_id="pipe-1", tenant_id="tenant-1"
     )
 
     assert result["status"] == "COMPLETED"
+    # The blue-green cutover panel (frontend/src/lib/blueGreenCutover.ts) derives its phases from these exact
+    # lines, in this order - including the two (cutover complete, graduation complete) that used to be silent.
+    logs = _logged(fake_redis, "run-1")
+    order = [
+        _index_of(logs, "Blue-green rollout —"),
+        _index_of(logs, "Waiting for the green target group to report healthy"),
+        _index_of(logs, "Green is healthy — cutting over"),
+        _index_of(logs, "Cutover complete —"),
+        _index_of(logs, "Live URL verified — graduating"),
+        _index_of(logs, "Graduation complete —"),
+        _index_of(logs, "Blue-green rollout complete"),
+    ]
+    assert order == sorted(order)
+    assert not any("Rolled back —" in line for line in logs)
     assert calls["wait_ready"] == [("widget", "canary")]
     assert calls["wait_healthy"] == ["widget-canary"]
     assert calls["cutover"] == ["widget"]
@@ -295,9 +319,19 @@ def test_failed_post_cutover_verification_rolls_back_and_never_graduates(monkeyp
     monkeypatch.setattr(worker_module, "AWS_ALB_BASE_URL", "smartcd-platform-alb-123.us-east-1.elb.amazonaws.com")
 
     fake_db = _FakeDB()
-    orchestrator = PipelineOrchestrator(_FakeRedis(), db=fake_db)
+    fake_redis = _FakeRedis()
+    orchestrator = PipelineOrchestrator(fake_redis, db=fake_db)
     with pytest.raises(RuntimeError, match="failed live-URL verification"):
         orchestrator.start_pipeline(manifest_path, pipeline_run_id="run-3", pipeline_id="pipe-1", tenant_id="tenant-1")
+
+    logs = _logged(fake_redis, "run-3")
+    order = [
+        _index_of(logs, "Cutover complete —"),
+        _index_of(logs, "Live URL verification failed after cutover"),
+        _index_of(logs, "Rolled back —"),
+    ]
+    assert order == sorted(order)
+    assert not any("Graduation complete —" in line for line in logs)
 
     assert calls["cutover"] == ["widget"]
     assert calls["rollback"] == ["widget"]

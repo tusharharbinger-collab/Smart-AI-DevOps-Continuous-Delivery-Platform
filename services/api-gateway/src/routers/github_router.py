@@ -466,10 +466,16 @@ async def _fetch_repo_tree_and_manifests(
     if req_path:
         requirements_txt_content = await _fetch_text_file(req_path)
 
+    procfile_content = None
+    procfile_path = next((p for p in file_paths if p.rsplit("/", 1)[-1] == "Procfile" and p.count("/") <= 2), None)
+    if procfile_path:
+        procfile_content = await _fetch_text_file(procfile_path)
+
     return {
         "file_paths": file_paths,
         "package_json_content": package_json_content,
         "requirements_txt_content": requirements_txt_content,
+        "procfile_content": procfile_content,
         "yaml_manifest_content": yaml_manifest_content,
         "yaml_manifest_path": yaml_manifest_path,
         "truncated": bool(tree_raw.get("truncated")),
@@ -498,7 +504,10 @@ async def detect_build_config(
         package_json_content=fetch_res["package_json_content"],
         yaml_manifest_content=fetch_res["yaml_manifest_content"],
         yaml_manifest_path=fetch_res["yaml_manifest_path"],
+        requirements_txt_content=fetch_res["requirements_txt_content"],
+        procfile_content=fetch_res.get("procfile_content"),
     )
+    infra = detection.infra_signals
     return {
         "method": detection.method,
         "dockerfile_path": detection.dockerfile_path,
@@ -511,7 +520,17 @@ async def detect_build_config(
         "confidence": detection.confidence,
         "issues": detection.issues,
         "deploy_config": detection.deploy_config,
+        "archetype": detection.archetype,
         "truncated": fetch_res["truncated"],
+        "infra_signals": {
+            "needs_database": infra.needs_database,
+            "database_hint": infra.database_hint,
+            "needs_cache": infra.needs_cache,
+            "cache_hint": infra.cache_hint,
+            "needs_object_storage": infra.needs_object_storage,
+            "storage_hint": infra.storage_hint,
+            "is_static_site": infra.is_static_site,
+        } if infra else None,
         **suggest_networking_defaults(detection),
     }
 

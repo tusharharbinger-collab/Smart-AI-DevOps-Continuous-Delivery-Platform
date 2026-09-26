@@ -218,7 +218,15 @@ def ensure_shared_alb(elbv2, vpc_id: str, subnet_ids: list[str], alb_sg_id: str)
 def ensure_target_group(elbv2, name: str, vpc_id: str, port: int, health_check_path: str) -> str:
     existing = elbv2.describe_target_groups(Names=[name])["TargetGroups"] if _target_group_exists(elbv2, name) else []
     if existing:
-        return existing[0]["TargetGroupArn"]
+        arn = existing[0]["TargetGroupArn"]
+        try:
+            elbv2.modify_target_group_attributes(
+                TargetGroupArn=arn,
+                Attributes=[{"Key": "deregistration_delay.timeout_seconds", "Value": "15"}],
+            )
+        except Exception:
+            pass
+        return arn
     tg = elbv2.create_target_group(
         Name=name,
         Protocol="HTTP",
@@ -285,7 +293,8 @@ def ensure_listener_rule(
     Idempotent: updates the existing rule's actions/weights if this
     project's rule already exists, rather than erroring or duplicating it.
     """
-    condition = [{"Field": "path-pattern", "Values": [f"{path_prefix}*"]}]
+    clean = path_prefix.rstrip("/")
+    condition = [{"Field": "path-pattern", "Values": [clean, f"{clean}/*"]}]
     action = [
         {
             "Type": "forward",
@@ -303,7 +312,11 @@ def ensure_listener_rule(
             r
             for r in rules
             if r.get("Conditions")
-            and r["Conditions"][0].get("Values") == condition[0]["Values"]
+            and (
+                r["Conditions"][0].get("Values") == condition[0]["Values"]
+                or r["Conditions"][0].get("Values") == [f"{clean}*"]
+                or clean in r["Conditions"][0].get("Values", [])
+            )
         ),
         None,
     )
@@ -451,10 +464,14 @@ def deprovision_ecs_service(region: str, service_name: str, path_prefix: str | N
         listener = next((l for l in listeners if l["Port"] == 80), None)
         if listener:
             rules = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])["Rules"]
-            rule = next(
-                (r for r in rules if r.get("Conditions") and r["Conditions"][0].get("Values") == [f"{effective_path_prefix}*"]),
-                None,
-            )
+            def _matches_rule(r: dict) -> bool:
+                for c in r.get("Conditions", []):
+                    for v in c.get("Values", []):
+                        if v == effective_path_prefix or v.startswith(f"{effective_path_prefix}*") or v.startswith(f"{effective_path_prefix}/"):
+                            return True
+                return False
+
+            rule = next((r for r in rules if _matches_rule(r)), None)
             if rule:
                 elbv2.delete_rule(RuleArn=rule["RuleArn"])
                 deleted["listener_rules"].append(effective_path_prefix)

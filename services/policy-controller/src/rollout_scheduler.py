@@ -149,8 +149,12 @@ async def schedule_retry_of_current_step(
         step_index=state["current_step_index"],
         remaining_seconds=remaining_seconds,
     )
+    step_elapsed = step_elapsed_seconds(state)
     asyncio.create_task(
-        _fire_reverify_after_delay(run_id, tenant_id, state["verification_config"], remaining_seconds, trace_id, target)
+        _fire_reverify_after_delay(
+            run_id, tenant_id, state["verification_config"], remaining_seconds, trace_id, target,
+            elapsed_seconds=step_elapsed,
+        )
     )
 
 
@@ -161,6 +165,7 @@ async def _fire_reverify_after_delay(
     delay_seconds: float,
     trace_id: str | None,
     target: dict | None = None,
+    elapsed_seconds: float | None = None,
 ) -> None:
     """
     Fire-and-forget background task (never blocks verdict handling for the
@@ -172,13 +177,17 @@ async def _fire_reverify_after_delay(
     try:
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
+        # CloudWatch metrics have a minimum 60s period and slight propagation lag.
+        # When delay_seconds is small (e.g. 1s retry), querying 1s returns 0 samples.
+        # Ensure we evaluate over at least 180s so real request volume and latency datapoints are seen.
+        eval_window = max(elapsed_seconds or delay_seconds, 180.0)
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{PIPELINE_WORKER_URL}/pipelines/{run_id}/reverify",
                 json={
                     "tenant_id": tenant_id,
                     "verification_config": verification_config,
-                    "elapsed_seconds": delay_seconds,
+                    "elapsed_seconds": eval_window,
                     "trace_id": trace_id,
                     # CloudWatch telemetry (P1, 2026-09-16) — an AWS ECS
                     # project's SECOND-and-later verdicts need the same real

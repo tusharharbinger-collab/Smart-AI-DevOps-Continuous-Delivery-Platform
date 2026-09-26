@@ -262,3 +262,230 @@ def test_genuinely_unsupported_repo_reports_a_clear_actionable_reason():
 def test_empty_repo_is_unsupported_not_a_crash():
     result = detect_build_method([])
     assert result.method == "unsupported"
+
+
+# ─────────────── Infra-signal inference (AI_AGENTIC_ORCHESTRATION_PLAN.md §2.2) ───────────────
+#
+# Feeds the Requirements Form pre-fill for the AI infra-generation flow —
+# these signals are inferred from the SAME already-fetched package.json/
+# requirements.txt content used for build detection, never a new fetch.
+
+
+def test_no_package_manifest_content_means_no_infra_signals():
+    result = detect_build_method(["Dockerfile"])
+    assert result.infra_signals is not None
+    assert result.infra_signals.needs_database is False
+    assert result.infra_signals.needs_cache is False
+    assert result.infra_signals.needs_object_storage is False
+    assert result.infra_signals.database_hint is None
+
+
+def test_node_postgres_dependency_detected_as_database_need():
+    result = detect_build_method(
+        ["package.json"],
+        package_json_content={"dependencies": {"pg": "^8.11.0"}, "scripts": {"start": "node index.js"}},
+    )
+    assert result.infra_signals.needs_database is True
+    assert result.infra_signals.database_hint == "pg"
+
+
+def test_node_ioredis_dependency_detected_as_cache_need():
+    result = detect_build_method(
+        ["package.json"],
+        package_json_content={"dependencies": {"ioredis": "^5.0.0"}, "scripts": {"start": "node index.js"}},
+    )
+    assert result.infra_signals.needs_cache is True
+    assert result.infra_signals.cache_hint == "ioredis"
+
+
+def test_node_s3_sdk_dependency_detected_as_storage_need():
+    result = detect_build_method(
+        ["package.json"],
+        package_json_content={
+            "dependencies": {"@aws-sdk/client-s3": "^3.0.0"},
+            "scripts": {"start": "node index.js"},
+        },
+    )
+    assert result.infra_signals.needs_object_storage is True
+    assert result.infra_signals.storage_hint == "@aws-sdk/client-s3"
+
+
+def test_python_psycopg2_in_requirements_detected_as_database_need():
+    result = detect_build_method(
+        ["requirements.txt", "main.py"],
+        requirements_txt_content="fastapi==0.110.0\npsycopg2-binary==2.9.9\nuvicorn>=0.29\n",
+    )
+    assert result.infra_signals.needs_database is True
+    assert result.infra_signals.database_hint == "psycopg2-binary"
+
+
+def test_python_redis_in_requirements_detected_as_cache_need():
+    result = detect_build_method(
+        ["requirements.txt", "main.py"],
+        requirements_txt_content="redis==5.0.1\n",
+    )
+    assert result.infra_signals.needs_cache is True
+    assert result.infra_signals.cache_hint == "redis"
+
+
+def test_python_boto3_in_requirements_detected_as_storage_need():
+    result = detect_build_method(
+        ["requirements.txt", "main.py"],
+        requirements_txt_content="boto3==1.34.0\n",
+    )
+    assert result.infra_signals.needs_object_storage is True
+    assert result.infra_signals.storage_hint == "boto3"
+
+
+def test_requirements_txt_comments_and_git_urls_are_skipped_not_misparsed():
+    result = detect_build_method(
+        ["requirements.txt", "main.py"],
+        requirements_txt_content="# a comment\n\n-e .\ngit+https://github.com/example/pkg.git\nboto3==1.34.0\n",
+    )
+    assert result.infra_signals.needs_object_storage is True
+    assert result.infra_signals.storage_hint == "boto3"
+
+
+def test_infra_signals_computed_regardless_of_build_method():
+    # Real gap this guards against: infra needs shouldn't disappear just
+    # because a Dockerfile was found and the build-method branch returns
+    # early — a Python app in a Dockerfile still needs its real database.
+    result = detect_build_method(
+        ["Dockerfile", "requirements.txt"],
+        requirements_txt_content="psycopg2-binary==2.9.9\n",
+    )
+    assert result.method == "dockerfile"
+    assert result.infra_signals.needs_database is True
+
+
+def test_static_site_is_flagged_as_static_with_no_infra_needs_by_default():
+    result = detect_build_method(["index.html"])
+    assert result.infra_signals.is_static_site is True
+    assert result.infra_signals.needs_database is False
+
+
+def test_vite_spa_is_flagged_as_static_site():
+    result = detect_build_method(
+        ["package.json"], package_json_content={"devDependencies": {"vite": "^5.0.0"}, "scripts": {"build": "vite build"}}
+    )
+    assert result.infra_signals.is_static_site is True
+
+
+def test_plain_node_server_is_not_flagged_as_static_site():
+    result = detect_build_method(
+        ["package.json"], package_json_content={"dependencies": {"express": "^4.0.0"}, "scripts": {"start": "node index.js"}}
+    )
+    assert result.infra_signals.is_static_site is False
+
+
+def test_a_repo_with_no_db_cache_or_storage_dependency_has_all_signals_false():
+    result = detect_build_method(
+        ["package.json"],
+        package_json_content={"dependencies": {"express": "^4.0.0", "lodash": "^4.17.21"}, "scripts": {"start": "node index.js"}},
+    )
+    assert result.infra_signals.needs_database is False
+    assert result.infra_signals.needs_cache is False
+    assert result.infra_signals.needs_object_storage is False
+
+
+# ─────────────── Golden-path archetype matching (AI_AGENTIC_ORCHESTRATION_PLAN.md §2.3) ───────────────
+
+
+def test_bare_static_site_matches_static_site_archetype():
+    result = detect_build_method(["index.html"])
+    assert result.archetype == "static_site"
+
+
+def test_vite_spa_matches_static_site_archetype():
+    result = detect_build_method(
+        ["package.json"], package_json_content={"devDependencies": {"vite": "^5.0.0"}, "scripts": {"build": "vite build"}}
+    )
+    assert result.archetype == "static_site"
+
+
+def test_plain_web_service_with_no_db_matches_stateless_web_service():
+    result = detect_build_method(
+        ["package.json"], package_json_content={"dependencies": {"express": "^4.0.0"}, "scripts": {"start": "node index.js"}}
+    )
+    assert result.archetype == "stateless_web_service"
+
+
+def test_service_with_database_dependency_matches_web_service_with_database():
+    result = detect_build_method(
+        ["requirements.txt", "main.py"],
+        requirements_txt_content="psycopg2-binary==2.9.9\n",
+    )
+    assert result.archetype == "web_service_with_database"
+
+
+def test_service_with_database_and_cache_matches_the_combined_archetype():
+    result = detect_build_method(
+        ["package.json"],
+        package_json_content={"dependencies": {"pg": "^8.0.0", "ioredis": "^5.0.0"}, "scripts": {"start": "node index.js"}},
+    )
+    assert result.archetype == "web_service_with_database_and_cache"
+
+
+def test_cache_only_with_no_database_does_not_get_the_combined_archetype():
+    result = detect_build_method(
+        ["package.json"],
+        package_json_content={"dependencies": {"ioredis": "^5.0.0"}, "scripts": {"start": "node index.js"}},
+    )
+    assert result.archetype == "stateless_web_service"
+
+
+def test_multiple_dockerfiles_match_multi_service_archetype():
+    result = detect_build_method(["Dockerfile", "worker/Dockerfile"])
+    assert result.archetype == "multi_service"
+
+
+def test_compose_file_matches_multi_service_archetype():
+    result = detect_build_method(["docker-compose.yml", "package.json"], package_json_content={"scripts": {"start": "node index.js"}})
+    assert result.archetype == "multi_service"
+
+
+def test_single_dockerfile_does_not_trigger_multi_service():
+    result = detect_build_method(["Dockerfile"])
+    assert result.archetype != "multi_service"
+
+
+def test_procfile_with_only_worker_process_matches_background_worker():
+    result = detect_build_method(
+        ["Procfile", "requirements.txt"],
+        requirements_txt_content="celery==5.3.0\n",
+        procfile_content="worker: celery -A tasks worker\n",
+    )
+    assert result.archetype == "background_worker"
+
+
+def test_procfile_with_web_and_worker_processes_is_not_a_pure_worker():
+    # A repo that declares BOTH a web and a worker process is a web service
+    # that also runs a worker — not the pure "background_worker" archetype.
+    result = detect_build_method(
+        ["Procfile", "package.json"],
+        package_json_content={"scripts": {"start": "node index.js"}},
+        procfile_content="web: node index.js\nworker: node worker.js\n",
+    )
+    assert result.archetype != "background_worker"
+
+
+def test_procfile_with_only_web_process_is_not_a_worker():
+    result = detect_build_method(
+        ["Procfile", "package.json"],
+        package_json_content={"scripts": {"start": "node index.js"}},
+        procfile_content="web: node index.js\n",
+    )
+    assert result.archetype != "background_worker"
+
+
+def test_multi_service_takes_priority_over_database_signal():
+    result = detect_build_method(
+        ["Dockerfile", "worker/Dockerfile", "requirements.txt"],
+        requirements_txt_content="psycopg2-binary==2.9.9\n",
+    )
+    assert result.archetype == "multi_service"
+
+
+def test_no_procfile_means_no_worker_misdetection():
+    result = detect_build_method(["package.json"], package_json_content={"scripts": {"start": "node index.js"}})
+    assert result.archetype != "background_worker"

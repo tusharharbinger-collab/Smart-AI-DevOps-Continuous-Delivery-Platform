@@ -64,6 +64,202 @@ TEST_CONFIG_SIGNALS: list[str] = [
 # per candidate folder is needed.
 STATIC_INDEX_FILENAME = "index.html"
 
+# Infra-need signals — same discipline as everything else in this module:
+# a real dependency name in a real manifest, never a guess. These drive the
+# AI infra-generation flow's Requirements Form pre-fill (see
+# AI_AGENTIC_ORCHESTRATION_PLAN.md §2.2) — the point is to hand that flow a
+# real signal instead of it starting from a blank form, not to be
+# exhaustive. `redis`/`ioredis` deliberately excluded from
+# NODE_DB_PACKAGES/PYTHON_DB_PACKAGES (they're cache clients, not database
+# clients) even though Redis is technically a database — this module treats
+# it as the cache category since that's how every golden-path archetype in
+# the orchestration plan uses it.
+NODE_DB_PACKAGES: frozenset[str] = frozenset(
+    {"pg", "mysql2", "mysql", "mongoose", "mongodb", "sequelize", "typeorm", "prisma", "knex"}
+)
+NODE_CACHE_PACKAGES: frozenset[str] = frozenset({"redis", "ioredis", "memcached"})
+NODE_STORAGE_PACKAGES: frozenset[str] = frozenset(
+    {"@aws-sdk/client-s3", "aws-sdk", "minio", "@google-cloud/storage"}
+)
+
+PYTHON_DB_PACKAGES: frozenset[str] = frozenset(
+    {"psycopg2", "psycopg2-binary", "asyncpg", "pymongo", "sqlalchemy", "django", "mysqlclient", "pymysql"}
+)
+PYTHON_CACHE_PACKAGES: frozenset[str] = frozenset({"redis", "aioredis", "python-memcached", "pymemcache"})
+PYTHON_STORAGE_PACKAGES: frozenset[str] = frozenset({"boto3", "minio", "google-cloud-storage"})
+
+
+@dataclass
+class InfraSignals:
+    """
+    Pure file-signature inference of what a repo's DEPLOYMENT likely needs —
+    database/cache/object storage, and whether it produces static output
+    only (no running process) — as opposed to BuildDetection's "how do we
+    build it" question. Same "never guess beyond a real signal" rule: a
+    False here means no matching dependency was found, not "confirmed not
+    needed" — the Requirements Form (AI_AGENTIC_ORCHESTRATION_PLAN.md §2.5)
+    always shows these as pre-filled-but-editable, never locked.
+    """
+    needs_database: bool = False
+    database_hint: str | None = None  # the actual dependency name matched, for transparency in the UI
+    needs_cache: bool = False
+    cache_hint: str | None = None
+    needs_object_storage: bool = False
+    storage_hint: str | None = None
+    # True when detect_build_method resolved to "static" (bare index.html)
+    # or framework "spa" (Vite/CRA) — both produce build output served by
+    # nginx with no running application process, the deciding signal for
+    # the "static site" golden-path archetype vs. "stateless web service".
+    is_static_site: bool = False
+
+
+def _parse_requirements_txt_names(requirements_txt_content: str) -> set[str]:
+    """
+    requirements.txt has no structured parser in the stdlib worth pulling in
+    for this — one package name per line, optionally followed by a version
+    specifier (==, >=, <=, ~=, !=, <, >), an extras marker ([extra]), or an
+    environment marker (; python_version...). Comments (#) and blank lines
+    are skipped. Deliberately permissive (a line this doesn't parse cleanly
+    is just dropped, never raises) since this is an inference aid, not a
+    dependency resolver.
+    """
+    import re
+
+    names: set[str] = set()
+    for raw_line in requirements_txt_content.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith(("-", "git+", "http://", "https://")):
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+)", line)
+        if match:
+            names.add(match.group(1).lower())
+    return names
+
+
+def detect_infra_signals(
+    package_json_content: dict | None,
+    requirements_txt_content: str | None,
+    detection: "BuildDetection",
+) -> InfraSignals:
+    """
+    Reuses the exact package.json/requirements.txt content already fetched
+    for detect_build_method — no new network calls, no re-parsing beyond
+    what dependency names are present. `detection` is only consulted for
+    `language`/`framework` (to decide `is_static_site`), never for infra
+    inference — a Python or Node app's infra needs come from its own
+    dependency manifest, not from which language it's written in.
+    """
+    signals = InfraSignals(
+        is_static_site=(detection.language == "static" or detection.framework == "spa"),
+    )
+
+    if package_json_content:
+        deps = {
+            **(package_json_content.get("dependencies") or {}),
+            **(package_json_content.get("devDependencies") or {}),
+        }
+        dep_names = {name.lower() for name in deps}
+        if hit := next((n for n in NODE_DB_PACKAGES if n in dep_names), None):
+            signals.needs_database, signals.database_hint = True, hit
+        if hit := next((n for n in NODE_CACHE_PACKAGES if n in dep_names), None):
+            signals.needs_cache, signals.cache_hint = True, hit
+        if hit := next((n for n in NODE_STORAGE_PACKAGES if n in dep_names), None):
+            signals.needs_object_storage, signals.storage_hint = True, hit
+
+    if requirements_txt_content:
+        req_names = _parse_requirements_txt_names(requirements_txt_content)
+        if hit := next((n for n in PYTHON_DB_PACKAGES if n in req_names), None):
+            signals.needs_database, signals.database_hint = True, hit
+        if hit := next((n for n in PYTHON_CACHE_PACKAGES if n in req_names), None):
+            signals.needs_cache, signals.cache_hint = True, hit
+        if hit := next((n for n in PYTHON_STORAGE_PACKAGES if n in req_names), None):
+            signals.needs_object_storage, signals.storage_hint = True, hit
+
+    return signals
+
+
+# ─────────────── Golden-path archetype matching (AI_AGENTIC_ORCHESTRATION_PLAN.md §2.3) ───────────────
+#
+# Bounds what the (future, not-yet-built) Infra Architect Agent is asked to
+# generate — it parameterizes ONE of these six known-good shapes, never
+# invents a topology freehand. Matching happens here, off the same real
+# signals as everything else in this module (infra_signals, Dockerfile
+# count, an actual Procfile process-type line) — never a guess about scale
+# or traffic, which is exactly what the Requirements Form (§2.5) exists to
+# ask the human instead.
+ARCHETYPE_STATIC_SITE = "static_site"
+ARCHETYPE_STATELESS_WEB_SERVICE = "stateless_web_service"
+ARCHETYPE_WEB_SERVICE_WITH_DATABASE = "web_service_with_database"
+ARCHETYPE_WEB_SERVICE_WITH_DATABASE_AND_CACHE = "web_service_with_database_and_cache"
+ARCHETYPE_BACKGROUND_WORKER = "background_worker"
+ARCHETYPE_MULTI_SERVICE = "multi_service"
+
+PROCFILE_NAME = "Procfile"
+COMPOSE_FILENAMES = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+
+
+def _parse_procfile_process_types(procfile_content: str) -> set[str]:
+    """
+    Heroku's own Procfile convention (also what Railway's Nixpacks/Railpack
+    reads, per this platform's own industry research) — one line per
+    process type: `<type>: <command>`. Used ONLY to tell a "web" process
+    apart from a "worker"/"clock"/queue-consumer process — a real signal a
+    human wrote, never inferred from the command text itself.
+    """
+    types: set[str] = set()
+    for raw_line in procfile_content.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        process_type = line.split(":", 1)[0].strip().lower()
+        if process_type:
+            types.add(process_type)
+    return types
+
+
+def match_golden_path_archetype(
+    detection: "BuildDetection",
+    file_paths: list[str],
+    procfile_content: str | None = None,
+) -> str:
+    """
+    Precedence, highest first — matches §2.3's table:
+      1. multi_service   — more than one Dockerfile, or a compose file present.
+                            Overrides everything else since it changes the whole
+                            topology shape (multiple target groups), regardless
+                            of what any single service inside it needs.
+      2. background_worker — a real Procfile with a non-"web" process type and
+                            no "web" process type at all (a repo declaring
+                            BOTH is a web app that also runs a worker process,
+                            which is exactly a stateless/db web service, not a
+                            pure worker).
+      3. static_site      — detect_infra_signals already decided this from
+                            language=="static" or framework=="spa".
+      4. web_service_with_database_and_cache / _with_database / stateless —
+                            purely from infra_signals' real dependency hits.
+    No branch here ever fires without a concrete signal — the fallback is
+    always the least-assuming archetype (stateless_web_service), never a
+    guess at something fancier.
+    """
+    if len(_find_candidates(file_paths, DOCKERFILE_NAMES)) > 1 or _find_candidates(file_paths, COMPOSE_FILENAMES):
+        return ARCHETYPE_MULTI_SERVICE
+
+    if procfile_content:
+        process_types = _parse_procfile_process_types(procfile_content)
+        if process_types and "web" not in process_types:
+            return ARCHETYPE_BACKGROUND_WORKER
+
+    signals = detection.infra_signals
+    if signals and signals.is_static_site:
+        return ARCHETYPE_STATIC_SITE
+    if signals and signals.needs_database and signals.needs_cache:
+        return ARCHETYPE_WEB_SERVICE_WITH_DATABASE_AND_CACHE
+    if signals and signals.needs_database:
+        return ARCHETYPE_WEB_SERVICE_WITH_DATABASE
+
+    return ARCHETYPE_STATELESS_WEB_SERVICE
+
+
 DOCKERFILE_NAMES = {"Dockerfile", "dockerfile"}
 # Checked BEFORE Dockerfile/language-manifest detection — an explicit human
 # declaration always outranks an inference. Schema (see parse_yaml_manifest):
@@ -107,6 +303,12 @@ class BuildDetection:
     # anything that acts on it yet. Keeping it here now means the schema
     # doesn't change shape later just because deployment work starts.
     deploy_config: dict | None = None
+    # Populated by the detect_build_method wrapper below, after the method/
+    # language/framework decision is final — infra needs are inferred from
+    # the SAME already-fetched manifest content, never a separate fetch.
+    infra_signals: InfraSignals | None = None
+    # One of the ARCHETYPE_* constants — see match_golden_path_archetype.
+    archetype: str | None = None
 
 
 class YamlManifestError(Exception):
@@ -242,6 +444,8 @@ def detect_build_method(
     package_json_content: dict | None = None,
     yaml_manifest_content: str | None = None,
     yaml_manifest_path: str | None = None,
+    requirements_txt_content: str | None = None,
+    procfile_content: str | None = None,
 ) -> BuildDetection:
     """
     `file_paths`: every file path in the repo (or repo subtree), forward-
@@ -258,7 +462,28 @@ def detect_build_method(
     (e.g. "nodocker/smartcd.yaml") — used only to resolve a language
     runtime's real manifest location (see `_resolve_manifest_path`), never
     to change WHICH build method is chosen.
+    `requirements_txt_content`: raw text of a found requirements.txt, if
+    any — used ONLY for infra-signal inference (see `detect_infra_signals`);
+    never read for build-method/language decisions, which stay existence-
+    only for requirements.txt as they always have been.
+    `procfile_content`: raw text of a found Procfile, if any — used ONLY for
+    golden-path archetype matching (see `match_golden_path_archetype`),
+    specifically to tell a "web" process apart from a "worker" one.
     """
+    detection = _detect_build_method_core(
+        file_paths, package_json_content, yaml_manifest_content, yaml_manifest_path
+    )
+    detection.infra_signals = detect_infra_signals(package_json_content, requirements_txt_content, detection)
+    detection.archetype = match_golden_path_archetype(detection, file_paths, procfile_content)
+    return detection
+
+
+def _detect_build_method_core(
+    file_paths: list[str],
+    package_json_content: dict | None = None,
+    yaml_manifest_content: str | None = None,
+    yaml_manifest_path: str | None = None,
+) -> BuildDetection:
     if yaml_manifest_content is not None:
         try:
             detection = parse_yaml_manifest(yaml_manifest_content)

@@ -338,7 +338,7 @@ async def handle_incoming_verdict(
     )
 
     if not opa_result["allow_action"] and not failsafe_rollback_override:
-        if verdict.get("status") == "HEALTHY" and active_step and rollout_state is not None:
+        if verdict.get("status") in ("HEALTHY", "DEGRADED") and active_step and rollout_state is not None:
             # Real gap found live: a pipeline with no separate deploy/wait
             # stage (canary_verify runs immediately after registration —
             # true of every project the onboarding wizard generates, and
@@ -359,8 +359,9 @@ async def handle_incoming_verdict(
             remaining_duration = active_step["minDurationSeconds"] - promotion_fields["active_step_duration_seconds"]
             remaining_samples = active_step["minSampleSize"] - promotion_fields["active_step_sample_count"]
             if remaining_duration > 0 or remaining_samples > 0:
+                retry_delay = remaining_duration if remaining_duration > 0 else 15.0
                 await rollout_scheduler.schedule_retry_of_current_step(
-                    pipeline_run_id, target.get("tenant_id"), rollout_state, max(remaining_duration, 1.0),
+                    pipeline_run_id, target.get("tenant_id"), rollout_state, retry_delay,
                     target=target,
                 )
                 logger.info(

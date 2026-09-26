@@ -111,6 +111,29 @@ class PipelineWorkerDB:
                     datetime.fromisoformat(state.last_updated),
                 )
 
+    async def save_stage_log(self, run_id: str, tenant_id: str, stage_name: str, content: str) -> None:
+        """
+        One row per log line — `stage_logs` (db/schema.sql) existed since
+        Phase 8 with the right schema/RLS but nothing ever wrote to it, so
+        `logs:{run_id}`'s 24h Redis TTL was the only place a run's log ever
+        lived. Same RLS discipline as `save_execution_state`: write through
+        the app_user pool with this run's own tenant context set for the
+        transaction.
+        """
+        async with self._app_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.active_tenant_id', $1, true)", tenant_id)
+                await conn.execute(
+                    """
+                    INSERT INTO stage_logs (run_id, tenant_id, stage_name, content)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    run_id,
+                    tenant_id,
+                    stage_name,
+                    content,
+                )
+
     async def get_interrupted_pipelines(self, staleness_seconds: int = 120) -> list[dict]:
         """Cross-tenant by design — see module docstring."""
         async with self._superuser_pool.acquire() as conn:

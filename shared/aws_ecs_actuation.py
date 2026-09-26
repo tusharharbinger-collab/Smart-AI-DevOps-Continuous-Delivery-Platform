@@ -62,9 +62,9 @@ def register_task_definition(
                 # the container so synthesized nginx/static containers can strip
                 # it internally via alias.
                 "environment": [
-                    {"name": "DEPLOYMENT_COHORT", "value": cohort},
-                    {"name": "APP_VERSION", "value": app_version},
-                    {"name": "PATH_PREFIX", "value": path_prefix or ""},
+                    {"name": "DEPLOYMENT_COHORT", "value": str(cohort if cohort is not None else "")},
+                    {"name": "APP_VERSION", "value": str(app_version if app_version is not None else "")},
+                    {"name": "PATH_PREFIX", "value": str(path_prefix if path_prefix is not None else "")},
                     # Real gap found live (2026-09-18): a project declares its
                     # real listen port in the wizard, and that port is
                     # already used to configure the ALB target group's
@@ -156,8 +156,18 @@ def set_traffic_weights(region: str, service_name: str, path_prefix: str, baseli
         raise RuntimeError("Shared ALB has no HTTP:80 listener.")
 
     rules = elbv2.describe_rules(ListenerArn=listener["ListenerArn"])["Rules"]
+    clean = path_prefix.rstrip("/")
     rule = next(
-        (r for r in rules if r.get("Conditions") and r["Conditions"][0].get("Values") == [f"{path_prefix}*"]),
+        (
+            r
+            for r in rules
+            if r.get("Conditions")
+            and (
+                r["Conditions"][0].get("Values") == [clean, f"{clean}/*"]
+                or r["Conditions"][0].get("Values") == [f"{clean}*"]
+                or clean in r["Conditions"][0].get("Values", [])
+            )
+        ),
         None,
     )
     if not rule:

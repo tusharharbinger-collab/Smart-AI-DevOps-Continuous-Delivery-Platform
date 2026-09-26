@@ -59,6 +59,15 @@ from src.aws.ecs_onboarding import (
     deprovision_ecs_service,
 )
 from src.build_preview import run_build_preview
+from shared.provisioning.aws_session import ConnectionError_ as AwsConnectionError, platform_account_id as aws_platform_account_id, verify_connection as aws_verify_connection
+from shared.provisioning.aws_pricing import estimate_for_region as aws_estimate_cost
+from shared.provisioning.aws_discovery import describe_selected as aws_describe_selected, discover_existing as aws_discover_existing
+from shared.provisioning.aws_cloudformation import (
+    check_status as cfn_check_status,
+    fetch_failure_events as cfn_fetch_failure_events,
+    execute_changes as cfn_execute_changes,
+    preview_changes as cfn_preview_changes,
+)
 
 logger = structlog.get_logger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -607,6 +616,189 @@ async def deprovision_service_aws_now(body: dict):
         raise HTTPException(status_code=502, detail=f"AWS ECS deprovisioning failed: {e}")
 
     return result
+
+
+@app.post("/infra-provisioning/change-set")
+async def create_infra_change_set(body: dict):
+    """
+    Phase 7 (AI_INFRA_PROVISIONING_EXECUTION_PLAN.md) — real, zero-risk
+    preview of what the Infra Architect Agent's approved proposal would
+    actually create. `create_change_set` never modifies any resource; it
+    only computes a diff. Called by api-gateway after a draft reaches
+    INFRA_APPROVED, before any human sees an "execute" button at all.
+    """
+    try:
+        template_body = body["template_body"]
+        draft_id = body["draft_id"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+
+    connection = _connection_from(body)  # validated BEFORE the try: a bad connection is a 422, not a "502 preview failed"
+    try:
+        result = await asyncio.to_thread(
+            cfn_preview_changes, template_body, draft_id, body.get("region", "us-east-1"),
+            bool(body.get("import_existing", False)), body.get("stack_name") or None, connection,
+        )
+    except Exception as e:
+        logger.error("cfn_preview_failed", draft_id=draft_id, error=str(e))
+        raise HTTPException(status_code=502, detail=f"CloudFormation change-set preview failed: {e}")
+
+    return {
+        "change_set_id": result.change_set_id,
+        "stack_name": result.stack_name,
+        "stack_id": result.stack_id,
+        "status": result.status,
+        "status_reason": result.status_reason,
+        "changes": [
+            {"action": c.action, "logical_id": c.logical_id, "resource_type": c.resource_type}
+            for c in result.changes
+        ],
+    }
+
+
+@app.get("/infra-provisioning/discover-existing")
+async def discover_existing_infra(archetype: str, region: str = "us-east-1"):
+    """AI_INFRA_IMPORT_AND_PROMPT_EDIT_PLAN.md Phase B — read-only picklist of existing AWS
+    resources for the slots this archetype needs. No AI call, no writes."""
+    return await asyncio.to_thread(aws_discover_existing, archetype, region)
+
+
+@app.post("/infra-provisioning/discover-existing")
+async def discover_existing_infra_for_connection(body: dict):
+    """Discovery inside a tenant-owned AWS account (the ExternalId must not travel in a URL)."""
+    try:
+        archetype = body["archetype"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+    try:
+        return await asyncio.to_thread(aws_discover_existing, archetype, body.get("region", "us-east-1"), _connection_from(body))
+    except AwsConnectionError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/infra-provisioning/describe-existing")
+async def describe_existing_infra(body: dict):
+    """Re-verifies a human's picks ({slot: identifier}) against AWS and returns their REAL
+    configuration — the client is never trusted for what an imported resource actually is."""
+    try:
+        selection, archetype = body["selection"], body["archetype"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+    try:
+        return await asyncio.to_thread(
+            aws_describe_selected, selection, archetype, body.get("region", "us-east-1"), _connection_from(body)
+        )
+    except (ValueError, AwsConnectionError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+def _connection_from(body: dict) -> dict | None:
+    """The optional {"role_arn", "external_id"} the gateway forwards for a tenant-owned AWS account."""
+    conn = body.get("connection")
+    if not conn:
+        return None
+    if not isinstance(conn, dict) or not conn.get("role_arn") or not conn.get("external_id"):
+        raise HTTPException(status_code=422, detail="connection must include role_arn and external_id")
+    return {"role_arn": conn["role_arn"], "external_id": conn["external_id"]}
+
+
+@app.get("/aws-connections/platform-identity")
+async def aws_platform_identity():
+    """The platform's own AWS account id - what a customer's role trust policy must name."""
+    return {"account_id": await asyncio.to_thread(aws_platform_account_id)}
+
+
+@app.post("/aws-connections/verify")
+async def verify_aws_connection(body: dict):
+    """Backlog #3 - really assumes the customer's role with the connection's ExternalId (sts:AssumeRole)."""
+    try:
+        role_arn, external_id = body["role_arn"], body["external_id"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+    try:
+        return await asyncio.to_thread(aws_verify_connection, role_arn, external_id)
+    except (ValueError, AwsConnectionError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/infra-provisioning/estimate-cost")
+async def estimate_infra_cost(body: dict):
+    """Phase 7e - independent monthly cost of a CloudFormation template from AWS's own Price List API
+    (never the model's own estimate). Unsupported resource types come back as `unpriced`, not $0."""
+    try:
+        template = body["template"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+    if not isinstance(template, dict):
+        raise HTTPException(status_code=422, detail="template must be a parsed CloudFormation template object")
+    return await asyncio.to_thread(aws_estimate_cost, template, body.get("region", "us-east-1"))
+
+
+@app.post("/infra-provisioning/execute")
+async def execute_infra_change_set(body: dict):
+    """
+    The one call in this whole chain that actually creates/modifies real
+    AWS resources — only ever reached after a human has seen the real
+    preview from create_infra_change_set above and explicitly approved
+    executing it (api-gateway's own second, distinct approval gate).
+    """
+    try:
+        change_set_id = body["change_set_id"]
+        stack_name = body["stack_name"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+
+    connection = _connection_from(body)
+    try:
+        result = await asyncio.to_thread(
+            cfn_execute_changes, change_set_id, stack_name, body.get("region", "us-east-1"), connection
+        )
+    except Exception as e:
+        logger.error("cfn_execute_failed", stack_name=stack_name, error=str(e))
+        raise HTTPException(status_code=502, detail=f"CloudFormation execute failed: {e}")
+
+    return {"stack_id": result.stack_id, "status": result.status}
+
+
+@app.get("/infra-provisioning/status")
+async def get_infra_provisioning_status(stack_name: str, region: str = "us-east-1"):
+    """Polled by api-gateway (and, through it, the frontend) after execute — CloudFormation
+    provisioning is asynchronous and can take anywhere from seconds to several minutes."""
+    return await _status_response(stack_name, region, None)
+
+
+@app.post("/infra-provisioning/status")
+async def post_infra_provisioning_status(body: dict):
+    """Same as the GET, for a tenant-owned AWS account: the ExternalId must not travel in a URL."""
+    try:
+        stack_name = body["stack_name"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+    return await _status_response(stack_name, body.get("region", "us-east-1"), _connection_from(body))
+
+
+async def _status_response(stack_name: str, region: str, connection: dict | None):
+    result = await asyncio.to_thread(cfn_check_status, stack_name, region, connection)
+    return {
+        "status": result.status,
+        "is_terminal": result.is_terminal,
+        "succeeded": result.succeeded,
+        "outputs": result.outputs,
+        "status_reason": result.status_reason,
+    }
+
+
+@app.post("/infra-provisioning/failure-events")
+async def post_infra_failure_events(body: dict):
+    """Real CloudFormation stack events for a failed draft (backlog #4). Tenant-account aware; never raises."""
+    try:
+        stack_name = body["stack_name"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+    events = await asyncio.to_thread(
+        cfn_fetch_failure_events, stack_name, body.get("region", "us-east-1"), _connection_from(body)
+    )
+    return {"events": events}
 
 
 @app.post("/pipelines/start")

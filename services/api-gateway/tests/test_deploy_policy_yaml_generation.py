@@ -273,3 +273,14 @@ def test_plain_node_server_build_config_is_unaffected_by_the_static_spa_change()
     assert cfg["language"] == "node"
     assert cfg["startCommand"] == "npm start"
     assert "framework" not in cfg
+
+
+def test_auto_graduate_omits_manual_approval_at_100_step():
+    req = _base_request(auto_graduate=True)
+    gates = _gates(req)
+    assert gates["manualApprovalRequired"]["beforeStages"] == []
+    doc = _render(req)
+    canary_stage = next(s for s in doc["spec"]["stages"] if s["name"] == "canary_verify")
+    steps = canary_stage["config"]["steps"]
+    final_step = next(s for s in steps if s["trafficWeight"] == 100)
+    assert "requiresManualApproval" not in final_step

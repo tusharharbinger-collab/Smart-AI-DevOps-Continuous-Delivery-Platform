@@ -46,7 +46,7 @@ class FakeRequest:
         self.state = type("S", (), {"tenant_id": tenant_id})()
 
 
-def _row(cost_id, run_id, baseline, canary, delta, rec=None):
+def _row(cost_id, run_id, baseline, canary, delta, rec=None, verification_evidence=None):
     return {
         "cost_id": cost_id,
         "pipeline_run_id": run_id,
@@ -58,6 +58,7 @@ def _row(cost_id, run_id, baseline, canary, delta, rec=None):
         "trigger_type": "GITHUB_PUSH",
         "commit_sha": "abc123",
         "commit_message": "fix: bug",
+        "verification_evidence": verification_evidence,
     }
 
 
@@ -143,3 +144,53 @@ def test_empty_history_returns_empty_list_and_zero_totals(monkeypatch):
     )
 
     assert result == {"cost_history": [], "total_baseline_cost": 0.0, "total_canary_cost": 0.0}
+    
+
+def test_insufficient_samples_sets_performance_correlation_status(monkeypatch):
+    async def fake_load_project(db, project_id, tenant_id):
+        return {"pipeline_id": "pipe-1"}
+
+    monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
+    monkeypatch.setattr(projects_router, "_get_tenant_id", lambda request: "tenant-1")
+
+    evidence = {
+        "testing_p95_latency_seconds": {"note": "insufficient samples", "test": "Mann-Whitney U"}
+    }
+    rows = [_row("cost-1", "run-1", 1.0, 1.0, 0.0, verification_evidence=evidence)]
+    result = asyncio.run(
+        projects_router.get_project_cost_history("proj-1", FakeRequest(), db=FakeDB(rows))
+    )
+
+    perf = result["cost_history"][0]["performance_correlation"]
+    assert perf is not None
+    assert perf["status"] == "insufficient_samples"
+    assert perf["latency_delta_percent"] is None
+    assert "Awaiting traffic" in perf["detail"]
+
+
+def test_valid_mann_whitney_calculates_latency_delta(monkeypatch):
+    async def fake_load_project(db, project_id, tenant_id):
+        return {"pipeline_id": "pipe-1"}
+
+    monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
+    monkeypatch.setattr(projects_router, "_get_tenant_id", lambda request: "tenant-1")
+
+    evidence = {
+        "testing_p95_latency_seconds": {
+            "mann_whitney": {
+                "baseline_median": 0.200,
+                "canary_median": 0.160,
+                "is_actionable_regression": False,
+            }
+        }
+    }
+    rows = [_row("cost-1", "run-1", 1.0, 1.2, 20.0, verification_evidence=evidence)]
+    result = asyncio.run(
+        projects_router.get_project_cost_history("proj-1", FakeRequest(), db=FakeDB(rows))
+    )
+
+    perf = result["cost_history"][0]["performance_correlation"]
+    assert perf is not None
+    assert perf["status"] == "available"
+    assert perf["latency_delta_percent"] == -20.0
+

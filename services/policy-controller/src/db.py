@@ -160,3 +160,34 @@ class PolicyControllerDB:
                     rca_summary,
                     verdict_id,
                 )
+
+    async def get_execution_context_for_rca(self, tenant_id: str, pipeline_run_id: str) -> dict | None:
+        """
+        Reads pipeline run metadata (commit_sha, commit_message, service_name, repo_url,
+        deploy_target) under tenant RLS to enrich AI Root Cause Analysis.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.active_tenant_id', $1, true)", tenant_id)
+                row = await conn.fetchrow(
+                    """
+                    SELECT 
+                        pe.pipeline_run_id,
+                        pe.project_id,
+                        pe.commit_sha,
+                        pe.commit_message,
+                        pe.target_version,
+                        p.name as project_name,
+                        p.repo_url,
+                        p.branch,
+                        p.deploy_target,
+                        COALESCE(es.service_name, p.name) as service_name
+                    FROM pipeline_executions pe
+                    LEFT JOIN projects p ON p.project_id = pe.project_id
+                    LEFT JOIN execution_state es ON es.pipeline_run_id = pe.pipeline_run_id
+                    WHERE pe.pipeline_run_id = $1
+                    """,
+                    pipeline_run_id,
+                )
+                return dict(row) if row else None
+

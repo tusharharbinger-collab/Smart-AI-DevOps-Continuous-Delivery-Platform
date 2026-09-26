@@ -9,6 +9,7 @@ import os
 import json
 import uuid
 import asyncio
+import time
 from datetime import datetime, timezone
 import redis
 import requests
@@ -44,7 +45,7 @@ from src.aws.ecs_deploy_task import (
     graduate_blue_green_ecs,
     compute_blue_green_cost,
 )
-from shared.aws_ecs_actuation import wait_for_target_group_healthy
+from shared.aws_ecs_actuation import wait_for_target_group_healthy, set_traffic_weights
 from shared.live_url_check import verify_live_url
 from shared.live_url_builder import build_live_url
 
@@ -64,6 +65,12 @@ class PipelineOrchestrator:
         self.redis = redis_client
         self.db = db
         self.state_store = ExecutionStateStore(redis_client, db)
+        # tenant_id + current stage_name per in-flight run_id, so `_log()`
+        # can persist each line to Postgres `stage_logs` without every one
+        # of its ~25 call sites having to thread both values through
+        # individually. Populated once at the top of `start_pipeline`,
+        # updated at each stage transition, popped in its `finally`.
+        self._log_context: dict[str, dict] = {}
 
     def _log(self, run_id: str, message: str) -> None:
         """
@@ -80,6 +87,17 @@ class PipelineOrchestrator:
         it started. A list is replayable: a viewer connecting after the
         fact still sees everything, not just whatever happened to arrive
         while they were subscribed.
+
+        Real gap found live (2026-09-18): this Redis LIST has a 24h TTL
+        (below) and nothing ever wrote these lines anywhere durable —
+        `stage_logs` (db/schema.sql) has existed since Phase 8 with the
+        right schema and RLS policy, but was dead: nothing inserted into
+        it. Any run a viewer opened more than a day after it ran showed
+        "Waiting for log output…" forever, indistinguishable from a run
+        that never logged anything at all. Mirrors `save_state_sync`'s own
+        Redis-then-Postgres durability split — a transient DB error here
+        must never break the pipeline over a persistence hiccup, so it's
+        wrapped separately and never re-raised.
         """
         try:
             key = f"logs:{run_id}"
@@ -87,6 +105,17 @@ class PipelineOrchestrator:
             self.redis.expire(key, 86400)
         except Exception as e:
             logger.warning("log_append_failed", run_id=run_id, error=str(e))
+
+        if self.db:
+            ctx = self._log_context.get(run_id, {})
+            tenant_id = ctx.get("tenant_id")
+            if tenant_id:
+                try:
+                    self.db.run_from_thread(
+                        self.db.save_stage_log(run_id, tenant_id, ctx.get("stage_name", "_meta"), message)
+                    )
+                except Exception as e:
+                    logger.warning("stage_log_persist_failed", run_id=run_id, error=str(e))
 
     def _request_stage_failure_rca(self, run_id: str, failed_stage: str, error_message: str) -> None:
         """
@@ -306,6 +335,7 @@ class PipelineOrchestrator:
         run_id = pipeline_run_id or str(uuid.uuid4())
         resolved_tenant_id = tenant_id or spec.tenant_id
         service_name = spec.name
+        self._log_context[run_id] = {"tenant_id": resolved_tenant_id, "stage_name": "_meta"}
 
         self._register_actuation_target(run_id, spec, resolved_tenant_id, target_version)
 
@@ -406,6 +436,7 @@ class PipelineOrchestrator:
                 config = stage_cfg.get("config", {})
 
                 logger.info("executing_stage", run_id=run_id, stage=stage_name, stage_type=stage_type)
+                self._log_context.setdefault(run_id, {})["stage_name"] = stage_name
                 self._log(run_id, f"--- Stage: {stage_name} ({stage_type}) ---")
                 initial_state.current_stage = stage_name
                 initial_state.last_updated = datetime.now(timezone.utc).isoformat()
@@ -661,6 +692,13 @@ class PipelineOrchestrator:
                             run_id, service_name=ecs_service_name, path_prefix=path_prefix,
                             region=aws_region, pipeline_policy=blue_green_policy,
                         )
+                        # The Pipeline View's blue-green cutover panel derives its phases from these exact
+                        # lines (frontend/src/lib/blueGreenCutover.ts) - keep the wording stable.
+                        self._log(
+                            run_id,
+                            "Cutover complete — 100% of traffic is now on green; the previous (blue) version is "
+                            "still running, so rollback is instant.",
+                        )
                         # Real gap found live (2026-09-17): this whole
                         # blue-green path never wrote a single audit_ledger
                         # row — the Audit Ledger UI correctly showed "0
@@ -714,6 +752,9 @@ class PipelineOrchestrator:
                             rollback_blue_green_ecs_weights(
                                 run_id, service_name=ecs_service_name, path_prefix=path_prefix, region=aws_region,
                             )
+                            self._log(
+                                run_id, "Rolled back — 100% of traffic is back on the previous (blue) version.",
+                            )
                             if self.db:
                                 self.db.run_from_thread(
                                     self.db.record_actuation(
@@ -728,9 +769,25 @@ class PipelineOrchestrator:
                             )
 
                         self._log(run_id, "Live URL verified — graduating: promoting the new image onto baseline.")
+                        if not last_deploy_image_name or not last_deploy_image_tag:
+                            deploy_cfg = next(
+                                (s.get("config", {}) for s in spec.stages if s.get("type") == "deploy"), {}
+                            )
+                            last_deploy_image_name = last_deploy_image_name or deploy_cfg.get("image")
+                            last_deploy_image_tag = (
+                                last_deploy_image_tag
+                                or deploy_cfg.get("imageTag")
+                                or getattr(initial_state, "target_version", None)
+                                or "latest"
+                            )
                         graduate_blue_green_ecs(
                             run_id, service_name=ecs_service_name, image=last_deploy_image_name,
                             image_tag=last_deploy_image_tag, path_prefix=path_prefix, region=aws_region,
+                        )
+                        self._log(
+                            run_id,
+                            "Graduation complete — baseline now runs the new version, traffic is back on baseline, "
+                            "and green has been scaled to zero.",
                         )
                         if self.db:
                             self.db.run_from_thread(
@@ -902,7 +959,31 @@ class PipelineOrchestrator:
                     else:
                         steps = config.get("steps", [])
                         rollout_res = run_rollout_task(run_id, steps, 0, self.state_store)
-                        self._log(run_id, f"Traffic step: {rollout_res.get('traffic_weight', rollout_res.get('weight', 0))}% canary — running verification")
+                        traffic_weight = int(rollout_res.get("traffic_weight", rollout_res.get("weight", 0)))
+                        self._log(run_id, f"Traffic step: {traffic_weight}% canary — running verification")
+                        if config.get("deploymentTarget") == "aws_ecs" and traffic_weight > 0:
+                            ecs_service_name = config.get("service", service_name)
+                            aws_region = config.get("awsRegion", "us-east-1")
+                            path_prefix = config.get("pathPrefix") or f"/api/v1/{ecs_service_name}"
+                            try:
+                                set_traffic_weights(
+                                    aws_region, ecs_service_name, path_prefix,
+                                    baseline_weight=100 - traffic_weight,
+                                    canary_weight=traffic_weight,
+                                )
+                                initial_state.current_traffic_weight = traffic_weight
+                                self.state_store.save_state_sync(initial_state)
+                                self._log(run_id, f"Shifted ALB weights to {100 - traffic_weight}% baseline / {traffic_weight}% canary.")
+                            except Exception as e:
+                                logger.error("ecs_shift_traffic_weights_failed", error=str(e), pipeline_run_id=run_id)
+                                self._log(run_id, f"Warning: failed to shift ALB weights: {e}")
+
+                        min_duration = 0
+                        if steps:
+                            min_duration = parse_duration_seconds(steps[0].get("minDuration", "120s"))
+                        if min_duration > 0 and config.get("deploymentTarget") == "aws_ecs":
+                            self._log(run_id, f"Observing canary for {min_duration}s dwell window while traffic flows...")
+                            time.sleep(min_duration)
                         verdict = run_verification_task(
                             run_id, spec.verificationConfig, trace_id=trace_id, tenant_id=resolved_tenant_id,
                             deployment_target=config.get("deploymentTarget", "kubernetes"),
@@ -934,6 +1015,7 @@ class PipelineOrchestrator:
             self.state_store.release_tenant_lock(resolved_tenant_id, service_name)
             if repo_clone_workspace:
                 cleanup_workspace(run_id)
+            self._log_context.pop(run_id, None)
 
         return {
             "pipeline_run_id": run_id,

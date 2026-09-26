@@ -26,12 +26,14 @@ from src.health_router import router as health_router
 from src.routers.actuation_router import router as actuation_router
 from src.routers.auth_router import router as auth_router
 from src.routers.audit_router import router as audit_router
+from src.routers.copilot_router import router as copilot_router
 from src.routers.github_router import router as github_router
 from src.routers.logs_router import router as logs_router
 from src.routers.pipeline_router import router as pipeline_router
 from src.routers.policy_router import router as policy_router
 from src.routers.projects_router import router as projects_router
 from src.routers.registry_router import router as registry_router
+from src.routers.aws_connections_router import router as aws_connections_router
 from src.routers.reports_router import router as reports_router
 from src.routers.services_router import router as services_router
 from src.routers.verification_router import router as verification_router
@@ -121,8 +123,10 @@ app.include_router(services_router, prefix="/api/v1/services", tags=["services"]
 # Phase 8 (§08-project-workspaces.md): Render-style project workspaces and
 # the GitHub ingestion backing the project-creation wizard.
 app.include_router(projects_router, prefix="/api/v1/projects", tags=["projects"])
+app.include_router(copilot_router, prefix="/api/v1/copilot", tags=["copilot"])
 app.include_router(github_router, prefix="/api/v1/integrations/github", tags=["github"])
 app.include_router(registry_router, prefix="/api/v1/integrations/registry", tags=["registry"])
+app.include_router(aws_connections_router, prefix="/api/v1/integrations/aws", tags=["aws-connections"])
 
 # Phase 9.6 (P0 #1, 2026-09-16) — the real "git push -> cloud" trigger.
 # Deliberately unauthenticated (see auth/middleware.py's allowlist) — GitHub

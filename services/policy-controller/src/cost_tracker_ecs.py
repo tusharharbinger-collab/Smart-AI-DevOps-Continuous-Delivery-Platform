@@ -31,14 +31,17 @@ between this service and verification-engine (see cost_tracker.py's own
 docstring for why THAT duplication is justified); duplicating the formula
 again within the same service would just be two copies that could drift.
 """
+import asyncio
+import math
 import os
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import structlog
 
 from shared.aws_ecs_actuation import describe_current_container_config
 from src.aws_actuation_executor import CLUSTER
-from src.cost_tracker import _compute_cost_delta
+from src.cost_tracker import _compute_cost_delta, compute_rightsizing_recommendation
 
 logger = structlog.get_logger(__name__)
 
@@ -81,6 +84,116 @@ def _read_ecs_service_footprint(ecs, cluster: str, service_name: str) -> dict | 
         "cpu_vcpu": _parse_fargate_cpu_vcpu(config["cpu"]),
         "mem_gib": _parse_fargate_memory_gib(config["memory"]),
     }
+
+
+# ─────────────────────────── right-sizing (backlog #6) ───────────────────────────
+#
+# Connects two pieces that both existed but that nothing joined: real CloudWatch utilization
+# (CPUUtilization / MemoryUtilization on the ECS service) -> compute_rightsizing_recommendation ->
+# cost_analysis.rightsizing_rec, which the Cost tab already renders.
+#
+# Measured on the BASELINE service, deliberately not the canary: a canary serving 10% of traffic always
+# looks over-provisioned, which would make every recommendation a false positive. It is ALWAYS only a
+# recommendation - applying it stays gated behind a platform-admin approval (OPA Rule 8).
+
+RIGHTSIZING_WINDOW_SECONDS = int(os.environ.get("RIGHTSIZING_WINDOW_SECONDS", "3600"))
+# One-minute datapoints. Fewer than this and a p95 is noise, so no recommendation beats a made-up one.
+RIGHTSIZING_MIN_SAMPLES = int(os.environ.get("RIGHTSIZING_MIN_SAMPLES", "10"))
+
+# Fargate supported task sizes: cpu units -> allowed memory MiB. Anything else is rejected by ECS.
+_FARGATE_SIZES = {
+    256: [512, 1024, 2048],
+    512: list(range(1024, 4097, 1024)),
+    1024: list(range(2048, 8193, 1024)),
+    2048: list(range(4096, 16385, 1024)),
+    4096: list(range(8192, 30721, 1024)),
+}
+
+
+def _percentile(values, pct):
+    """Nearest-rank percentile (no interpolation: a p95 should be a value that was actually observed)."""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(pct / 100 * len(ordered)) - 1)]
+
+
+def snap_to_fargate_size(cpu_vcpu, mem_gib):
+    """
+    The cheapest REAL Fargate size (cpu units + MiB) that covers the given need. The raw right-sizing
+    formula can suggest 0.05 vCPU / 0.064 GiB, which cannot be deployed. None above 4 vCPU (not covered
+    here rather than guessed).
+    """
+    need_cpu, need_mem = cpu_vcpu * 1024, mem_gib * 1024
+    best = None
+    for cpu_units, mems in _FARGATE_SIZES.items():
+        if cpu_units < need_cpu:
+            continue
+        for mem_mib in mems:
+            if mem_mib < need_mem:
+                continue
+            cost = (cpu_units / 1024) * FARGATE_CPU_COST_PER_VCPU_HOUR + (mem_mib / 1024) * FARGATE_MEM_COST_PER_GB_HOUR
+            if best is None or cost < best[0]:
+                best = (cost, cpu_units, mem_mib)
+    if best is None:
+        return None
+    return {"cpu": best[1], "memory": best[2], "cpu_vcpu": best[1] / 1024, "mem_gib": best[2] / 1024}
+
+
+def _fetch_utilization_percent(cw, cluster, service_name, metric, window_seconds):
+    end = datetime.now(timezone.utc)
+    resp = cw.get_metric_statistics(
+        Namespace="AWS/ECS", MetricName=metric,
+        Dimensions=[{"Name": "ClusterName", "Value": cluster}, {"Name": "ServiceName", "Value": service_name}],
+        StartTime=end - timedelta(seconds=window_seconds), EndTime=end, Period=60, Statistics=["Average"],
+    )
+    return [dp["Average"] for dp in resp.get("Datapoints", [])]
+
+
+def compute_ecs_rightsizing(region, cluster, service_name, footprint,
+                            window_seconds=RIGHTSIZING_WINDOW_SECONDS, min_samples=RIGHTSIZING_MIN_SAMPLES, cloudwatch=None):
+    """
+    A right-sizing recommendation from real CloudWatch usage, or None when there is not enough evidence
+    (too few datapoints, nothing running, CloudWatch unreachable). Fail-soft, never raises.
+    `footprint` is _read_ecs_service_footprint's result for the measured service.
+    """
+    try:
+        cw = cloudwatch or boto3.client("cloudwatch", region_name=region)
+        cpu_pct = _fetch_utilization_percent(cw, cluster, service_name, "CPUUtilization", window_seconds)
+        mem_pct = _fetch_utilization_percent(cw, cluster, service_name, "MemoryUtilization", window_seconds)
+    except Exception as e:
+        logger.warning("ecs_rightsizing_cloudwatch_failed", service=service_name, error=str(e))
+        return None
+
+    samples = min(len(cpu_pct), len(mem_pct))
+    if samples < min_samples or footprint["cpu_vcpu"] <= 0 or footprint["mem_gib"] <= 0:
+        logger.info("ecs_rightsizing_insufficient_data", service=service_name, samples=samples, needed=min_samples)
+        return None
+
+    cpu_p95, mem_p95 = _percentile(cpu_pct, 95), _percentile(mem_pct, 95)
+    rec = compute_rightsizing_recommendation(
+        observed_cpu_p95=cpu_p95 / 100 * footprint["cpu_vcpu"],
+        observed_mem_p95=mem_p95 / 100 * footprint["mem_gib"],
+        requested_cpu=footprint["cpu_vcpu"],
+        requested_mem=footprint["mem_gib"],
+    )
+    snapped = snap_to_fargate_size(rec["recommended_cpu_vcpu"], rec["recommended_mem_gib"])
+    rec.update({
+        "source": "cloudwatch",
+        "measured_service": service_name,
+        "window_seconds": window_seconds,
+        "sample_count": samples,
+        "observed_cpu_p95_percent": round(cpu_p95, 1),
+        "observed_mem_p95_percent": round(mem_p95, 1),
+        "requested_cpu_vcpu": footprint["cpu_vcpu"],
+        "requested_mem_gib": footprint["mem_gib"],
+        # A concrete, deployable size - the raw recommended_* above can be e.g. 0.05 vCPU, which Fargate does not offer.
+        "recommended_fargate_size": snapped,
+        "caveat": "Measured on the baseline service over a short window: low utilization during a quiet period "
+                  "looks like over-provisioning. Confirm against peak traffic before resizing.",
+    })
+    # Never call something over-provisioned when the smallest real size that fits is not smaller than what runs now.
+    if snapped and snapped["cpu"] >= footprint["cpu_vcpu"] * 1024 and snapped["memory"] >= footprint["mem_gib"] * 1024:
+        rec["is_overprovisioned"] = False
+    return rec
 
 
 async def compute_and_record_cost_ecs(
@@ -129,6 +242,9 @@ async def compute_and_record_cost_ecs(
         baseline_cost_usd=result["baseline_cost_usd"],
     )
 
+    # Right-sizing from real baseline usage (fail-soft: None when there is not enough data yet).
+    rightsizing_rec = await asyncio.to_thread(compute_ecs_rightsizing, region, CLUSTER, baseline_service_name, baseline)
+
     if db and tenant_id:
         try:
             await db.record_cost_analysis(
@@ -137,6 +253,7 @@ async def compute_and_record_cost_ecs(
                 baseline_cost=result["baseline_cost_usd"],
                 canary_cost=result["canary_cost_usd"],
                 delta_percent=result["delta_percent"],
+                rightsizing_rec=rightsizing_rec,
             )
         except Exception as e:
             logger.error("ecs_cost_analysis_db_write_failed", error=str(e), pipeline_run_id=pipeline_run_id)

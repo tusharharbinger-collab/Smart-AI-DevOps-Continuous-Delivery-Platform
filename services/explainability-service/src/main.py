@@ -28,9 +28,14 @@ from src.decision_report import build_decision_report
 from src.digest_generator import generate_delivery_health_digest
 from src.digest_summarizer import generate_digest_summary
 from src.health_router import router as health_router
+from src.infra_generator import InfraGenerationError, generate_infra_proposal
 from src.pipeline_generator import PipelineGenerationError, generate_pipeline_yaml
-from src.report_generator import generate_rca
+from src.report_generator import generate_rca, generate_degradation_diagnosis
 from src.stage_failure_analyzer import generate_stage_failure_rca
+from src.copilot_engine import CopilotConverseRequest, CopilotConverseResponse, converse_with_copilot
+from src.log_hygiene_analyzer import analyze_code_and_log_hygiene
+from src.predictive_risk_scorer import score_deployment_risk
+
 
 logger = structlog.get_logger(__name__)
 
@@ -101,6 +106,47 @@ async def post_generate_pipeline(body: dict):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/generate-infra")
+async def post_generate_infra(body: dict):
+    """
+    body: {"intent_spec": dict, "archetype": str}
+
+    Phase 4's Infra Architect Agent — proposes a topology + Terraform HCL +
+    cost estimate + policy checks for the ALREADY-MATCHED golden-path
+    archetype (Phase 1). Never auto-applies: the caller (api-gateway) runs
+    the result through the tiered deployment-readiness gate (Phase 3) and
+    a human approval checkpoint before anything provisions.
+    """
+    try:
+        return await generate_infra_proposal(
+            intent_spec=body["intent_spec"],
+            archetype=body["archetype"],
+            # AI_INFRA_IMPORT_AND_PROMPT_EDIT_PLAN.md: both optional. existing_resources =
+            # {slot: {"id", "details"}} (verified against AWS by the caller); edit =
+            # {"current_proposal": dict, "instruction": str} for prompt-driven edits.
+            existing_resources=body.get("existing_resources") or None,
+            edit=body.get("edit") or None,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing field: {e}")
+    except InfraGenerationError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/infra-failure-rca")
+async def post_infra_failure_rca(body: dict):
+    """body: {"draft_id": str, "phase": "change_set"|"stack", "status_reason": str|None, "events": list[dict], "resources": list[dict]}"""
+    from src.infra_failure_analyzer import analyze_infra_failure
+
+    return await analyze_infra_failure(
+        draft_id=str(body.get("draft_id", "")),
+        phase=body.get("phase", "stack"),
+        status_reason=body.get("status_reason"),
+        events=body.get("events") or [],
+        resources=body.get("resources") or [],
+    )
+
+
 @app.post("/stage-failure-rca")
 async def post_stage_failure_rca(body: dict):
     """body: {"run_id": str, "failed_stage": str, "error_message": str, "recent_logs": list[str]}"""
@@ -160,3 +206,52 @@ async def post_chatops_ask(body: dict, db: AsyncSession = Depends(get_db)):
     context = await assemble_chatops_context(db, tenant_id, project_id)
     context["project_id"] = project_id
     return await answer_chatops_question(context, question)
+
+
+@app.post("/copilot/converse", response_model=CopilotConverseResponse)
+async def post_copilot_converse(body: CopilotConverseRequest):
+    """
+    Multi-turn AI DevOps Copilot & UI Guide endpoint.
+    Maintains zero persistent state in DB (context stored strictly in that chat session).
+    Enforces strict scope guardrails, secret scrubbing, and UI/DevOps knowledge.
+    """
+    return await converse_with_copilot(
+        messages=body.messages,
+        project_context=body.project_context,
+        wizard_context=body.wizard_context,
+    )
+
+
+@app.post("/degradation-diagnosis")
+async def post_degradation_diagnosis(body: dict):
+    """
+    Analyzes why a canary verdict is DEGRADED and produces prescriptive recommendations & code patches.
+    body: {"service_name": str, "confidence": float, "metric_evidence": list, "error_logs": list, "commit_diff": str}
+    """
+    return await generate_degradation_diagnosis(body)
+
+
+@app.post("/log-hygiene")
+async def post_log_hygiene(body: dict):
+    """
+    Scans code files and CloudWatch logs for noisy console/print statements and security leaks.
+    body: {"code_files": dict[str, str], "cloudwatch_logs": list[str]}
+    """
+    code_files = body.get("code_files", {})
+    cloudwatch_logs = body.get("cloudwatch_logs", [])
+    return await analyze_code_and_log_hygiene(code_files, cloudwatch_logs)
+
+
+@app.post("/predictive-risk")
+async def post_predictive_risk(body: dict):
+    """
+    Performs pre-flight deployment risk assessment at Gate 1.
+    body: {"commit_diff": str, "commit_message": str, "files_changed": list[str]}
+    """
+    return await score_deployment_risk(
+        commit_diff=body.get("commit_diff"),
+        commit_message=body.get("commit_message"),
+        files_changed=body.get("files_changed"),
+    )
+
+

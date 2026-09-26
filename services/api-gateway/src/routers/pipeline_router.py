@@ -24,6 +24,7 @@ import structlog
 
 from shared import redis_streams as streams
 from src.db.session import get_request_db
+from src.routers.projects_router import PROJECT_STAGES
 
 STREAM_PIPELINE_START = "stream:pipeline:start"
 
@@ -258,4 +259,16 @@ async def get_run(pipeline_run_id: str, request: Request, db: AsyncSession = Dep
     run = result.mappings().first()
     if run is None:
         raise HTTPException(status_code=404, detail="Pipeline run not found")
-    return dict(run)
+    # Real gap found live (2026-09-18): the Redis `state:` snapshot above
+    # carries `stages` (the DAG order StageTimeline needs to render), but
+    # this Postgres fallback never did — `execution_state` has no `stages`
+    # column, nothing ever persisted it durably. Once that key's 24h TTL
+    # passed, a viewer opening an old, already-terminal run's Pipeline View
+    # got `stages: undefined` forever and StageTimeline never rendered past
+    # "Waiting for pipeline DAG…", even though status/current_stage/weight
+    # all correctly fell back via the COALESCE above. Every real run is a
+    # project run post-Phase-8 (see PROJECT_STAGES's own docstring), so this
+    # is a safe, already-proven fallback — projects_router.py's own
+    # /{project_id}/runs/{run_id}/stages endpoint uses the identical
+    # `live.get("stages") or PROJECT_STAGES` fallback for the same reason.
+    return {**dict(run), "stages": PROJECT_STAGES}
