@@ -62,6 +62,8 @@ class RepoFeatures:
     language: str | None = None
     framework: str | None = None
     build_confidence: str = "high"
+    # True/False when build detection ran (is a test command configured?); None when unknown.
+    has_test_command: bool | None = None
 
 
 def extract_repo_features(
@@ -151,6 +153,10 @@ def extract_repo_features(
         language=language,
         framework=framework,
         build_confidence=build_confidence,
+        has_test_command=(
+            bool(getattr(detection, "test_config_found", False) or getattr(detection, "test_command", None))
+            if detection else None
+        ),
     )
 
 
@@ -203,10 +209,118 @@ def _load_reference_corpus(custom_path: Path | None = None) -> list[list[float]]
     ]
 
 
+# Deployment-readiness checks. Each is (id, severity, weight, title, why it matters, how to fix). The weights say
+# how much a missing check costs the 0-100 readiness score; "critical" means the platform cannot build it at all.
+_CHECKS = (
+    ("build", "critical", 25, "Build method is clear",
+     "The platform cannot build what it cannot identify - without a Dockerfile or a recognizable language the "
+     "pipeline has nothing to run.",
+     "Add a Dockerfile at the repo root, or a smartcd.yaml declaring the language and start command."),
+    ("tests", "important", 20, "Automated tests present",
+     "Without tests nothing checks the code before it reaches users; the pre-flight test step is skipped and only "
+     "live canary statistics stand between a bug and production.",
+     "Add at least a smoke test and set the test command (or run your tests as a Dockerfile build step)."),
+    ("lockfile", "important", 20, "Dependencies are pinned (lockfile)",
+     "Unpinned dependencies can resolve to different versions on every build, so a rollout can ship code you never "
+     "tested.",
+     "Commit your lockfile (package-lock.json, poetry.lock, go.sum, ...) and install from it."),
+    ("ci", "minor", 10, "CI workflow configured",
+     "Nothing verifies pull requests before they merge, so broken commits can trigger a deploy pipeline.",
+     "Add a .github/workflows file that builds and tests on every pull request."),
+    ("readme", "minor", 10, "README present",
+     "New teammates and on-call engineers have no starting point for how the service runs.",
+     "Add a README covering how to run, configure and deploy the service."),
+    ("license", "minor", 5, "License declared",
+     "Without a license the code's reuse terms are undefined.",
+     "Add a LICENSE file."),
+    ("deps", "minor", 5, "Dependencies declared in the manifest",
+     "An empty manifest usually means the manifest is incomplete, so the image may miss packages it needs at runtime.",
+     "List runtime dependencies in package.json / requirements.txt."),
+)
+
+
+def _check_result(check_id: str, features: RepoFeatures) -> bool | None:
+    """True = passed, False = failed, None = not applicable to this repo."""
+    lang = features.language
+    if check_id == "build":
+        return features.has_dockerfile or features.build_confidence == "high"
+    if check_id == "tests":
+        if not features.has_tests:
+            return False
+        # Test files exist but nothing will run them before deploy: half credit, reported as its own finding.
+        return "partial" if features.has_test_command is False else True
+    if check_id == "lockfile":
+        # A static site or a repo with no dependencies has nothing to pin.
+        if lang in (None, "static") and features.dependency_count == 0:
+            return None
+        return features.has_lockfile
+    if check_id == "ci":
+        return features.has_ci_config
+    if check_id == "readme":
+        return features.has_readme
+    if check_id == "license":
+        return features.has_license
+    if check_id == "deps":
+        return None if lang not in ("node", "python") else features.dependency_count > 0
+    return None
+
+
+_SEVERITY_ORDER = {"critical": 0, "important": 1, "minor": 2}
+
+# What to show when a check fails (the check titles above read as passed-states).
+_PROBLEM = {
+    "build": "No clear way to build this repo",
+    "tests": "No automated tests",
+    "lockfile": "Dependencies are not pinned",
+    "ci": "No CI workflow",
+    "readme": "No README",
+    "license": "No LICENSE",
+    "deps": "No dependencies declared",
+}
+
+
+def assess_readiness(features: RepoFeatures) -> dict:
+    """
+    Deterministic 0-100 readiness score over checks that actually matter for shipping. Unlike the anomaly score
+    (how UNUSUAL the repo's structure is), this answers "what would go wrong deploying it, and what fixes that".
+    """
+    earned = total = 0
+    findings: list[dict] = []
+    passed: list[str] = []
+    for check_id, severity, weight, title, why, fix in _CHECKS:
+        result = _check_result(check_id, features)
+        if result is None:
+            continue
+        total += weight
+        if result is True:
+            earned += weight
+            passed.append(title)
+            continue
+        problem = _PROBLEM[check_id]
+        if result == "partial":
+            earned += weight / 2
+            severity, problem = "minor", "Tests exist but no test command is set"
+            why = "The test files will not run before deploy until a test command is configured."
+            fix = "Set the pre-flight test command (for example npm test or pytest), or run the tests in a Dockerfile build step."
+        elif check_id == "build" and features.language:
+            # The language is known, so a Dockerfile can be generated - what is missing is how to start it.
+            severity, problem = "important", "Start command needs your input"
+            why = (f"A Dockerfile can be generated for {features.language}, but the platform cannot tell how to "
+                   "start the app, so the build cannot be finished automatically.")
+            fix = "Set the start command in the wizard (for Node, add scripts.start to package.json), or add a Dockerfile."
+        findings.append({"id": check_id, "severity": severity, "weight": weight, "title": title, "problem": problem, "why": why, "fix": fix})
+    findings.sort(key=lambda f: (_SEVERITY_ORDER[f["severity"]], -f["weight"]))
+    score = round(100 * earned / total) if total else 100
+    has_critical = any(f["severity"] == "critical" for f in findings)
+    level = "high" if has_critical or score < 40 else "medium" if score < 80 else "low"
+    return {"readiness_score": score, "risk_level": level, "findings": findings, "passed": passed}
+
+
 def score_repo_risk(features: RepoFeatures, reference_corpus_path: Path | None = None) -> dict:
     """
     Fits scikit-learn IsolationForest against the reference corpus plus incoming vector.
-    Returns normalized risk_score (0-1), risk_level (low/medium/high), and explainable risk_flags.
+    Risk level and score come from the deterministic readiness assessment (assess_readiness); the IsolationForest
+    output is returned separately as `anomaly_score`. Also returns explainable risk_flags and structured findings.
     """
     ref_vectors = _load_reference_corpus(reference_corpus_path)
     cand_vec = _feature_vector(features)
@@ -229,14 +343,10 @@ def score_repo_risk(features: RepoFeatures, reference_corpus_path: Path | None =
     else:
         normalized_scores = np.zeros_like(raw_scores)
 
-    cand_score = float(normalized_scores[-1])
-
-    if cand_score < 0.35:
-        risk_level = "low"
-    elif cand_score < 0.65:
-        risk_level = "medium"
-    else:
-        risk_level = "high"
+    anomaly_score = float(normalized_scores[-1])
+    readiness = assess_readiness(features)
+    risk_level = readiness["risk_level"]
+    cand_score = 1.0 - readiness["readiness_score"] / 100.0
 
     # Compute explainable risk flags
     risk_flags: list[str] = []
@@ -261,6 +371,11 @@ def score_repo_risk(features: RepoFeatures, reference_corpus_path: Path | None =
         "risk_score": round(cand_score, 4),
         "risk_level": risk_level,
         "risk_flags": risk_flags,
+        "readiness_score": readiness["readiness_score"],
+        "findings": readiness["findings"],
+        "passed": readiness["passed"],
+        # How unusual the structure is versus reference repos - informational, it does not drive the level.
+        "anomaly_score": round(anomaly_score, 4),
     }
 
 
@@ -298,34 +413,41 @@ async def build_narrative(
     cost: dict,
     features: RepoFeatures,
     timeout_seconds: float = 15.0,
+    findings: list[dict] | None = None,
+    readiness_score: int | None = None,
 ) -> str:
     """
-    Generates a concise 1-2 sentence executive summary using Groq LLM if configured,
-    or falls back deterministically.
+    A short, specific summary: what the repo is, how ready it is, and the single most valuable fix. Uses Groq if
+    configured, otherwise a deterministic sentence built from the same findings. It never mentions cost - pricing
+    belongs after the infrastructure is built. (`cost` is accepted for call compatibility and deliberately unused.)
     """
-    # Deterministic fallback
-    if not risk_flags:
-        fallback = (
-            "Repository shows healthy structure with test and lockfile coverage."
-        )
+    findings = findings or []
+    what = " ".join(x for x in (features.language, features.framework) if x) or "repository"
+    score_part = f"readiness {readiness_score}/100" if readiness_score is not None else f"{risk_level} risk"
+
+    if not risk_flags and not findings:
+        fallback = f"This {what} repo looks ready to onboard ({score_part}): build, tests and dependency pinning are all in place."
     else:
-        flags_snippet = "; ".join(risk_flags[:2])
-        fallback = (
-            f"Repository identified with {len(risk_flags)} readiness observations ({flags_snippet})."
-        )
+        top = findings[0] if findings else None
+        listed = ", ".join(f.get("problem", f["title"]).lower() for f in findings[:3]) if findings else "; ".join(risk_flags[:2])
+        fallback = f"This {what} repo scores {score_part}; gaps: {listed}."
+        if top:
+            fallback += f" Start with: {top['fix']}"
 
     groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not groq_api_key:
         return fallback
 
     groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    finding_lines = "\n".join(f"  - [{f['severity']}] {f.get('problem', f['title'])}: {f['fix']}" for f in findings) or "  none"
     prompt = (
-        f"Repository Health Assessment:\n"
-        f"- Risk level: {risk_level}\n"
+        "Repository readiness assessment:\n"
+        f"- Readiness score: {readiness_score if readiness_score is not None else 'n/a'}/100 ({risk_level} risk)\n"
         f"- Language: {features.language or 'Unknown'}, Framework: {features.framework or 'None'}\n"
-        f"- Issues: {risk_flags if risk_flags else 'None'}\n"
-        "\n"
-        f"Do not mention cost or pricing. Write a professional 2-sentence executive summary for a DevOps engineer deciding whether to onboard this service."
+        f"- Has Dockerfile: {features.has_dockerfile}\n"
+        f"- Findings (most important first):\n{finding_lines}\n\n"
+        "Write exactly 2 sentences for a DevOps engineer deciding whether to onboard this service: first the overall "
+        "readiness in plain words, then the single most valuable fix to make first. Do not mention cost or pricing."
     )
 
     try:
@@ -340,7 +462,7 @@ async def build_narrative(
                             "role": "system",
                             "content": (
                                 "You are an autonomous cloud delivery assistant. Be concise, factual, and strictly cite "
-                                "the provided risk figures."
+                                "only the provided findings and never invent problems."
                             ),
                         },
                         {"role": "user", "content": prompt},

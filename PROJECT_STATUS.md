@@ -282,6 +282,10 @@ Live-only bugs found and fixed: (1) a pipeline generated with `manual_approval_r
 
 Browser verification of the earlier infra UI (11 checks, real backend and Groq): AWS account picker (connect flow, real rejected AssumeRole), draft cost/policy labels, failure-analysis card and its "Use as an edit instruction" hand-off to Edit with AI. Template-format errors are now classified as `invalid_configuration` with an edit hint.
 
+### 9.12 - Repo Health analysis rewritten (2026-09-26)
+
+The build-step card ("Repo Health") used to headline an IsolationForest anomaly score trained on five sample repos, so a Dockerfile repo with a missing LICENSE could show "HIGH RISK - 0% readiness", every finding was a flat one-liner, and it printed hosting prices. Now: `shared/repo_report.py::assess_readiness` computes a deterministic, weighted 0-100 readiness score over deployment-relevant checks (build method 25, tests 20, lockfile 20, CI 10, README 10, license 5, declared deps 5; checks that do not apply, such as a lockfile for a static site, are skipped). Each finding has a severity (critical / important / minor), a problem statement, why it matters and a concrete fix; passed checks are listed too. Nuance: a known language with no start command is "important" (a Dockerfile can be generated), only an unidentifiable build is "critical"; test files with no test command earn half credit and their own finding (this removed a contradiction with the wizard's detection line). Level: high only for a critical finding or a score under 40. The anomaly score is still returned as `anomaly_score` but no longer drives anything. The summary sentence is built from the findings, names the single most valuable fix, and never mentions cost (pricing appears only after the infrastructure proposal is generated). 13 new tests; verified in Chromium against a real repo.
+
 ---
 
 ## Known open bugs / small gaps (not full sub-phases, but real and undone)

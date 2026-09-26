@@ -1216,7 +1216,9 @@ export function NewProject() {
                             : level === "medium"
                             ? { text: "text-warning", bg: "bg-warning/10", border: "border-warning/30", ring: "ring-warning/20", Icon: ShieldAlert }
                             : { text: "text-destructive", bg: "bg-destructive/10", border: "border-destructive/30", ring: "ring-destructive/20", Icon: ShieldX };
-                        const readiness = Math.round((1 - repoReport.risk.risk_score) * 100);
+                        const readiness = repoReport.risk.readiness_score ?? Math.round((1 - repoReport.risk.risk_score) * 100);
+                        const findings = repoReport.risk.findings ?? [];
+                        const passedChecks = repoReport.risk.passed ?? [];
                         return (
                           <div className={`mt-3 overflow-hidden rounded-lg border ${tone.border} ${tone.bg}`}>
                             <div className="flex flex-wrap items-center justify-between gap-3 p-3.5">
@@ -1241,26 +1243,61 @@ export function NewProject() {
                             )}
 
                             <div className="border-t border-border/40 bg-background/40 p-3.5">
-                              {repoReport.risk.risk_flags.length > 0 ? (
-                                <div className="space-y-1.5">
+                              {findings.length > 0 ? (
+                                <div className="space-y-2">
                                   <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                                    Readiness Observations
+                                    What to fix, most important first
                                   </div>
-                                  <div className="grid gap-1.5 sm:grid-cols-2">
-                                    {repoReport.risk.risk_flags.map((flag) => (
+                                  <div className="space-y-1.5" data-testid="repo-findings">
+                                    {findings.map((f) => (
                                       <div
-                                        key={flag}
-                                        className="flex items-start gap-1.5 rounded-md border border-warning/20 bg-warning/5 px-2 py-1.5 text-xs text-warning"
+                                        key={f.id}
+                                        className={`rounded-md border px-2.5 py-2 text-xs ${
+                                          f.severity === "critical"
+                                            ? "border-destructive/30 bg-destructive/5"
+                                            : f.severity === "important"
+                                            ? "border-warning/30 bg-warning/5"
+                                            : "border-border/60 bg-muted/30"
+                                        }`}
                                       >
-                                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                                        <span className="text-foreground/80">{flag}</span>
+                                        <div className="flex items-center gap-1.5 font-medium text-foreground">
+                                          <AlertTriangle
+                                            className={`h-3.5 w-3.5 shrink-0 ${
+                                              f.severity === "critical" ? "text-destructive" : f.severity === "important" ? "text-warning" : "text-muted-foreground"
+                                            }`}
+                                          />
+                                          {f.problem ?? f.title}
+                                          <span className="ml-auto rounded-full border px-1.5 py-0.5 text-[10px] font-normal uppercase tracking-wide text-muted-foreground">
+                                            {f.severity}
+                                          </span>
+                                        </div>
+                                        <p className="mt-1 text-muted-foreground">{f.why}</p>
+                                        <p className="mt-1 text-foreground/80">
+                                          <span className="font-medium">Fix:</span> {f.fix}
+                                        </p>
                                       </div>
                                     ))}
                                   </div>
+                                  {passedChecks.length > 0 && (
+                                    <p className="flex flex-wrap items-center gap-x-2 gap-y-0.5 pt-1 text-[11px] text-muted-foreground" data-testid="repo-passed">
+                                      <Check className="h-3 w-3 text-success" />
+                                      <span className="font-medium text-foreground/70">Already in place:</span>
+                                      {passedChecks.join(" · ")}
+                                    </p>
+                                  )}
+                                </div>
+                              ) : repoReport.risk.risk_flags.length > 0 && !repoReport.risk.findings ? (
+                                <div className="grid gap-1.5 sm:grid-cols-2">
+                                  {repoReport.risk.risk_flags.map((flag) => (
+                                    <div key={flag} className="flex items-start gap-1.5 rounded-md border border-warning/20 bg-warning/5 px-2 py-1.5 text-xs text-warning">
+                                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                      <span className="text-foreground/80">{flag}</span>
+                                    </div>
+                                  ))}
                                 </div>
                               ) : (
                                 <div className="flex items-center gap-1.5 rounded-md border border-success/20 bg-success/5 px-2 py-1.5 text-xs text-success">
-                                  <Check className="h-3.5 w-3.5" /> All baseline hygiene standards met (tests, lockfile, CI configuration present).
+                                  <Check className="h-3.5 w-3.5" /> Every readiness check passed{passedChecks.length ? `: ${passedChecks.join(", ")}` : ""}.
                                 </div>
                               )}
                             </div>

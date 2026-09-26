@@ -136,6 +136,16 @@ export const getBuildDetection = (owner: string, repo: string, ref: string, toke
     tokenHeader(token)
   );
 
+export interface RepoFinding {
+  id: string;
+  severity: "critical" | "important" | "minor";
+  title: string;
+  /** What is wrong, phrased as a problem (title reads as the passed state). */
+  problem?: string;
+  why: string;
+  fix: string;
+}
+
 export interface RepoReport {
   features: {
     file_count: number;
@@ -150,11 +160,20 @@ export interface RepoReport {
     language: string | null;
     framework: string | null;
     build_confidence: string;
+    /** true/false once build detection ran; null when unknown. */
+    has_test_command?: boolean | null;
   };
   risk: {
     risk_score: number;
     risk_level: "low" | "medium" | "high";
     risk_flags: string[];
+    /** 0-100, deterministic (see shared/repo_report.py assess_readiness). Absent on older gateways. */
+    readiness_score?: number;
+    findings?: RepoFinding[];
+    /** Titles of the checks that passed. */
+    passed?: string[];
+    /** How unusual the repo structure is versus reference repos - informational only. */
+    anomaly_score?: number;
   };
   cost: {
     task_cpu_units: number;

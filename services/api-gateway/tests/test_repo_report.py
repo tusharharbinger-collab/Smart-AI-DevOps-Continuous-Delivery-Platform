@@ -162,4 +162,105 @@ def test_build_narrative_fallback_without_api_key(monkeypatch):
     assert isinstance(narrative, str)
     # Pricing is deliberately not shown at the build step - it belongs after the infrastructure is built.
     assert "$" not in narrative and "Fargate" not in narrative
-    assert "2 readiness observations" in narrative
+    assert "No automated tests detected" in narrative and "No lockfile found" in narrative
+
+
+# ───────── readiness assessment (the score that drives the headline) ─────────
+
+from shared.repo_report import assess_readiness
+
+
+def _features(**over):
+    base = dict(file_count=20, max_depth=3, has_tests=True, has_dockerfile=True, has_lockfile=True, has_ci_config=True,
+                has_readme=True, has_license=True, dependency_count=10, language="node", framework=None,
+                build_confidence="high")
+    base.update(over)
+    return RepoFeatures(**base)
+
+
+def test_a_complete_repo_is_ready_with_no_findings():
+    r = assess_readiness(_features())
+    assert r["readiness_score"] == 100 and r["risk_level"] == "low" and r["findings"] == []
+
+
+def test_a_repo_with_a_dockerfile_is_never_scored_zero():
+    """The reported bug: a Dockerfile repo with no tests/lockfile/CI showed '0% readiness / HIGH RISK'."""
+    r = assess_readiness(_features(has_tests=False, has_lockfile=False, has_ci_config=False, has_license=False))
+    assert r["readiness_score"] > 0
+    assert "Build method is clear" in r["passed"]
+
+
+def test_findings_are_ordered_by_importance_and_carry_a_fix():
+    r = assess_readiness(_features(has_tests=False, has_license=False, has_lockfile=False))
+    assert [f["id"] for f in r["findings"]] == ["tests", "lockfile", "license"] or [f["id"] for f in r["findings"]][0] in ("tests", "lockfile")
+    assert r["findings"][-1]["severity"] == "minor"
+    assert all(f["why"] and f["fix"] for f in r["findings"])
+
+
+def test_missing_build_method_is_critical_and_high_risk():
+    r = assess_readiness(_features(has_dockerfile=False, build_confidence="low", language=None))
+    assert r["findings"][0]["id"] == "build" and r["findings"][0]["severity"] == "critical"
+    assert r["risk_level"] == "high"
+
+
+def test_checks_that_do_not_apply_are_not_held_against_the_repo():
+    static = assess_readiness(_features(language="static", dependency_count=0, has_lockfile=False))
+    assert all(f["id"] not in ("lockfile", "deps") for f in static["findings"])
+
+
+def test_missing_only_minor_items_is_medium_at_worst_not_high():
+    r = assess_readiness(_features(has_ci_config=False, has_readme=False, has_license=False))
+    assert r["risk_level"] != "high" and r["readiness_score"] >= 55
+
+
+def test_score_repo_risk_uses_readiness_and_keeps_anomaly_separate():
+    out = score_repo_risk(_features(has_tests=False, has_lockfile=False))
+    assert out["readiness_score"] == assess_readiness(_features(has_tests=False, has_lockfile=False))["readiness_score"]
+    assert out["risk_score"] == pytest.approx(1 - out["readiness_score"] / 100, abs=0.001)
+    assert "anomaly_score" in out and out["findings"] and out["passed"]
+
+
+def test_narrative_names_the_top_fix_and_never_mentions_cost(monkeypatch):
+    import asyncio
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    f = _features(has_tests=False, has_lockfile=False)
+    risk = score_repo_risk(f)
+    text = asyncio.run(build_narrative(risk["risk_level"], risk["risk_flags"], predict_hosting_cost(f), f,
+                                       findings=risk["findings"], readiness_score=risk["readiness_score"]))
+    assert "$" not in text and "Fargate" not in text and "/mo" not in text
+    assert risk["findings"][0]["fix"] in text and str(risk["readiness_score"]) in text
+
+
+def test_narrative_lists_problems_not_passed_state_titles(monkeypatch):
+    import asyncio
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    f = _features(has_tests=False, has_lockfile=False)
+    risk = score_repo_risk(f)
+    text = asyncio.run(build_narrative(risk["risk_level"], risk["risk_flags"], {}, f, findings=risk["findings"],
+                                       readiness_score=risk["readiness_score"]))
+    assert "no automated tests" in text and "not pinned" in text and "tests present" not in text
+
+
+def test_known_language_without_a_start_command_is_important_not_critical():
+    r = assess_readiness(_features(has_dockerfile=False, build_confidence="low", language="node"))
+    build = next(f for f in r["findings"] if f["id"] == "build")
+    assert build["severity"] == "important" and "Start command" in build["problem"] and "node" in build["why"]
+    assert r["risk_level"] == "medium"  # setup needed, not a deploy risk
+
+
+def test_unknown_language_and_no_dockerfile_stays_critical():
+    r = assess_readiness(_features(has_dockerfile=False, build_confidence="low", language=None))
+    assert next(f for f in r["findings"] if f["id"] == "build")["severity"] == "critical"
+
+
+def test_test_files_without_a_test_command_get_half_credit_and_their_own_finding():
+    full = assess_readiness(_features(has_test_command=True))["readiness_score"]
+    partial = assess_readiness(_features(has_test_command=False))
+    finding = next(f for f in partial["findings"] if f["id"] == "tests")
+    assert finding["severity"] == "minor" and "no test command" in finding["problem"]
+    assert "Automated tests present" not in partial["passed"]
+    assert 0 < full - partial["readiness_score"] < 20
+
+
+def test_unknown_test_command_is_not_penalised():
+    assert "Automated tests present" in assess_readiness(_features(has_test_command=None))["passed"]

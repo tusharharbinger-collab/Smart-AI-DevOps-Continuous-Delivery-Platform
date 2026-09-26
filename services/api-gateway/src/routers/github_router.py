@@ -580,6 +580,8 @@ async def get_repo_report(
         risk_flags=risk["risk_flags"],
         cost=cost,
         features=features,
+        findings=risk["findings"],
+        readiness_score=risk["readiness_score"],
     )
 
     return {
