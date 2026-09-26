@@ -35,6 +35,7 @@ from shared import redis_streams as streams
 from shared.deployment_readiness import evaluate_deployment_readiness
 from shared.intent_spec import FARGATE_TIER_DEFAULTS, EnvironmentTier, IntentSpec, apply_tier_defaults
 from shared.live_url_builder import build_live_url
+from shared.infra_needs import analyze_infra_needs, build_standard_only_proposal
 from src import webhook_registry
 from src.auth.rbac import require_role
 from src.config import settings
@@ -1260,6 +1261,22 @@ def _readiness_with_policy(readiness, proposal: dict) -> tuple[str, list[str], s
     return readiness.outcome, list(readiness.reasons), next_status
 
 
+async def _platform_network_context(region: str, connection: dict | None) -> dict:
+    """The real VPC/CIDR/subnets the platform deploys into, so AI-designed extras are placed with real ids."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{PIPELINE_WORKER_URL}/infra-provisioning/platform-context",
+                json={"region": region, "connection": connection},
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Could not read the platform network: {str(e) or type(e).__name__}")
+    if resp.status_code >= 400:
+        detail = resp.json().get("detail") if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+        raise HTTPException(status_code=502 if resp.status_code >= 500 else 422, detail=f"Could not read the platform network: {detail}")
+    return resp.json()
+
+
 async def _call_generate_infra(payload: dict) -> dict:
     """Shared by create and edit. 150s, not 70s (found live): a rejected-then-corrected attempt
     (e.g. an edit that removed a Retain resource) is two full generations, and Groq's 8,000
@@ -1384,12 +1401,23 @@ async def create_infra_draft(body: InfraDraftRequest, request: Request, db: Asyn
         },
     )
 
-    proposal = await _call_generate_infra(
-        {"intent_spec": intent_dict, "archetype": body.archetype, "existing_resources": existing_resources or None}
-    )
-
-    proposal = await apply_independent_cost(proposal, body.aws_region)  # before OPA: its budget rule must use the real number
-    proposal = apply_policy_to_proposal(proposal, await evaluate_infra_policy(proposal, intent_dict, existing_resources))
+    # Decide WHAT is needed before asking any AI: the platform already builds the ALB, cluster and baseline/canary
+    # services, so a self-contained web app needs nothing extra (no AI call, no template, no cost).
+    needs = analyze_infra_needs(intent_dict, body.archetype, existing_resources)
+    if not needs["needs_ai"]:
+        proposal = build_standard_only_proposal(intent_dict, body.archetype, needs)
+    else:
+        payload = {"intent_spec": intent_dict, "archetype": body.archetype, "existing_resources": existing_resources or None}
+        if needs["additions"]:
+            payload["additions"] = needs["additions"]
+            payload["platform_context"] = await _platform_network_context(body.aws_region, connection)
+        proposal = await _call_generate_infra(payload)
+        proposal = await apply_independent_cost(proposal, body.aws_region)  # before OPA: its budget rule must use the real number
+        proposal = apply_policy_to_proposal(proposal, await evaluate_infra_policy(proposal, intent_dict, existing_resources))
+        proposal.update(
+            no_additional_infrastructure=False, additions=needs["additions"],
+            platform_provides=needs["platform_provides"], needs_summary=needs["summary"],
+        )
     readiness = evaluate_deployment_readiness(body)
     readiness_outcome, readiness_reasons, next_status = _readiness_with_policy(readiness, proposal)
 
@@ -1456,6 +1484,12 @@ async def edit_infra_draft(
         raise HTTPException(status_code=409, detail=f"Draft is in status {row['status']} and cannot be edited right now.")
     if not row["infra_proposal"]:
         raise HTTPException(status_code=409, detail="This draft has no proposal to edit yet.")
+    if (row["infra_proposal"] or {}).get("no_additional_infrastructure"):
+        raise HTTPException(
+            status_code=409,
+            detail="This app needs no extra infrastructure, so there is nothing to edit. To add a database, cache or "
+            "object storage, turn it on in the Requirements above and generate the proposal again.",
+        )
 
     new_proposal = await _call_generate_infra(
         {
@@ -1614,6 +1648,12 @@ async def create_infra_change_set(draft_id: str, request: Request, db: AsyncSess
 
     proposal = row["infra_proposal"] or {}
     template_body = proposal.get("cloudformation_template")
+    if proposal.get("no_additional_infrastructure"):
+        raise HTTPException(
+            status_code=409,
+            detail="Nothing to provision: this app needs no extra infrastructure. The platform creates the shared load "
+            "balancer and the baseline/canary services when the project is created.",
+        )
     if not template_body:
         raise HTTPException(
             status_code=422,

@@ -126,6 +126,9 @@ async def post_generate_infra(body: dict):
             # {"current_proposal": dict, "instruction": str} for prompt-driven edits.
             existing_resources=body.get("existing_resources") or None,
             edit=body.get("edit") or None,
+            # Extras-only mode (shared/infra_needs.py): what the platform does NOT already build, plus the real network.
+            additions=body.get("additions") or None,
+            platform_context=body.get("platform_context") or None,
         )
     except KeyError as e:
         raise HTTPException(status_code=422, detail=f"Missing field: {e}")

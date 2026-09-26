@@ -692,3 +692,47 @@ def test_a_non_template_object_with_stray_closers_is_rejected():
 def test_a_valid_template_is_returned_unchanged():
     raw = _json.dumps(_TEMPLATE)
     assert _repair(raw) == raw
+
+
+# ───────── extras-only mode (the platform already builds the web-service topology) ─────────
+
+from src.infra_generator import _extras_only_instruction, _require_only_additions
+
+_CTX = {"vpc_id": "vpc-0abc", "vpc_cidr": "172.31.0.0/16", "subnet_ids": ["subnet-1", "subnet-2"]}
+
+
+def _tpl(*types):
+    return _json.dumps({"Resources": {f"R{i}": {"Type": t} for i, t in enumerate(types)}})
+
+
+def test_a_database_only_template_is_accepted():
+    _require_only_additions(_tpl("AWS::RDS::DBInstance", "AWS::RDS::DBSubnetGroup", "AWS::EC2::SecurityGroup"), [{"kind": "database"}])
+
+
+@_pytest.mark.parametrize("bad", [
+    "AWS::ElasticLoadBalancingV2::LoadBalancer", "AWS::ElasticLoadBalancingV2::Listener",
+    "AWS::ElasticLoadBalancingV2::TargetGroup", "AWS::ECS::Cluster", "AWS::ECS::Service", "AWS::ECS::TaskDefinition",
+])
+def test_recreating_platform_infrastructure_is_rejected_for_data_extras(bad):
+    with _pytest.raises(_Err) as e:
+        _require_only_additions(_tpl("AWS::RDS::DBInstance", bad), [{"kind": "database"}])
+    assert "already provides" in str(e.value) and bad in str(e.value)
+
+
+def test_a_worker_may_have_its_own_service_but_never_a_cluster_or_load_balancer():
+    _require_only_additions(_tpl("AWS::ECS::Service", "AWS::ECS::TaskDefinition"), [{"kind": "worker_service"}])
+    for bad in ("AWS::ECS::Cluster", "AWS::ElasticLoadBalancingV2::LoadBalancer"):
+        with _pytest.raises(_Err):
+            _require_only_additions(_tpl("AWS::ECS::Service", bad), [{"kind": "worker_service"}])
+
+
+def test_the_prompt_forbids_the_platforms_own_resources_and_carries_the_real_network():
+    text = _extras_only_instruction([{"kind": "database"}, {"kind": "cache"}], _CTX)
+    assert "NEVER create a load balancer" in text and "ECS service or task definition" in text
+    assert "vpc-0abc" in text and "172.31.0.0/16" in text and '"subnet-1"' in text
+    assert "AWS::RDS::DBInstance" in text and "AWS::ElastiCache::CacheCluster" in text
+    assert "ONLY from the VPC CIDR" in text
+
+
+def test_the_prompt_for_a_worker_does_not_forbid_its_own_service():
+    assert "nor an ECS service or task definition" not in _extras_only_instruction([{"kind": "worker_service"}], _CTX)

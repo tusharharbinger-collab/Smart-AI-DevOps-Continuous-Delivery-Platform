@@ -571,8 +571,46 @@ export function RequirementsForm({ detection, value, onChange, onDraftChange, de
               : "Click Preview Infrastructure (AI) to generate a fresh AI-created proposal."}
           </div>
         )}
-        {draft?.infra_proposal && (
+        {draft?.infra_proposal?.no_additional_infrastructure && (
+          <div className="space-y-3" data-testid="no-extra-infra">
+            <div className="flex items-center gap-2 rounded-md border border-success/40 bg-success/5 p-3 text-xs">
+              <ShieldCheck className="h-4 w-4 shrink-0 text-success" />
+              <div className="flex-1">
+                <div className="text-sm font-medium">Nothing extra to build</div>
+                <p className="mt-0.5 text-muted-foreground">{draft.infra_proposal.needs_summary}</p>
+              </div>
+              {draft.status === "INFRA_APPROVED" ? (
+                <span className="flex items-center gap-1 text-[11px] font-medium text-success">
+                  <CheckCircle2 className="h-3.5 w-3.5" /> Selected for this project
+                </span>
+              ) : (
+                <Button size="sm" onClick={handleUseThisInfrastructure} disabled={approvingDraft || draft.source !== infraSource}>
+                  {approvingDraft ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                  Use this infrastructure
+                </Button>
+              )}
+            </div>
+            <div className="rounded-md border p-3 text-xs">
+              <div className="mb-1 font-medium">Already provided by the platform</div>
+              <ul className="list-disc space-y-0.5 pl-5 text-muted-foreground">
+                {(draft.infra_proposal.platform_provides ?? []).map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+              <p className="mt-2 text-muted-foreground">
+                No additional infrastructure cost. If the app also needs a database, cache or object storage, turn it on in
+                the Requirements above and generate again — only then is anything designed.
+              </p>
+            </div>
+          </div>
+        )}
+        {draft?.infra_proposal && !draft.infra_proposal.no_additional_infrastructure && (
           <div className="space-y-3">
+            {draft.infra_proposal.needs_summary && (
+              <p className="text-[11px] text-muted-foreground" data-testid="needs-summary">
+                {draft.infra_proposal.needs_summary}
+              </p>
+            )}
             <div
               className={`flex items-center gap-1.5 rounded-md border p-2 text-xs ${
                 draft.readiness_outcome === "require_approval"

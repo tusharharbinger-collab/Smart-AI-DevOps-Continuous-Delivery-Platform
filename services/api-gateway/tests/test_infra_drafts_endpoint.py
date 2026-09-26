@@ -141,7 +141,7 @@ class _Result:
 
 
 def _spec(**overrides) -> IntentSpec:
-    defaults = dict(environment_tier=EnvironmentTier.DEV, archetype="stateless_web_service")
+    defaults = dict(environment_tier=EnvironmentTier.DEV, archetype="stateless_web_service", needs_database=True)
     defaults.update(overrides)
     return IntentSpec(**defaults)
 

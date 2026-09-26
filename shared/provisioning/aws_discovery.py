@@ -150,3 +150,25 @@ def describe_selected(selection: dict[str, str], archetype: str, region: str, co
             raise ValueError(f"No existing {slot} named '{identifier}' found in {region}.")
         verified[slot] = {"id": match["id"], "details": match["details"]}
     return verified
+
+
+def get_platform_network_context(region: str, connection: dict | None = None) -> dict:
+    """
+    The network the platform deploys services into (the default VPC and its subnets - the same choice
+    ecs_onboarding makes), so an AI-designed extra such as a database can be placed in it with REAL ids rather
+    than invented ones. Read-only. Raises RuntimeError when there is no default VPC (the platform cannot deploy
+    there either).
+    """
+    ec2 = aws_client("ec2", region, connection)
+    vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
+    if not vpcs:
+        raise RuntimeError("No default VPC in this account/region - the platform deploys into the default VPC.")
+    vpc = vpcs[0]
+    subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc["VpcId"]]}])["Subnets"]
+    # One subnet per availability zone, stable order: an RDS/ElastiCache subnet group needs >= 2 AZs.
+    by_az: dict[str, str] = {}
+    for s in sorted(subnets, key=lambda x: x["SubnetId"]):
+        by_az.setdefault(s["AvailabilityZone"], s["SubnetId"])
+    if len(by_az) < 2:
+        raise RuntimeError(f"Default VPC {vpc['VpcId']} spans fewer than 2 availability zones.")
+    return {"vpc_id": vpc["VpcId"], "vpc_cidr": vpc["CidrBlock"], "subnet_ids": list(by_az.values())[:3], "region": region}

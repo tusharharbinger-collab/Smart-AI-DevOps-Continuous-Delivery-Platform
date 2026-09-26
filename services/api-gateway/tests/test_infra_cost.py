@@ -164,7 +164,7 @@ def test_create_prices_before_policy_so_the_budget_rule_uses_the_real_number(mon
 
     from tests.test_infra_import_and_edit_endpoints import FakeDB, FakeRequest  # reuse the in-memory DB double
 
-    spec = InfraDraftRequest(environment_tier="dev", archetype="web_service_with_database", aws_region="us-east-1")
+    spec = InfraDraftRequest(environment_tier="dev", archetype="web_service_with_database", aws_region="us-east-1", needs_database=True)
     out = asyncio.run(projects_router.create_infra_draft(spec, FakeRequest(), db=FakeDB()))
 
     assert order == ["cost", ("policy", 15.44)]  # OPA saw the computed number, not the model's 999

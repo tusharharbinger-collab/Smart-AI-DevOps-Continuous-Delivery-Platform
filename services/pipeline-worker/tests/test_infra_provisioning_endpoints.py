@@ -189,3 +189,41 @@ def test_discovery_in_a_tenant_account_forwards_the_connection(monkeypatch):
     conn = {"role_arn": "arn:aws:iam::123456789012:role/r", "external_id": "e" * 43}
     out = asyncio.run(main.discover_existing_infra_for_connection({"archetype": "web_service_with_database", "region": "eu-north-1", "connection": conn}))
     assert out == {"database": []} and seen == {"c": conn, "r": "eu-north-1"}
+
+
+# ───────── platform network context (extras are placed with real ids) ─────────
+
+from shared.provisioning import aws_discovery as _disc
+
+
+class _Ec2:
+    def __init__(self, vpcs, subnets):
+        self._v, self._s = vpcs, subnets
+
+    def describe_vpcs(self, Filters):
+        return {"Vpcs": self._v}
+
+    def describe_subnets(self, Filters):
+        return {"Subnets": self._s}
+
+
+def test_platform_network_context_picks_one_subnet_per_az(monkeypatch):
+    ec2 = _Ec2([{"VpcId": "vpc-1", "CidrBlock": "172.31.0.0/16"}], [
+        {"SubnetId": "subnet-b", "AvailabilityZone": "us-east-1a"}, {"SubnetId": "subnet-a", "AvailabilityZone": "us-east-1a"},
+        {"SubnetId": "subnet-c", "AvailabilityZone": "us-east-1b"},
+    ])
+    monkeypatch.setattr(_disc, "aws_client", lambda *a, **k: ec2)
+    out = _disc.get_platform_network_context("us-east-1")
+    assert out["vpc_id"] == "vpc-1" and out["vpc_cidr"] == "172.31.0.0/16"
+    assert out["subnet_ids"] == ["subnet-a", "subnet-c"]
+
+
+def test_platform_network_context_needs_a_default_vpc_and_two_azs(monkeypatch):
+    import pytest
+    monkeypatch.setattr(_disc, "aws_client", lambda *a, **k: _Ec2([], []))
+    with pytest.raises(RuntimeError):
+        _disc.get_platform_network_context("us-east-1")
+    one_az = _Ec2([{"VpcId": "v", "CidrBlock": "10.0.0.0/16"}], [{"SubnetId": "s", "AvailabilityZone": "a"}])
+    monkeypatch.setattr(_disc, "aws_client", lambda *a, **k: one_az)
+    with pytest.raises(RuntimeError):
+        _disc.get_platform_network_context("us-east-1")

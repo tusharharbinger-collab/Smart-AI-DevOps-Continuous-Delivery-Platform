@@ -44,7 +44,7 @@ def connection_stub(monkeypatch):
 
 
 def spec(**over):
-    base = dict(environment_tier="dev", archetype="web_service_with_database", aws_region="eu-north-1")
+    base = dict(environment_tier="dev", archetype="web_service_with_database", aws_region="eu-north-1", needs_database=True)
     base.update(over)
     return InfraDraftRequest(**base)
 

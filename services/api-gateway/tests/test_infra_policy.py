@@ -228,7 +228,7 @@ def test_a_denied_proposal_never_auto_advances_even_when_readiness_says_it_could
     monkeypatch.setattr(projects_router.httpx, "AsyncClient", _Http({"generate-infra": PROPOSAL}))
     # stateless + high-confidence + a small budget is the auto_advance case (see test_infra_drafts_endpoint.py).
     spec = InfraDraftRequest(environment_tier="dev", archetype="stateless_web_service", detected_confidence="high",
-                             monthly_budget_usd=20, aws_region="us-east-1")
+                             monthly_budget_usd=20, aws_region="us-east-1", needs_database=True)
 
     out = asyncio.run(projects_router.create_infra_draft(spec, FakeRequest(), db=FakeDB()))
 
@@ -242,7 +242,7 @@ def test_a_clean_proposal_still_auto_advances(monkeypatch):
     _use_opa(monkeypatch, CLEAN)
     monkeypatch.setattr(projects_router.httpx, "AsyncClient", _Http({"generate-infra": PROPOSAL}))
     spec = InfraDraftRequest(environment_tier="dev", archetype="stateless_web_service", detected_confidence="high",
-                             monthly_budget_usd=20, aws_region="us-east-1")
+                             monthly_budget_usd=20, aws_region="us-east-1", needs_database=True)
 
     out = asyncio.run(projects_router.create_infra_draft(spec, FakeRequest(), db=FakeDB()))
 

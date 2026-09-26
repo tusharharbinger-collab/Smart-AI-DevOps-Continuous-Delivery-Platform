@@ -61,7 +61,11 @@ from src.aws.ecs_onboarding import (
 from src.build_preview import run_build_preview
 from shared.provisioning.aws_session import ConnectionError_ as AwsConnectionError, platform_account_id as aws_platform_account_id, verify_connection as aws_verify_connection
 from shared.provisioning.aws_pricing import estimate_for_region as aws_estimate_cost
-from shared.provisioning.aws_discovery import describe_selected as aws_describe_selected, discover_existing as aws_discover_existing
+from shared.provisioning.aws_discovery import (
+    describe_selected as aws_describe_selected,
+    discover_existing as aws_discover_existing,
+    get_platform_network_context as aws_platform_network_context,
+)
 from shared.provisioning.aws_cloudformation import (
     check_status as cfn_check_status,
     fetch_failure_events as cfn_fetch_failure_events,
@@ -786,6 +790,20 @@ async def _status_response(stack_name: str, region: str, connection: dict | None
         "outputs": result.outputs,
         "status_reason": result.status_reason,
     }
+
+
+@app.post("/infra-provisioning/platform-context")
+async def post_infra_platform_context(body: dict):
+    """The default VPC/CIDR/subnets the platform deploys into, so AI-designed extras (a database, a cache) are placed
+    with real ids. Read-only; tenant-account aware."""
+    connection = _connection_from(body)
+    region = body.get("region", "us-east-1")
+    try:
+        return await asyncio.to_thread(aws_platform_network_context, region, connection)
+    except RuntimeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not read the platform's network: {str(e) or type(e).__name__}")
 
 
 @app.post("/infra-provisioning/failure-events")

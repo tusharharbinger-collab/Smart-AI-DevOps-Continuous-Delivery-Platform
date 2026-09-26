@@ -38,3 +38,15 @@ def _stub_infra_cost_estimator(monkeypatch):
         return proposal
 
     monkeypatch.setattr(projects_router, "apply_independent_cost", unchanged)
+
+
+@_pytest.fixture(autouse=True)
+def _stub_platform_network_context(monkeypatch):
+    """Extras-only drafts read the platform's real VPC from pipeline-worker; router tests get a fixed one.
+    Tests of that lookup override this stub."""
+    from src.routers import projects_router
+
+    async def fixed(region, connection):
+        return {"vpc_id": "vpc-test", "vpc_cidr": "172.31.0.0/16", "subnet_ids": ["subnet-a", "subnet-b"], "region": region}
+
+    monkeypatch.setattr(projects_router, "_platform_network_context", fixed)

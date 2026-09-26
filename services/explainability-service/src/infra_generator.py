@@ -352,12 +352,75 @@ def _require_no_additional_properties(object_schema: dict) -> None:
         object_schema["additionalProperties"] = False
 
 
+# ───────── extras-only mode: the platform already builds the web-service topology ─────────
+
+_PLATFORM_OWNED_TYPES = frozenset({
+    "AWS::ElasticLoadBalancingV2::LoadBalancer", "AWS::ElasticLoadBalancingV2::Listener",
+    "AWS::ElasticLoadBalancingV2::ListenerRule", "AWS::ElasticLoadBalancingV2::TargetGroup",
+    "AWS::ECS::Cluster", "AWS::ECS::Service", "AWS::ECS::TaskDefinition",
+})
+_COMPUTE_KINDS = frozenset({"worker_service", "extra_services"})
+
+_ADDITION_SHAPES = {
+    "database": "one AWS::RDS::DBInstance (engine and size per the spec and tier) with its AWS::RDS::DBSubnetGroup, and one "
+                "AWS::EC2::SecurityGroup that allows the database port ONLY from the VPC CIDR",
+    "cache": "one AWS::ElastiCache::CacheCluster (Redis) with its AWS::ElastiCache::SubnetGroup, and one "
+             "AWS::EC2::SecurityGroup that allows port 6379 ONLY from the VPC CIDR",
+    "object_storage": "one AWS::S3::Bucket with server-side encryption (AES256) and all four PublicAccessBlockConfiguration "
+                      "flags true",
+    "worker_service": "the ECS Fargate service and task definition for the worker, in the existing cluster, with NO load "
+                      "balancer and NO target group",
+    "extra_services": "an ECS Fargate service and task definition for each additional service, in the existing cluster",
+}
+
+
+def _platform_owned_types(additions: list[dict]) -> frozenset:
+    if any(a.get("kind") in _COMPUTE_KINDS for a in additions):
+        return _PLATFORM_OWNED_TYPES - {"AWS::ECS::Service", "AWS::ECS::TaskDefinition"}
+    return _PLATFORM_OWNED_TYPES
+
+
+def _extras_only_instruction(additions: list[dict], platform_context: dict | None) -> str:
+    shapes = "; ".join(_ADDITION_SHAPES[a["kind"]] for a in additions if a.get("kind") in _ADDITION_SHAPES)
+    text = (
+        "EXTRAS-ONLY MODE. This platform ALREADY creates, for every project: the shared Application Load Balancer, "
+        "the ECS cluster, the target groups and listener rule, and the baseline and canary Fargate services with their "
+        "task definitions. You must NEVER create a load balancer, listener, target group or ECS cluster"
+        + ("" if any(a.get("kind") in _COMPUTE_KINDS for a in additions)
+           else ", nor an ECS service or task definition")
+        + f". Design ONLY what the app needs beyond that, which is exactly: {shapes}. Nothing else - no extra "
+        "resources 'for completeness'. Keep the template as small as possible. The topology must contain one node for "
+        "each resource you create plus one node with id 'app' labelled 'Your app (platform-provided services)', with an "
+        "edge from 'app' to each resource you create."
+    )
+    if platform_context:
+        text += (
+            " The network is REAL - use exactly these values, hard-coded (no Parameters, no references to resources that "
+            f"are not in your template): VpcId {platform_context['vpc_id']}, VPC CIDR {platform_context['vpc_cidr']}, "
+            f"SubnetIds {json.dumps(platform_context['subnet_ids'])}, ECS cluster name smartcd-platform."
+        )
+    return text
+
+
+def _require_only_additions(template_json: str, additions: list[dict]) -> None:
+    """Deterministic guard, not just a prompt: a template that recreates platform-owned infrastructure is rejected."""
+    owned = _platform_owned_types(additions)
+    duplicates = [f"{lid} ({r.get('Type')})" for lid, r in _template_resources(template_json).items() if r.get("Type") in owned]
+    if duplicates:
+        raise InfraGenerationError(
+            "The platform already provides the load balancer, cluster, target groups and web-service tasks. Remove these "
+            f"resources and keep only the extras the app needs: {', '.join(duplicates)}."
+        )
+
+
 async def generate_infra_proposal(
     intent_spec: dict,
     archetype: str,
     timeout_seconds: float = 60.0,
     existing_resources: dict | None = None,
     edit: dict | None = None,
+    additions: list[dict] | None = None,
+    platform_context: dict | None = None,
 ) -> dict:
     """
     `intent_spec`: the locked, tier-defaulted IntentSpec (see
@@ -374,7 +437,14 @@ async def generate_infra_proposal(
         archetype, "An unrecognized archetype — treat conservatively: propose only the minimum ECS Fargate "
         "service the spec's own needs_database/needs_cache/needs_object_storage flags call for."
     )
+    if additions:
+        resource_shape = (
+            "the platform's own standard web-service topology, which the PLATFORM builds (not you), plus only the extras "
+            "listed in the EXTRAS-ONLY MODE instructions below"
+        )
     system_instruction = _SYSTEM_INSTRUCTION_TEMPLATE.format(archetype=archetype, resource_shape=resource_shape)
+    if additions:
+        system_instruction += " " + _extras_only_instruction(additions, platform_context)
     base_user_content = f"IntentSpec:\n{json.dumps(intent_spec, default=str)}"
     if existing_resources:
         # Verified server-side against AWS (describe_selected), so `details` is ground truth -
@@ -465,6 +535,8 @@ async def generate_infra_proposal(
 
             parsed = InfraGenerationResult.model_validate_json(content)
             parsed.cloudformation_template = _repair_or_reject_cloudformation_json(parsed.cloudformation_template)
+            if additions:
+                _require_only_additions(parsed.cloudformation_template, additions)
             if existing_resources:
                 _require_retain_on_imports(parsed.cloudformation_template, existing_resources)
             if edit:

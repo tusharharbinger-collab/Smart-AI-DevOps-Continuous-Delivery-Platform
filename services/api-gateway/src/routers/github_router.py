@@ -421,7 +421,11 @@ async def _fetch_repo_tree_and_manifests(
         token = await _resolve_token(request, x_github_token)
         tree_raw = await _github_get(f"/repos/{owner}/{repo}/git/trees/{ref}", token, params={"recursive": "1"})
     except HTTPException as e:
-        if e.status_code not in (400, 401):
+        # 400 = no GitHub account connected, 401 = bare rejection, 502 = the stored token was rejected (that case
+        # deliberately maps to 502, see _github_get). All three mean "no usable user token" - a PUBLIC repo can still be
+        # read anonymously, so fall back instead of failing detection for a stale token.
+        stale_token = e.status_code == 502 and "rejected the stored token" in str(e.detail)
+        if e.status_code not in (400, 401) and not stale_token:
             raise
         logger.info("github_tree_fetch_falling_back_to_anonymous", owner=owner, repo=repo, reason=e.detail)
         token = None

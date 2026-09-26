@@ -71,10 +71,18 @@ export interface InfraProposal {
   cost_estimate?: CostEstimate;
   /** The model's own figure, kept for transparency when the computed one replaced it. */
   ai_estimated_monthly_cost_usd?: number | null;
+  /** True when the app needs nothing beyond what the platform already builds: no template, no cost, no AI call. */
+  no_additional_infrastructure?: boolean;
+  /** Plain-words explanation of what was (or was not) built and why. */
+  needs_summary?: string;
+  /** What the platform already creates for every project. */
+  platform_provides?: string[];
+  /** The extras the app needs beyond the platform's standard topology. */
+  additions?: { kind: string; reason: string }[];
 }
 
 export interface CostEstimate {
-  source: "aws-price-list" | "ai_estimate_unverified";
+  source: "aws-price-list" | "ai_estimate_unverified" | "none";
   reason?: string;
   currency?: string;
   /** Resources excluded from the total - never assumed to be $0. */

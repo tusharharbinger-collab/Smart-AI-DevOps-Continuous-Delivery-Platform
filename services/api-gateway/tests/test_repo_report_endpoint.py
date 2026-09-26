@@ -106,3 +106,47 @@ def test_build_detection_endpoint_unaffected(client, monkeypatch):
     assert data["dockerfile_path"] == "Dockerfile"
     assert data["suggested_port"] == 8080
     assert data["suggested_health_check_path"] == "/healthz"
+
+
+# ───────── a stale stored GitHub token must not break reading a PUBLIC repo ─────────
+
+def test_a_rejected_stored_token_falls_back_to_anonymous_for_a_public_repo(monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+    from src.routers import github_router as gh
+
+    calls = []
+
+    async def fake_resolve(request, header_token):
+        return "stale-token"
+
+    async def fake_get(path, token, params=None):
+        calls.append(token)
+        if token:
+            raise HTTPException(status_code=502, detail="GitHub rejected the stored token. Reconnect your GitHub account (Disconnect, then Connect GitHub again).")
+        return {"tree": [{"type": "blob", "path": "Dockerfile"}, {"type": "blob", "path": "package.json"}]}
+
+    monkeypatch.setattr(gh, "_resolve_token", fake_resolve)
+    monkeypatch.setattr(gh, "_github_get", fake_get)
+    out = asyncio.run(gh._fetch_repo_tree_and_manifests(None, "o", "r", "main", None))
+    assert "Dockerfile" in out["file_paths"]
+    assert calls[0] == "stale-token" and calls[1] is None  # tried the user's token, then went anonymous
+
+
+def test_other_github_failures_are_still_raised_not_swallowed(monkeypatch):
+    import asyncio
+    import pytest
+    from fastapi import HTTPException
+    from src.routers import github_router as gh
+
+    async def fake_resolve(request, header_token):
+        return "t"
+
+    async def fake_get(path, token, params=None):
+        raise HTTPException(status_code=403, detail="rate limited")
+
+    monkeypatch.setattr(gh, "_resolve_token", fake_resolve)
+    monkeypatch.setattr(gh, "_github_get", fake_get)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(gh._fetch_repo_tree_and_manifests(None, "o", "r", "main", None))
+    assert e.value.status_code == 403
