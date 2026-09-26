@@ -160,5 +160,6 @@ def test_build_narrative_fallback_without_api_key(monkeypatch):
     )
 
     assert isinstance(narrative, str)
-    assert f"${cost['steady_state_monthly_usd']}/mo" in narrative
-    assert "AWS Fargate" in narrative
+    # Pricing is deliberately not shown at the build step - it belongs after the infrastructure is built.
+    assert "$" not in narrative and "Fargate" not in narrative
+    assert "2 readiness observations" in narrative

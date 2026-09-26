@@ -303,20 +303,15 @@ async def build_narrative(
     Generates a concise 1-2 sentence executive summary using Groq LLM if configured,
     or falls back deterministically.
     """
-    monthly = cost.get("steady_state_monthly_usd", 8.42)
-    canary = cost.get("estimated_rollout_window_usd", 0.02)
-
     # Deterministic fallback
     if not risk_flags:
         fallback = (
-            f"Repository shows healthy structure with test and lockfile coverage. "
-            f"Estimated hosting is ${monthly}/mo steady-state on AWS Fargate (+${canary} per canary rollout)."
+            "Repository shows healthy structure with test and lockfile coverage."
         )
     else:
         flags_snippet = "; ".join(risk_flags[:2])
         fallback = (
-            f"Repository identified with {len(risk_flags)} readiness observations ({flags_snippet}). "
-            f"Estimated hosting is ${monthly}/mo on AWS Fargate (+${canary} per rollout)."
+            f"Repository identified with {len(risk_flags)} readiness observations ({flags_snippet})."
         )
 
     groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -329,8 +324,8 @@ async def build_narrative(
         f"- Risk level: {risk_level}\n"
         f"- Language: {features.language or 'Unknown'}, Framework: {features.framework or 'None'}\n"
         f"- Issues: {risk_flags if risk_flags else 'None'}\n"
-        f"- Projected cost: ${monthly}/month on AWS Fargate\n\n"
-        f"Write a professional 2-sentence executive summary for a DevOps engineer deciding whether to onboard this service."
+        "\n"
+        f"Do not mention cost or pricing. Write a professional 2-sentence executive summary for a DevOps engineer deciding whether to onboard this service."
     )
 
     try:
@@ -345,7 +340,7 @@ async def build_narrative(
                             "role": "system",
                             "content": (
                                 "You are an autonomous cloud delivery assistant. Be concise, factual, and strictly cite "
-                                "the provided risk and cost figures."
+                                "the provided risk figures."
                             ),
                         },
                         {"role": "user", "content": prompt},

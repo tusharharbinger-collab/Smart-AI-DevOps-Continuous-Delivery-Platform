@@ -1225,26 +1225,10 @@ export function NewProject() {
                                   <tone.Icon className={`h-5 w-5 ${tone.text}`} />
                                 </div>
                                 <div>
-                                  <div className="text-xs font-medium text-muted-foreground">Repo Health & Cost Prediction</div>
+                                  <div className="text-xs font-medium text-muted-foreground">Repo Health</div>
                                   <div className="flex items-baseline gap-1.5">
                                     <span className={`text-sm font-bold uppercase tracking-wide ${tone.text}`}>{level} risk</span>
                                     <span className="text-xs text-muted-foreground">· {readiness}% readiness</span>
-                                  </div>
-                                </div>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <div className="rounded-md border border-border/60 bg-background/80 px-3 py-1.5 text-right">
-                                  <div className="flex items-center justify-end gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                                    <DollarSign className="h-3 w-3" /> Steady-state
-                                  </div>
-                                  <div className="text-base font-bold text-foreground">
-                                    ${repoReport.cost.steady_state_monthly_usd}<span className="text-xs font-medium text-muted-foreground">/mo</span>
-                                  </div>
-                                </div>
-                                <div className="rounded-md border border-border/60 bg-background/80 px-3 py-1.5 text-right">
-                                  <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Per rollout</div>
-                                  <div className="text-base font-bold text-foreground">
-                                    +${repoReport.cost.estimated_rollout_window_usd}
                                   </div>
                                 </div>
                               </div>
