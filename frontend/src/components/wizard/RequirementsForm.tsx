@@ -561,6 +561,16 @@ export function RequirementsForm({ detection, value, onChange, onDraftChange, de
         {draftError && !drafting && (
           <p className="text-xs text-destructive">{draftError}</p>
         )}
+        {draft?.infra_proposal && draft.source !== infraSource && draft.status !== "INFRA_APPROVED" && (
+          <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5 text-xs" data-testid="stale-source-notice">
+            <span className="font-medium">This proposal is out of date.</span> It was generated for{" "}
+            <b>{draft.source === "existing" ? "Existing resources" : "AI-created"}</b>, but you have since selected{" "}
+            <b>{infraSource === "existing" ? "Existing resources" : "AI-created"}</b>.{" "}
+            {infraSource === "existing"
+              ? "Find and pick your existing resources, then click Preview Infrastructure (AI) to generate a proposal that attaches them."
+              : "Click Preview Infrastructure (AI) to generate a fresh AI-created proposal."}
+          </div>
+        )}
         {draft?.infra_proposal && (
           <div className="space-y-3">
             <div
@@ -591,7 +601,7 @@ export function RequirementsForm({ detection, value, onChange, onDraftChange, de
                 ) : null}
               </span>
               {draft.status === "INFRA_PENDING_APPROVAL" && (
-                <Button size="sm" onClick={handleUseThisInfrastructure} disabled={approvingDraft || policyBlockers.length > 0}
+                <Button size="sm" onClick={handleUseThisInfrastructure} disabled={approvingDraft || policyBlockers.length > 0 || draft.source !== infraSource}
                   title={policyBlockers.length > 0 ? "Blocked by infrastructure policy - edit the proposal to fix it" : undefined}>
                   {approvingDraft ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
                   Use this infrastructure
