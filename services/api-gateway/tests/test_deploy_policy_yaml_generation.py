@@ -284,3 +284,24 @@ def test_auto_graduate_omits_manual_approval_at_100_step():
     steps = canary_stage["config"]["steps"]
     final_step = next(s for s in steps if s["trafficWeight"] == 100)
     assert "requiresManualApproval" not in final_step
+
+
+def _final_step(req):
+    doc = _render(req)
+    canary_stage = next(s for s in doc["spec"]["stages"] if s["name"] == "canary_verify")
+    return next(s for s in canary_stage["config"]["steps"] if s["trafficWeight"] == 100)
+
+
+def test_automated_final_step_carries_a_real_duration_and_sample_floor():
+    """Found live: an auto-graduating pipeline got `minDuration: 0s` on its 100% step, which the worker's own
+    schema rejects - so every such run failed validation before doing anything."""
+    for req in (_base_request(auto_graduate=True), _base_request()):
+        req.deploy_policy.manual_approval_required = False
+        step = _final_step(req)
+        assert step["minDuration"] != "0s" and step["minSampleSize"] >= 100
+        assert "requiresManualApproval" not in step
+
+
+def test_human_gated_final_step_may_keep_zero_floors():
+    step = _final_step(_base_request())
+    assert step["requiresManualApproval"] is True and step["minDuration"] == "0s" and step["minSampleSize"] == 0

@@ -235,7 +235,7 @@ services:
       # by default so a fresh clone with no AWS account configured doesn't
       # advertise a live_url that resolves nowhere; the real value below is
       # this session's actually-provisioned ALB (see docs/roadmap/09-*.md).
-      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-smartcd-platform-alb-1806553190.us-east-1.elb.amazonaws.com}
+      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-}
       # Phase 9.6 (P0 #1, 2026-09-16) — the real "git push -> cloud"
       # trigger. Shared HMAC secret every registered repo's webhook signs
       # deliveries with (X-Hub-Signature-256); blank by default so a fresh
@@ -307,7 +307,7 @@ services:
       # blue-green rolls back a cutover that actually succeeded. Same
       # default as api-gateway's copy — must match exactly, since a
       # mismatch would make one service verify against the wrong ALB.
-      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-smartcd-platform-alb-1806553190.us-east-1.elb.amazonaws.com}
+      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-}
       # Gate 1 (P0, 2026-09-16) — the gate1 consumer calls back into this
       # once a webhook-triggered push's real build+test dry run finishes
       # (POST .../internal/{project_id}/gate1-result). Same Docker-network
@@ -416,7 +416,7 @@ services:
       # here before, even though graduate_canary_ecs's post-graduation
       # live-URL check (shared/live_url_check.py) needs it. Must match
       # every other service's copy exactly.
-      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-smartcd-platform-alb-1806553190.us-east-1.elb.amazonaws.com}
+      AWS_ALB_BASE_URL: ${AWS_ALB_BASE_URL:-}
     depends_on:
       redis:
         condition: service_healthy

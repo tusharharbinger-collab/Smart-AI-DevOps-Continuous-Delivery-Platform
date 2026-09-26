@@ -6,11 +6,11 @@ Snapshot: 2026-09-26. Detail lives in `PROJECT_STATUS.md` (full reference) and `
 
 | # | Item | Built | Tested | Live-verified | Left |
 |---|---|---|---|---|---|
-| 1 | Real cost calculation (AWS Price List, independent of the model) | Yes | 25 unit tests | Yes: real draft $46.72 (computed) vs $43.00 (model) | Browser check of the cost labels |
+| 1 | Real cost calculation (AWS Price List, independent of the model) | Yes | 25 unit tests | Yes: real draft $46.72 (computed) vs $43.00 (model) | Nothing |
 | 2 | Infra policy enforcement (`infra_guardrails.rego`) | Yes | OPA 39/39, gateway tests | Yes | Nothing |
-| 3 | Cross-account provisioning (BYO-AWS via `sts:AssumeRole`) | Yes (backend + `AwsAccountPicker`) | 35 + 12 unit tests | Yes: real role, confused-deputy denial, least-privilege denials, real draft + change set through the assumed role | Browser check of the picker |
-| 4 | Infra failure RCA | Yes (analyzer, worker events, gateway endpoint, UI card) | 12 + 6 + 5 unit tests | Yes, on a real failing stack (S3 name conflict) | Browser check of the failure card |
-| 5 | Blue-green cutover UI | Yes (`BlueGreenCutoverPanel`) | 12 unit tests | No | Browser check, ideally against a real blue-green run |
+| 3 | Cross-account provisioning (BYO-AWS via `sts:AssumeRole`) | Yes (backend + `AwsAccountPicker`) | 35 + 12 unit tests | Yes: real role, confused-deputy denial, least-privilege denials, real draft + change set through the assumed role | Nothing |
+| 4 | Infra failure RCA | Yes (analyzer, worker events, gateway endpoint, UI card) | 12 + 6 + 5 unit tests | Yes, on a real failing stack (S3 name conflict) | Nothing |
+| 5 | Blue-green cutover UI | Yes (`BlueGreenCutoverPanel`) | 12 unit tests | Yes: real blue-green run on AWS ECS; panel browser-verified through every phase | Rolled-back state only unit-tested |
 | 6 | CloudWatch right-sizing | Yes | 22 unit tests | Yes, on a temporary Fargate service (torn down) | Nothing |
 
 ## 2. Platform overall
@@ -31,9 +31,9 @@ Snapshot: 2026-09-26. Detail lives in `PROJECT_STATUS.md` (full reference) and `
 
 | Priority | Item | Note |
 |---|---|---|
-| Now | Browser checks: account picker, blue-green panel, failure card, cost/policy labels | Only tsc/vitest so far |
-| Now | Run `vite build`; nothing is committed yet | |
-| P0 | Live-verify blue-green end to end, post-cutover rollback drill, migration `0014`, Dockerfile synthesis for Vite/Next/static, health-check defaults, live-URL verification | BACKLOG P0 items 1-6 |
+| Now | Commit the fixes made during live verification (uncommitted) | |
+| P0 | Blue-green end to end is DONE (live). Still open: post-cutover rollback drill (needs an app that answers 5xx), Dockerfile synthesis for Vite/Next/static, health-check defaults, live-URL semantics | BACKLOG P0 rows 2, 4, 5, 6 |
+| P2 | `AWS_ALB_BASE_URL` is static and goes stale when the ALB is recreated; failed-validation pipelines are retried instead of dead-lettered | BACKLOG P2 7a/7b |
 | P2 | Orphaned ALB listener rule if a project's `path_prefix` changes | Low severity |
 | P3 | Build/Test/Deploy as dedicated routes; hosting the platform itself publicly (Phase 7); visual refresh (Phase 1b) | |
 | P4 | TLS and secrets store; OpenTelemetry tracing; `tests/e2e/*.py`; MinIO (wire a use or drop); Celery migration; root AWS password rotation | Deferred or operational |
@@ -42,9 +42,9 @@ Snapshot: 2026-09-26. Detail lives in `PROJECT_STATUS.md` (full reference) and `
 
 | Suite | Result |
 |---|---|
-| api-gateway | 340 passed |
+| api-gateway | 342 passed |
 | pipeline-worker | 280 passed, 5 skipped |
-| explainability-service | 91 passed (needs `PYTHONPATH` with the repo root) |
+| explainability-service | 92 passed (needs `PYTHONPATH` with the repo root) |
 | policy-controller | 132 passed |
 | OPA | 39/39 |
 | frontend vitest | 36 passed |

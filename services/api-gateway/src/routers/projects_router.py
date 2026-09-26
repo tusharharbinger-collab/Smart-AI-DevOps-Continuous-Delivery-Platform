@@ -376,8 +376,17 @@ def generate_project_pipeline_yaml(
     step_lines = []
     for weight in steps:
         is_final = weight >= 100
-        duration = 0 if is_final else max(120, weight * 6)
-        sample = 0 if is_final else max(body.guardrails.min_sample_size, weight * 10)
+        # Only a step held for a human (requiresManualApproval) may skip its duration/sample floors - the
+        # worker's schema rejects an automated step with a zero floor, so an auto-graduating final step
+        # (auto_graduate, or manual_approval_required=false) must carry a real one.
+        gated_by_human = is_final and manual_approval
+        if gated_by_human:
+            duration, sample = 0, 0
+        elif is_final:
+            duration, sample = 120, body.guardrails.min_sample_size
+        else:
+            duration = max(120, weight * 6)
+            sample = max(body.guardrails.min_sample_size, weight * 10)
         step_lines.append(f"          - trafficWeight: {weight}")
         step_lines.append(f"            minDuration: {duration}s")
         step_lines.append(f"            minSampleSize: {sample}")
@@ -1024,7 +1033,9 @@ async def create_project(
     onboard_response_live_url: str | None = None
     if body.provision_cluster:
         try:
-            async with httpx.AsyncClient(timeout=60.0) as http_client:
+            # 300s: a first onboarding creates the shared ALB, which alone takes 2-3 minutes; a 60s budget
+            # reported failure for work that then completed.
+            async with httpx.AsyncClient(timeout=300.0) as http_client:
                 if body.deploy_target == "aws_ecs":
                     resp = await http_client.post(
                         f"{PIPELINE_WORKER_URL}/services/onboard-aws",
@@ -1071,7 +1082,7 @@ async def create_project(
             if resp.status_code != 200:
                 provisioning["detail"] = f"pipeline-worker returned {resp.status_code}: {resp.text[:300]}"
         except httpx.RequestError as e:
-            provisioning["detail"] = f"pipeline-worker unreachable: {e}"
+            provisioning["detail"] = f"pipeline-worker unreachable: {str(e) or type(e).__name__}"
 
         if not provisioning["succeeded"]:
             logger.warning(
@@ -2035,7 +2046,7 @@ async def delete_project(project_id: str, request: Request, db: AsyncSession = D
         service_name = _k8s_name(project["name"])
         cluster_deprovisioning["attempted"] = True
         try:
-            async with httpx.AsyncClient(timeout=30.0) as http_client:
+            async with httpx.AsyncClient(timeout=300.0) as http_client:
                 if project.get("deploy_target") == "aws_ecs":
                     # Module 8 — real gap found live: this branch didn't exist
                     # at all until now, so every deleted "aws_ecs" project left
@@ -2056,7 +2067,7 @@ async def delete_project(project_id: str, request: Request, db: AsyncSession = D
             if resp.status_code != 200:
                 cluster_deprovisioning["detail"] = f"pipeline-worker returned {resp.status_code}: {resp.text[:300]}"
         except httpx.RequestError as e:
-            cluster_deprovisioning["detail"] = f"pipeline-worker unreachable: {e}"
+            cluster_deprovisioning["detail"] = f"pipeline-worker unreachable: {str(e) or type(e).__name__}"
         if not cluster_deprovisioning["succeeded"]:
             logger.warning(
                 "project_cluster_deprovisioning_failed", project_id=project_id, detail=cluster_deprovisioning["detail"]

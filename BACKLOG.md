@@ -37,18 +37,17 @@ yet.** Per this file's own convention, none of it moves to `PROJECT_STATUS.md`'s
 
 | # | Task | What it takes |
 |---|---|---|
-| 1 | **Live-verify blue-green end to end** | Onboard a real, genuinely zero-traffic repo with `deploy_mode: blue_green`, confirm the health-gated cutover (`HEALTH_GATED_CUTOVER` OPA rule, `wait_for_target_group_healthy`, `cutover_blue_green_ecs_weights`) actually reaches the live URL without any real traffic — the exact bug this was built to fix |
-| 2 | **Live-verify post-cutover automatic rollback** | A real kill-and-recover drill: break the app after a successful cutover, confirm `rollback_blue_green_ecs_weights` actually reverts traffic and the pipeline reports FAILED, not COMPLETED |
-| 3 | **Apply migration `0014`** to a real database (`deploy_mode`/`live_url_status`/`live_url_verified_at` on `projects`) |
+| 2 | **Live-verify post-cutover automatic rollback** | Unit-tested only. A real drill needs the app to answer 5xx (or be unreachable) right after cutover - `verify_live_url` treats anything under 500 as verified, so a 404 does NOT trigger it. The 2026-09-26 attempt (revoking the task security group's ALB ingress at cutover) was blocked by the permission classifier; use an app image that returns 5xx on its live path instead |
 | 4 | **Live-verify Dockerfile synthesis for real Vite/Next.js/static repos** | An actual `docker build` against each new template (`dockerfile_synthesis.py`'s spa/nextjs/static) — confirm the nginx SPA-fallback config and the multi-stage build actually produce a working image, not just correct-looking template text |
 | 5 | **Live-verify health-check defaults + ALB matcher** | Onboard a real static/SPA project via the wizard, confirm the pre-filled `/` health-check path and the `200-399` target-group matcher actually keep ECS from killing a healthy task |
-| 6 | **Live-verify live-URL verification** | Confirm `verify_live_url` actually catches the "healthy target group, 404 through the real URL" class of bug (ALB path-prefix trap) on a real deploy, and that `live_url_status` renders correctly in a real browser |
-| 7 | **Blue-green UI cutover view** | Built + unit-tested (2026-09-26, `BlueGreenCutoverPanel`); still needs a live browser check against a real blue-green run. Original scope: — health-check-in-progress/atomic-switch/old-service-termination as distinct visible phases; today the wizard shows deploy-mode + a post-hoc live-URL badge only, not a step-by-step cutover view |
+| 6 | **Live-URL verification semantics** | Verified live that it passes for a real 200 and (by design) for a 404. Still unproven against the actual ALB-prefix-trap bug class, because <500 counts as verified - decide whether that is the right bar |
 
 ## P2 — Real bugs / patches (undone, not hypothetical, AWS-relevant)
 
 | # | Bug | Where |
 |---|---|---|
+| 7a | `AWS_ALB_BASE_URL` is a static env var read by api-gateway, pipeline-worker and policy-controller; the shared ALB's DNS name changes whenever it is recreated, so live URLs and the live-URL check silently target a dead host (compose default is now empty so it fails loudly; `.env` must be set after each ALB creation). Resolve it from AWS by ALB name instead | AWS ECS path |
+| 7b | A pipeline that fails schema validation is re-delivered from the stream repeatedly (`pipeline_start_retrying_stale_message`); it should be acked/dead-lettered, not retried | pipeline-worker |
 | 7 | Orphaned ALB listener rule if a project's `path_prefix` changes between onboardings | AWS ECS path (low severity — not user-editable post-creation today) |
 
 ## P3 — Broader platform completeness

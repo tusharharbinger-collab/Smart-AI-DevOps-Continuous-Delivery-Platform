@@ -266,6 +266,22 @@ Traps found: api-gateway has no boto3 (shared modules it imports must stay boto3
 
 Tests: gateway 340, pipeline-worker 280 (5 skipped), explainability 91, policy-controller 132, OPA 39, vitest 36 - all green.
 
+### 9.11 - Live verification of blue-green on real AWS ECS (2026-09-26)
+
+Public `traefik/whoami` images (answer on any path, so the ALB path-prefix trap does not apply) deployed by the platform itself into the `smartcd-platform` cluster; everything torn down afterwards (no ALB, cluster, tasks or ENIs left).
+
+| Item | Status |
+|---|---|
+| Onboarding creates cluster, shared ALB, target groups, listener rule, baseline+canary Fargate services; live URL served by the baseline | Live-verified |
+| Blue-green rollout: stabilize, ALB health gate, atomic cutover (blue 100/0 -> 0/100), live-URL verification, graduation, `COMPLETED` (~140s) | Live-verified |
+| Blue-green cutover panel in a real browser against that run: phases advanced stabilize -> health -> switch -> verify -> graduate and the blue/green traffic split flipped 100/0 -> 0/100 -> 100/0 | Browser-verified |
+| Project deletion deprovisions services, target groups and listener rules | Live-verified (`succeeded: True` after the timeout fix) |
+| Post-cutover automatic rollback | NOT live-verified - unit-tested only (see BACKLOG P0 row 2) |
+
+Live-only bugs found and fixed: (1) a pipeline generated with `manual_approval_required=false` / `auto_graduate` had `minDuration: 0s` on its 100% step, which the worker's own schema rejects, so every such run failed validation (generator now gives an automated final step a 120s floor and the guardrail sample size; regression tests). (2) api-gateway called pipeline-worker to onboard/deprovision with 60s/30s timeouts, reporting "unreachable" (empty message) for work that then completed - now 300s with a named exception. (3) `AWS_ALB_BASE_URL` defaulted to a hardcoded, long-dead ALB hostname (compose default now empty; still needs setting per ALB - BACKLOG P2 7a).
+
+Browser verification of the earlier infra UI (11 checks, real backend and Groq): AWS account picker (connect flow, real rejected AssumeRole), draft cost/policy labels, failure-analysis card and its "Use as an edit instruction" hand-off to Edit with AI. Template-format errors are now classified as `invalid_configuration` with an edit hint.
+
 ---
 
 ## Known open bugs / small gaps (not full sub-phases, but real and undone)
