@@ -34,7 +34,7 @@ from src.tasks.deploy_task import (
 from src.tasks.ecr_auth import is_ecr_image, get_ecr_registry_credential, ensure_ecr_repository_exists
 from src.tasks.verification_task import run_verification_task
 from src.tasks.rollout_task import run_rollout_task
-from src.schemas import parse_duration_seconds
+from src.schemas import PipelineValidationError, parse_duration_seconds
 from src.aws.ecs_deploy_task import (
     deploy_ecs_canary_task,
     deploy_ecs_baseline_task,
@@ -48,16 +48,36 @@ from src.aws.ecs_deploy_task import (
 from shared.aws_ecs_actuation import wait_for_target_group_healthy, set_traffic_weights
 from shared.live_url_check import verify_live_url
 from shared.live_url_builder import build_live_url
+from shared.provisioning.alb_resolver import resolve_alb_dns_name
 
 logger = structlog.get_logger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 EXPLAINABILITY_SERVICE_URL = os.environ.get("EXPLAINABILITY_SERVICE_URL", "http://explainability-service:8004")
-# Module 8 continuation — must match api-gateway's projects_router.py's own
-# AWS_ALB_BASE_URL exactly (the real shared ALB's stable DNS name). Needed
-# here, not just in api-gateway, because the blue-green cutover path below
-# verifies the live URL for real BEFORE reporting a rollout as complete —
-# api-gateway's own copy only ever computes the string for display.
+# BACKLOG P2 #7a — the shared ALB's DNS name changes every time it is recreated, so this is resolved live from
+# AWS by the ALB's stable NAME on every call (`_resolve_alb_base_url` below) rather than read once from a static
+# env var that nothing ever updated after the first onboarding — a stale value here used to make the blue-green
+# post-cutover live-URL check silently target a dead host with no error. `AWS_ALB_BASE_URL` is kept as a fallback
+# only for a BYO-AWS or non-standard deployment where the ALB is not named `smartcd-platform-alb`.
 AWS_ALB_BASE_URL = os.environ.get("AWS_ALB_BASE_URL")
+SHARED_ALB_NAME = "smartcd-platform-alb"
+
+
+def _resolve_alb_base_url(region: str, redis_client=None) -> str | None:
+    """Live DNS name of the shared ALB, falling back to the static env var only if live resolution finds nothing
+    (e.g. a non-standard ALB name). Publishes the result to Redis so api-gateway's display-only copy — which has
+    no boto3 dependency and can't resolve this itself — stays current too."""
+    try:
+        dns_name = resolve_alb_dns_name(region, SHARED_ALB_NAME)
+    except Exception as e:
+        logger.warning("alb_dns_resolution_failed_falling_back_to_env", region=region, error=str(e))
+        dns_name = None
+    resolved = dns_name or AWS_ALB_BASE_URL
+    if dns_name and redis_client is not None:
+        try:
+            redis_client.set(f"platform:alb_dns_name:{region}", dns_name, ex=3600)
+        except Exception as e:
+            logger.warning("alb_dns_publish_to_redis_failed", region=region, error=str(e))
+    return resolved
 
 
 class PipelineOrchestrator:
@@ -331,8 +351,33 @@ class PipelineOrchestrator:
         pipeline YAML itself is untouched, so a run with no override keeps
         behaving exactly as before.
         """
-        spec: PipelineSpec = load_pipeline(manifest_path)
+        # BACKLOG P2 #7b — real gap found live: a pipeline whose generated YAML fails schema validation used to
+        # raise straight out of this call, which main.py's stream consumer treated exactly like a transient
+        # failure (network blip, AWS hiccup) — leaving the message unacked so it was re-delivered and re-validated
+        # against the exact same (still-invalid) YAML, over and over, for up to MAX_DELIVERY_ATTEMPTS cycles before
+        # finally dead-lettering. A validation error is deterministic: retrying it can never succeed, so it is
+        # acked and recorded as a real terminal FAILED run on the FIRST attempt instead — mirroring the tenant
+        # concurrency lock's own "never leave this as a ghost PENDING" fix immediately below.
         run_id = pipeline_run_id or str(uuid.uuid4())
+        try:
+            spec: PipelineSpec = load_pipeline(manifest_path)
+        except PipelineValidationError as e:
+            logger.error("pipeline_start_rejected_invalid_manifest", run_id=run_id, error=str(e))
+            if tenant_id:
+                self.state_store.save_state_sync(
+                    PipelineExecutionState(
+                        pipeline_run_id=run_id,
+                        tenant_id=tenant_id,
+                        pipeline_id=pipeline_id,
+                        service_name="unknown",
+                        current_stage="none",
+                        current_traffic_weight=0,
+                        status=StageStatus.FAILED,
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                        stages=[],
+                    )
+                )
+            return {"status": "REJECTED", "reason": f"Invalid pipeline manifest: {e}"}
         resolved_tenant_id = tenant_id or spec.tenant_id
         service_name = spec.name
         self._log_context[run_id] = {"tenant_id": resolved_tenant_id, "stage_name": "_meta"}
@@ -677,7 +722,7 @@ class PipelineOrchestrator:
                         ecs_service_name = config.get("service", service_name)
                         aws_region = config.get("awsRegion", "us-east-1")
                         path_prefix = config.get("pathPrefix") or f"/api/v1/{ecs_service_name}"
-                        live_url = build_live_url(AWS_ALB_BASE_URL, path_prefix)
+                        live_url = build_live_url(_resolve_alb_base_url(aws_region, self.redis), path_prefix)
                         blue_green_policy = {"gates": spec.gates, "guardrails": spec.guardrails}
 
                         self._log(run_id, "Blue-green rollout — waiting for the new (green) ECS service to stabilize...")
@@ -735,7 +780,7 @@ class PipelineOrchestrator:
 
                         verify_result = (
                             verify_live_url(live_url) if live_url
-                            else {"verified": False, "status_code": None, "error": "AWS_ALB_BASE_URL not configured"}
+                            else {"verified": False, "status_code": None, "error": "No shared ALB found for this region yet"}
                         )
                         if pipeline_id and self.db:
                             self.db.run_from_thread(
@@ -868,8 +913,9 @@ class PipelineOrchestrator:
                             # first deployment has no prior known-good
                             # version to roll back TO, so a failed check
                             # here is recorded and logged, not fatal.
-                            if AWS_ALB_BASE_URL:
-                                verify_result = verify_live_url(build_live_url(AWS_ALB_BASE_URL, path_prefix))
+                            resolved_alb_base_url = _resolve_alb_base_url(aws_region, self.redis)
+                            if resolved_alb_base_url:
+                                verify_result = verify_live_url(build_live_url(resolved_alb_base_url, path_prefix))
                                 if pipeline_id and self.db:
                                     self.db.run_from_thread(
                                         self.db.record_live_url_verification(

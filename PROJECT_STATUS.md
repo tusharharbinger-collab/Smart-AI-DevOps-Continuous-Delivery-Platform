@@ -296,6 +296,24 @@ Live-verified on the real repo in Chromium: no extras -> card, no AI call, appro
 
 Design choice: the human's flags win - toggling "Needs a database" off removes it even if the archetype suggests one. Not verified: the cache/storage/worker extras against real Groq (unit-tested only).
 
+### 9.14 - "Guaranteed Live Web App CI/CD" P0/P2 batch closed out (2026-09-27)
+
+All of BACKLOG's P0 rows (2, 4, 5, 6) and P2 rows (7, 7a, 7b) - live-verified or fixed against the real AWS account, all test resources torn down afterward, nothing left billing.
+
+| Item | What was done |
+|---|---|
+| #2 - post-cutover automatic rollback | Live-verified with a custom throwaway nginx image (`/healthz` -> 200, everything else -> 500, trailing-slash-agnostic - httpbin's `/status/500` route turned out to 404 on the trailing slash `build_live_url` always adds, so a purpose-built image was used instead). Real blue-green cutover to 100% canary, `verify_live_url` correctly saw the real HTTP 500, `rollback_blue_green_ecs_weights` fired, traffic reverted to 100/0 baseline, and the run recorded a real terminal `FAILED` in `execution_state` (not a silent `COMPLETED`) |
+| #4 - Dockerfile synthesis | Live-verified for `spa` (a real public Vite/React repo, tldraw/vite-template, with no Dockerfile - built via the two-stage node-build-then-nginx template, real `docker build`, real ECR push) and `static` (AfriDeploy/template-static-html, the plain nginx template) - both served real 200s through the ALB. `nextjs` not verified this round (hit GitHub's unauthenticated rate limit hunting for a suitable small standalone repo - not a platform issue, just not exercised) |
+| #5 - health-check defaults + ALB matcher | Confirmed already correctly built (`shared/repo_scanner.py::suggest_networking_defaults` - static/spa suggest port 80 + `/`, nextjs suggests port 3000 + `/`) and now live-verified: real detection against both repos returned the right values, and the resulting target groups showed `HealthCheckPath=/`, `HealthCheckPort=traffic-port`, `Matcher: 200-399`, both targets healthy |
+| #6 - live-URL verification semantics | Decision: keep "<500 = verified" (the platform can't know what the RIGHT page looks like for an arbitrary app), but close the one mechanically detectable gap - the ALB's own default listener action returns a fixed, platform-authored 404 body ("No service registered at this path.") when no project's rule matched at all; that exact response now never counts as verified, closing the part of the ALB-path-prefix-trap bug class that was silently passing through as "<500" |
+| #7a - `AWS_ALB_BASE_URL` goes stale | `shared/provisioning/alb_resolver.py` resolves the shared ALB's DNS name live from AWS by its stable NAME, with a 120s in-process cache invalidated the instant the ALB is (re)created; pipeline-worker/policy-controller call it directly, and publish the result to Redis (`platform:alb_dns_name:{region}`) so api-gateway's display-only `_live_url` (no boto3) reads it too. The static env var is now only a last-resort fallback |
+| #7b - failed-validation pipelines retried forever | A manifest that fails `load_pipeline`'s schema validation (deterministic - retrying can never produce a different outcome) is now acked and recorded as a real terminal `FAILED` run on the FIRST attempt, mirroring the existing tenant-lock-rejection fix, instead of being silently re-delivered and re-validated against the same invalid YAML for `MAX_DELIVERY_ATTEMPTS` cycles |
+| #7 - orphaned ALB listener rule on a path-prefix change | `ensure_listener_rule`'s existing-rule lookup now matches by this project's stable target-group ARNs (never by the current path condition), so a changed path_prefix updates the SAME rule (condition and actions both) instead of creating a second, orphaned one |
+
+Live-only bug found and fixed along the way: `_live_url` becoming async (to read the published Redis key) needed threading `request` through `_load_project`'s 12 call sites - a request-scoped shared helper, not obvious from any single call site.
+
+Tests: gateway 375, pipeline-worker 297 (5 skipped), policy-controller 122 (+10 needing a live OPA server, unaffected), explainability 108 - all green. AWS swept clean across all 17 regions afterward (no clusters/ALBs/ECR repos/IAM roles/security groups left).
+
 ---
 
 ## Known open bugs / small gaps (not full sub-phases, but real and undone)

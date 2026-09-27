@@ -25,14 +25,15 @@ import structlog
 from shared.aws_ecs_actuation import set_traffic_weights, scale_service, describe_current_container_config, register_task_definition, ensure_service
 from shared.live_url_check import verify_live_url
 from shared.live_url_builder import build_live_url
+from shared.provisioning.alb_resolver import resolve_alb_dns_name
 from src.audit_writer import record_actuation
 
 logger = structlog.get_logger(__name__)
 
 CLUSTER = "smartcd-platform"
-# Must match pipeline-worker's own AWS_ALB_BASE_URL exactly (the real
-# shared ALB's stable DNS name) — see worker.py's own copy of this constant
-# for why each service needs it independently rather than sharing one.
+SHARED_ALB_NAME = "smartcd-platform-alb"
+# BACKLOG P2 #7a — resolved live from AWS (see shared/provisioning/alb_resolver.py) rather than read once from a
+# static env var, which used to go stale the moment the ALB was recreated. Kept as a last-resort fallback only.
 AWS_ALB_BASE_URL = os.environ.get("AWS_ALB_BASE_URL")
 
 
@@ -246,8 +247,13 @@ async def graduate_canary_ecs(
     # trap describes (CLAUDE.md). Informational only, like the equivalent
     # first-deployment check in worker.py — a graduation that already
     # succeeded is never rolled back over this.
-    if AWS_ALB_BASE_URL:
-        verify_result = verify_live_url(build_live_url(AWS_ALB_BASE_URL, path_prefix))
+    try:
+        alb_base_url = resolve_alb_dns_name(region, SHARED_ALB_NAME) or AWS_ALB_BASE_URL
+    except Exception as e:
+        logger.warning("alb_dns_resolution_failed_falling_back_to_env", region=region, error=str(e))
+        alb_base_url = AWS_ALB_BASE_URL
+    if alb_base_url:
+        verify_result = verify_live_url(build_live_url(alb_base_url, path_prefix))
         if db and tenant_id:
             try:
                 await db.record_live_url_verification(tenant_id, pipeline_run_id, verify_result["verified"])

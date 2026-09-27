@@ -14,7 +14,13 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.routers.projects_router import _live_url, GATEWAY_BASE_URL, AWS_ALB_BASE_URL
+import asyncio
+
+from src.routers.projects_router import _live_url as _live_url_async, GATEWAY_BASE_URL, AWS_ALB_BASE_URL
+
+
+def _live_url(*a, **k):
+    return asyncio.run(_live_url_async(*a, **k))
 
 
 def test_live_url_combines_gateway_base_and_path_prefix_with_a_trailing_slash():
@@ -47,4 +53,29 @@ def test_live_url_for_aws_ecs_is_none_when_alb_base_url_not_configured(monkeypat
     import src.routers.projects_router as projects_router
 
     monkeypatch.setattr(projects_router, "AWS_ALB_BASE_URL", None)
-    assert projects_router._live_url("/api/v1/widget", deploy_target="aws_ecs") is None
+    assert asyncio.run(projects_router._live_url("/api/v1/widget", deploy_target="aws_ecs")) is None
+
+
+def test_live_url_for_aws_ecs_reads_a_freshly_published_dns_name_from_redis():
+    """BACKLOG P2 #7a - the static env var goes stale the moment the ALB is recreated; pipeline-worker/
+    policy-controller publish the live DNS name to Redis, and this is where the display link must read it from."""
+    class _Redis:
+        async def get(self, key):
+            assert key == "platform:alb_dns_name:us-east-1"
+            return "fresh-alb.us-east-1.elb.amazonaws.com"
+
+    out = asyncio.run(_live_url_async("/api/v1/widget", deploy_target="aws_ecs", redis_client=_Redis(), region="us-east-1"))
+    assert out == "http://fresh-alb.us-east-1.elb.amazonaws.com/api/v1/widget/"
+
+
+def test_live_url_for_aws_ecs_falls_back_to_the_env_var_when_nothing_is_published(monkeypatch):
+    import src.routers.projects_router as projects_router
+
+    monkeypatch.setattr(projects_router, "AWS_ALB_BASE_URL", "old-static-alb.example.com")
+
+    class _Redis:
+        async def get(self, key):
+            return None
+
+    out = asyncio.run(_live_url_async("/api/v1/widget", deploy_target="aws_ecs", redis_client=_Redis()))
+    assert out == "http://old-static-alb.example.com/api/v1/widget/"

@@ -23,6 +23,7 @@ import time
 import boto3
 import structlog
 
+from shared.provisioning.alb_resolver import invalidate_alb_dns_cache
 from shared.aws_ecs_actuation import (
     register_task_definition,
     ensure_service,
@@ -178,6 +179,12 @@ def ensure_shared_alb(elbv2, vpc_id: str, subnet_ids: list[str], alb_sg_id: str)
             IpAddressType="ipv4",
         )
         logger.info("ecs_alb_created", name=SHARED_ALB_NAME)
+        # BACKLOG P2 #7a — a new ALB has a new DNS name; drop the resolver's cache entry so the very next
+        # lookup (this same rollout's own live-URL check) sees it, not whatever was cached from before.
+        try:
+            invalidate_alb_dns_cache(elbv2.meta.region_name, SHARED_ALB_NAME)
+        except Exception:
+            pass
         # Provisioning an ALB is genuinely asynchronous — poll for "active"
         # rather than assuming the create call means it's ready to attach a
         # listener to.
@@ -290,8 +297,16 @@ def ensure_listener_rule(
     Kubernetes side's `HTTPRoute.spec.rules[].backendRefs[].weight`. One
     rule per project, matched by PathPrefix (same match type Envoy uses),
     forwarding to both target groups with their relative weights.
-    Idempotent: updates the existing rule's actions/weights if this
-    project's rule already exists, rather than erroring or duplicating it.
+    Idempotent: updates the existing rule's condition/actions/weights if this project's rule already exists,
+    rather than erroring or duplicating it.
+
+    BACKLOG P2 #7 — real gap found live: the existing-rule lookup used to match by the CURRENT path condition
+    only, so a project whose path_prefix ever changed between onboardings would never find its own old rule
+    (which still points at the exact same target groups, just under the old path) and would create a SECOND
+    rule instead — an orphan left routing the old path forever, silently eating a listener-rule slot (an ALB
+    listener caps at 100). A project's target-group ARNs (derived from its own name, never from path_prefix) are
+    the true stable identity of "this project's rule" — matched on those instead, so a path-prefix change
+    updates the SAME rule in place (both its condition and its actions) rather than ever creating a duplicate.
     """
     clean = path_prefix.rstrip("/")
     condition = [{"Field": "path-pattern", "Values": [clean, f"{clean}/*"]}]
@@ -306,20 +321,17 @@ def ensure_listener_rule(
             },
         }
     ]
+    this_project_tgs = {baseline_tg_arn, canary_tg_arn}
     rules = elbv2.describe_rules(ListenerArn=listener_arn)["Rules"]
-    existing_rule = next(
-        (
-            r
-            for r in rules
-            if r.get("Conditions")
-            and (
-                r["Conditions"][0].get("Values") == condition[0]["Values"]
-                or r["Conditions"][0].get("Values") == [f"{clean}*"]
-                or clean in r["Conditions"][0].get("Values", [])
-            )
-        ),
-        None,
-    )
+
+    def _rule_target_groups(r: dict) -> set:
+        return {
+            tg["TargetGroupArn"]
+            for a in r.get("Actions", [])
+            for tg in a.get("ForwardConfig", {}).get("TargetGroups", [])
+        }
+
+    existing_rule = next((r for r in rules if _rule_target_groups(r) == this_project_tgs), None)
     if existing_rule:
         elbv2.modify_rule(RuleArn=existing_rule["RuleArn"], Conditions=condition, Actions=action)
         logger.info("ecs_listener_rule_updated", path_prefix=path_prefix)

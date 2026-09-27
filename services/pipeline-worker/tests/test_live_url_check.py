@@ -20,13 +20,14 @@ from shared.live_url_builder import build_live_url
 
 
 class _FakeResponse:
-    def __init__(self, status_code):
+    def __init__(self, status_code, text=""):
         self.status_code = status_code
+        self.text = text
 
 
 def test_verified_on_first_attempt_with_200(monkeypatch):
     calls = []
-    monkeypatch.setattr(live_url_check.requests, "get", lambda url, timeout, allow_redirects: calls.append(url) or _FakeResponse(200))
+    monkeypatch.setattr(live_url_check.requests, "get", lambda url, timeout, allow_redirects: calls.append(url) or _FakeResponse(200, text="<html>ok</html>"))
     monkeypatch.setattr(live_url_check.time, "sleep", lambda s: None)
 
     result = live_url_check.verify_live_url("http://example.test/api/v1/widget")
@@ -34,14 +35,32 @@ def test_verified_on_first_attempt_with_200(monkeypatch):
     assert len(calls) == 1
 
 
-def test_404_counts_as_verified(monkeypatch):
-    # A 404 proves the ALB routed the request to a real, responding
-    # application — this function's job is confirming SOMETHING real
-    # answered, not judging whether the response is the right page.
-    monkeypatch.setattr(live_url_check.requests, "get", lambda url, timeout, allow_redirects: _FakeResponse(404))
+def test_a_genuine_app_404_still_counts_as_verified(monkeypatch):
+    # A 404 from the APP's own router (e.g. its "page not found" page) proves the ALB routed the request to a
+    # real, responding application — this function's job is confirming SOMETHING real answered, not judging
+    # whether the response is the right page. Distinct from the ALB's own default no-match response below.
+    monkeypatch.setattr(live_url_check.requests, "get", lambda url, timeout, allow_redirects: _FakeResponse(404, text="<h1>Not Found</h1>"))
     result = live_url_check.verify_live_url("http://example.test/api/v1/widget")
     assert result["verified"] is True
     assert result["status_code"] == 404
+
+
+def test_the_albs_own_default_no_route_response_never_counts_as_verified(monkeypatch):
+    """BACKLOG P0 #6 — real gap: <500 counting as verified let the exact bug class this function exists to catch
+    (the ALB path-prefix trap, CLAUDE.md) straight through, because that failure mode IS a 404 - the same status
+    code a genuine app 404 would return. The ALB's own default listener action returns this exact, platform-
+    authored body when no project's rule matched the path at all; that specific response must never pass, no
+    matter how many retries."""
+    monkeypatch.setattr(
+        live_url_check.requests, "get",
+        lambda url, timeout, allow_redirects: _FakeResponse(404, text="No service registered at this path."),
+    )
+    monkeypatch.setattr(live_url_check.time, "sleep", lambda s: None)
+
+    result = live_url_check.verify_live_url("http://example.test/api/v1/widget", retries=2)
+    assert result["verified"] is False
+    assert result["status_code"] == 404
+    assert "never reached the app" in result["error"]
 
 
 def test_retries_on_5xx_then_succeeds(monkeypatch):

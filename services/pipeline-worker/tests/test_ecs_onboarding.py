@@ -248,16 +248,19 @@ def test_listener_rule_created_with_correct_weights():
     assert tgs == [{"TargetGroupArn": "tg-baseline", "Weight": 100}, {"TargetGroupArn": "tg-canary", "Weight": 0}]
 
 
+def _rule(rule_arn, path_values, baseline_tg="tg-baseline", canary_tg="tg-canary", priority="1"):
+    return {
+        "RuleArn": rule_arn,
+        "Priority": priority,
+        "Conditions": [{"Field": "path-pattern", "Values": path_values}],
+        "Actions": [{"Type": "forward", "ForwardConfig": {"TargetGroups": [
+            {"TargetGroupArn": baseline_tg, "Weight": 100}, {"TargetGroupArn": canary_tg, "Weight": 0},
+        ]}}],
+    }
+
+
 def test_listener_rule_updates_in_place_when_it_already_exists_for_this_path():
-    existing = [
-        {
-            "RuleArn": "rule-1",
-            "Priority": "1",
-            "Conditions": [{"Field": "path-pattern", "Values": ["/api/v1/checkout*"]}],
-            "Actions": [],
-        }
-    ]
-    elbv2 = _FakeElbv2Rules(existing_rules=existing)
+    elbv2 = _FakeElbv2Rules(existing_rules=[_rule("rule-1", ["/api/v1/checkout*"])])
     ecs_onboarding.ensure_listener_rule(
         elbv2, "listener-arn", "/api/v1/checkout", "tg-baseline", "tg-canary",
         baseline_weight=50, canary_weight=50, priority=1,
@@ -266,6 +269,33 @@ def test_listener_rule_updates_in_place_when_it_already_exists_for_this_path():
     assert len(elbv2.modified) == 1
     tgs = elbv2.modified[0]["Actions"][0]["ForwardConfig"]["TargetGroups"]
     assert tgs[0]["Weight"] == 50 and tgs[1]["Weight"] == 50
+
+
+def test_a_changed_path_prefix_updates_the_same_rule_instead_of_orphaning_it():
+    """BACKLOG P2 #7 — real gap found live: the old lookup matched by the CURRENT path only, so a project whose
+    path_prefix changed never found its own rule (same target groups, old path) and created a SECOND one instead
+    - an orphan silently routing the old path forever. Matching by target groups (this project's stable identity)
+    fixes it: the SAME rule is updated in place, condition and all."""
+    elbv2 = _FakeElbv2Rules(existing_rules=[_rule("rule-1", ["/api/v1/old-checkout*"])])
+    rule_arn = ecs_onboarding.ensure_listener_rule(
+        elbv2, "listener-arn", "/api/v1/new-checkout", "tg-baseline", "tg-canary",
+        baseline_weight=100, canary_weight=0, priority=1,
+    )
+    assert len(elbv2.created) == 0, "must update the existing rule for this project, never create a duplicate"
+    assert rule_arn == "rule-1"
+    assert elbv2.modified[0]["RuleArn"] == "rule-1"
+
+
+def test_a_different_projects_rule_at_the_same_looking_path_is_never_matched():
+    """Two different projects' target groups never collide - a rule for a DIFFERENT project's target groups must
+    never be mistaken for this one's, even if a path condition happened to look similar."""
+    elbv2 = _FakeElbv2Rules(existing_rules=[_rule("rule-other", ["/api/v1/checkout*"], baseline_tg="tg-other-baseline", canary_tg="tg-other-canary")])
+    ecs_onboarding.ensure_listener_rule(
+        elbv2, "listener-arn", "/api/v1/checkout", "tg-baseline", "tg-canary",
+        baseline_weight=100, canary_weight=0, priority=2,
+    )
+    assert len(elbv2.created) == 1, "a different project's rule must not be reused"
+    assert len(elbv2.modified) == 0
 
 
 # ─────────────────────────── set_traffic_weights ───────────────────────────

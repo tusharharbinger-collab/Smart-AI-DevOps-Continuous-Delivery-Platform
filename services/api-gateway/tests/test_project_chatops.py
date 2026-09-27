@@ -60,7 +60,7 @@ class _FakeAsyncClient:
 
 
 def _patch_project_and_tenant(monkeypatch, tenant_id="tenant-1"):
-    async def fake_load_project(db, project_id, tid):
+    async def fake_load_project(db, project_id, tid, request=None):
         assert tid == tenant_id
         return {"pipeline_id": "pipe-1", "project_id": project_id}
 
@@ -86,7 +86,7 @@ def test_proxies_the_question_with_the_sessions_own_tenant_id_never_the_body(mon
 
 
 def test_404s_for_a_project_outside_the_callers_tenant(monkeypatch):
-    async def fake_load_project_not_found(db, project_id, tenant_id):
+    async def fake_load_project_not_found(db, project_id, tenant_id, request=None):
         raise HTTPException(status_code=404, detail="Project not found")
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project_not_found)

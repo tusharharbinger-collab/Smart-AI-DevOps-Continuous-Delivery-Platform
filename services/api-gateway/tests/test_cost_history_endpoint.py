@@ -63,7 +63,7 @@ def _row(cost_id, run_id, baseline, canary, delta, rec=None, verification_eviden
 
 
 def test_returns_rows_with_json_serializable_fields(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
@@ -86,7 +86,7 @@ def test_returns_rows_with_json_serializable_fields(monkeypatch):
 
 
 def test_rightsizing_rec_passes_through_null_honestly_not_fabricated(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
@@ -101,7 +101,7 @@ def test_rightsizing_rec_passes_through_null_honestly_not_fabricated(monkeypatch
 
 
 def test_rightsizing_rec_passes_through_when_present(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
@@ -117,7 +117,7 @@ def test_rightsizing_rec_passes_through_when_present(monkeypatch):
 
 
 def test_totals_are_summed_across_all_returned_rows(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
@@ -133,7 +133,7 @@ def test_totals_are_summed_across_all_returned_rows(monkeypatch):
 
 
 def test_empty_history_returns_empty_list_and_zero_totals(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
@@ -147,7 +147,7 @@ def test_empty_history_returns_empty_list_and_zero_totals(monkeypatch):
     
 
 def test_insufficient_samples_sets_performance_correlation_status(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)
@@ -169,7 +169,7 @@ def test_insufficient_samples_sets_performance_correlation_status(monkeypatch):
 
 
 def test_valid_mann_whitney_calculates_latency_delta(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)

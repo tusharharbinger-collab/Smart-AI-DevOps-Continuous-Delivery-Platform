@@ -26,6 +26,15 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# BACKLOG P0 #6 — the shared ALB's listener has exactly one hardcoded default action for a path no project's
+# rule matches at all (ecs_onboarding.py's ensure_shared_alb): a fixed 404 with this literal body. That specific
+# response means the request was never routed to any real application — the exact failure this function exists
+# to catch (the ALB path-prefix trap, CLAUDE.md) — and must never be mistaken for a genuine response, unlike an
+# arbitrary app's OWN 404 for a page it doesn't have, which this function still correctly treats as "verified"
+# (it has no way to know what the RIGHT page looks like for an arbitrary onboarded app — only AWS's own
+# catch-all is a response this platform authored and can recognize with certainty).
+_ALB_DEFAULT_NO_ROUTE_BODY = "No service registered at this path."
+
 
 def verify_live_url(
     url: str, retries: int = 5, delay_seconds: float = 3.0, timeout_seconds: float = 10.0
@@ -42,7 +51,10 @@ def verify_live_url(
     (which is what this function exists to confirm); it is not this
     function's job to judge whether that response is the RIGHT page, only
     that something real answered instead of the ALB's own default 404/503
-    or a connection failure.
+    or a connection failure. The one exception: the ALB's own default
+    "no rule matched this path at all" response is recognized by its exact,
+    platform-authored body and never counts as verified, however low its
+    status code — see `_ALB_DEFAULT_NO_ROUTE_BODY` above.
     """
     if not url:
         return {"verified": False, "status_code": None, "error": "No live_url to verify."}
@@ -53,10 +65,13 @@ def verify_live_url(
         try:
             resp = requests.get(url, timeout=timeout_seconds, allow_redirects=True)
             last_status = resp.status_code
-            if resp.status_code < 500:
+            if resp.status_code == 404 and resp.text.strip() == _ALB_DEFAULT_NO_ROUTE_BODY:
+                last_error = "No ALB listener rule matched this path — the request never reached the app"
+            elif resp.status_code < 500:
                 logger.info("live_url_verified", url=url, status_code=resp.status_code, attempt=attempt)
                 return {"verified": True, "status_code": resp.status_code, "error": None}
-            last_error = f"HTTP {resp.status_code}"
+            else:
+                last_error = f"HTTP {resp.status_code}"
         except requests.RequestException as e:
             last_error = str(e)
 

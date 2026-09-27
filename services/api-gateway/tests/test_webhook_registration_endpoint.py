@@ -70,7 +70,7 @@ def _configure(monkeypatch):
     monkeypatch.setattr(projects_router.settings, "GITHUB_WEBHOOK_SECRET", "test-secret")
     monkeypatch.setattr(projects_router.settings, "API_GATEWAY_PUBLIC_URL", "https://smartcd.example.com")
 
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return dict(PROJECT)
 
     async def fake_resolve_token(request, header_token):
@@ -93,7 +93,7 @@ def test_503_when_webhook_secret_not_configured(monkeypatch):
 
 
 def test_409_when_project_has_no_github_repo(monkeypatch):
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1", "repo_url": None, "branch": "main"}
 
     monkeypatch.setattr(projects_router, "_load_project", fake_load_project)

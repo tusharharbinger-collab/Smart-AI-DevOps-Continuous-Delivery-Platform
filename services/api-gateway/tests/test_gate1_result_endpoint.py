@@ -129,7 +129,7 @@ def test_passed_result_triggers_the_real_rollout(monkeypatch):
         captured.update(kwargs)
         return "run-real-123"
 
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         assert project_id == "proj-1"
         assert tenant_id == "tenant-1"
         return {"pipeline_id": "pipe-1"}
@@ -171,7 +171,7 @@ def test_passed_result_still_surfaces_a_non_blocking_test_warning(monkeypatch):
     async def fake_trigger(**kwargs):
         return "run-real-456"
 
-    async def fake_load_project(db, project_id, tenant_id):
+    async def fake_load_project(db, project_id, tenant_id, request=None):
         return {"pipeline_id": "pipe-1"}
 
     monkeypatch.setattr(projects_router, "_trigger_rollout_internal", fake_trigger)

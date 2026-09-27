@@ -27,28 +27,17 @@ targets.
 
 ---
 
-## P0 — Live-verify the "Guaranteed Live Web App CI/CD" build (2026-09-17)
+## P0 — "Guaranteed Live Web App CI/CD" (done, 2026-09-27)
 
-**Code-complete and unit-tested (432 backend tests + 11 OPA tests, zero
-regressions; `tsc -b`/`vite build` clean) — nothing below is live-verified
-yet.** Per this file's own convention, none of it moves to `PROJECT_STATUS.md`'s
-✅ column until proven against the real `smartcd-platform` AWS account. See
-`PROJECT_STATUS.md`'s 9.4 for the full per-item breakdown.
-
-| # | Task | What it takes |
-|---|---|---|
-| 2 | **Live-verify post-cutover automatic rollback** | Unit-tested only. A real drill needs the app to answer 5xx (or be unreachable) right after cutover - `verify_live_url` treats anything under 500 as verified, so a 404 does NOT trigger it. The 2026-09-26 attempt (revoking the task security group's ALB ingress at cutover) was blocked by the permission classifier; use an app image that returns 5xx on its live path instead |
-| 4 | **Live-verify Dockerfile synthesis for real Vite/Next.js/static repos** | An actual `docker build` against each new template (`dockerfile_synthesis.py`'s spa/nextjs/static) — confirm the nginx SPA-fallback config and the multi-stage build actually produce a working image, not just correct-looking template text |
-| 5 | **Live-verify health-check defaults + ALB matcher** | Onboard a real static/SPA project via the wizard, confirm the pre-filled `/` health-check path and the `200-399` target-group matcher actually keep ECS from killing a healthy task |
-| 6 | **Live-URL verification semantics** | Verified live that it passes for a real 200 and (by design) for a 404. Still unproven against the actual ALB-prefix-trap bug class, because <500 counts as verified - decide whether that is the right bar |
+All six items live-verified end to end against the real `smartcd-platform` AWS account (real SPA/static/blue-green
+deploys, a real post-cutover rollback, all real resources torn down afterward) - see `PROJECT_STATUS.md` 9.14.
 
 ## P2 — Real bugs / patches (undone, not hypothetical, AWS-relevant)
 
+Items 7/7a/7b fixed 2026-09-27 - see `PROJECT_STATUS.md` 9.14.
+
 | # | Bug | Where |
 |---|---|---|
-| 7a | `AWS_ALB_BASE_URL` is a static env var read by api-gateway, pipeline-worker and policy-controller; the shared ALB's DNS name changes whenever it is recreated, so live URLs and the live-URL check silently target a dead host (compose default is now empty so it fails loudly; `.env` must be set after each ALB creation). Resolve it from AWS by ALB name instead | AWS ECS path |
-| 7b | A pipeline that fails schema validation is re-delivered from the stream repeatedly (`pipeline_start_retrying_stale_message`); it should be acked/dead-lettered, not retried | pipeline-worker |
-| 7 | Orphaned ALB listener rule if a project's `path_prefix` changes between onboardings | AWS ECS path (low severity — not user-editable post-creation today) |
 
 ## P3 — Broader platform completeness
 

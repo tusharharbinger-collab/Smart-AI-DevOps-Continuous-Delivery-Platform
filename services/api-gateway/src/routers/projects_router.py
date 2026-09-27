@@ -75,7 +75,9 @@ GATEWAY_BASE_URL = os.environ.get("GATEWAY_BASE_URL", "http://localhost")
 AWS_ALB_BASE_URL = os.environ.get("AWS_ALB_BASE_URL")
 
 
-def _live_url(path_prefix: str | None, deploy_target: str = "kubernetes") -> str | None:
+async def _live_url(
+    path_prefix: str | None, deploy_target: str = "kubernetes", redis_client=None, region: str = "us-east-1",
+) -> str | None:
     if not path_prefix:
         return None
     if deploy_target == "aws_ecs":
@@ -83,7 +85,21 @@ def _live_url(path_prefix: str | None, deploy_target: str = "kubernetes") -> str
         # trailing slash — see shared/live_url_check.py::build_live_url's
         # docstring for the exact live incident (a real onboarded app
         # rendered completely unstyled with no working JS at this link).
-        return build_live_url(AWS_ALB_BASE_URL, path_prefix)
+        #
+        # BACKLOG P2 #7a — AWS_ALB_BASE_URL is a static env var that goes stale the moment the shared ALB is
+        # recreated. api-gateway has no boto3, so it can't resolve the DNS name itself (see the "no boto3" trap
+        # in CLAUDE.md) — pipeline-worker/policy-controller resolve it live and publish it here instead, every
+        # time they touch AWS for a real rollout. Falls back to the static env var only if nothing was ever
+        # published yet (e.g. no project in this region has onboarded since the gateway last restarted).
+        alb_base_url = AWS_ALB_BASE_URL
+        if redis_client is not None:
+            try:
+                published = await redis_client.get(f"platform:alb_dns_name:{region}")
+                if published:
+                    alb_base_url = published
+            except Exception as e:
+                logger.warning("alb_dns_redis_read_failed", region=region, error=str(e))
+        return build_live_url(alb_base_url, path_prefix)
     normalized_prefix = path_prefix if path_prefix.endswith("/") else f"{path_prefix}/"
     return f"{GATEWAY_BASE_URL}{normalized_prefix}"
 
@@ -614,7 +630,7 @@ spec:
 """
 
 
-async def _load_project(db: AsyncSession, project_id: str, tenant_id: str) -> dict:
+async def _load_project(db: AsyncSession, project_id: str, tenant_id: str, request: Request | None = None) -> dict:
     result = await db.execute(
         text(
             """
@@ -633,7 +649,10 @@ async def _load_project(db: AsyncSession, project_id: str, tenant_id: str) -> di
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     project = dict(row)
-    project["live_url"] = _live_url(project.get("path_prefix"), project.get("deploy_target", "kubernetes"))
+    project["live_url"] = await _live_url(
+        project.get("path_prefix"), project.get("deploy_target", "kubernetes"),
+        request.app.state.redis if request is not None else None, project.get("aws_region", "us-east-1"),
+    )
     return project
 
 
@@ -808,7 +827,10 @@ async def list_projects(request: Request, db: AsyncSession = Depends(get_request
             if s and s.get("avg_duration_seconds") is not None
             else None
         )
-        proj["live_url"] = _live_url(proj.get("path_prefix"), proj.get("deploy_target", "kubernetes"))
+        proj["live_url"] = await _live_url(
+            proj.get("path_prefix"), proj.get("deploy_target", "kubernetes"),
+            request.app.state.redis, proj.get("aws_region", "us-east-1"),
+        )
 
     return {"projects": projects}
 
@@ -1100,7 +1122,9 @@ async def create_project(
         "namespace": namespace,
         "generated_pipeline_yaml": policy_yaml,
         "cluster_provisioning": provisioning,
-        "live_url": onboard_response_live_url or _live_url(effective_path_prefix, body.deploy_target),
+        "live_url": onboard_response_live_url or await _live_url(
+            effective_path_prefix, body.deploy_target, request.app.state.redis, body.aws_region,
+        ),
     }
 
 
@@ -1988,7 +2012,7 @@ async def preview_pipeline_ai_tuned(body: PipelinePreviewGenerateRequest, reques
 @router.get("/{project_id}")
 async def get_project(project_id: str, request: Request, db: AsyncSession = Depends(get_request_db)):
     tenant_id = _get_tenant_id(request)
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
 
     runs_result = await db.execute(
         text(
@@ -2029,7 +2053,7 @@ async def delete_project(project_id: str, request: Request, db: AsyncSession = D
     must not block deleting the project record.
     """
     tenant_id = _get_tenant_id(request)
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
 
     # Symmetric with create_project's registration — an orphaned mapping
     # would otherwise let a push to this repo silently trigger a rollout
@@ -2241,7 +2265,7 @@ async def trigger_project_rollout(
     pipeline-worker replica's consumer group picks it up.
     """
     tenant_id = _get_tenant_id(request)
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
     run_id = await _trigger_rollout_internal(
         db=db,
         redis_client=request.app.state.redis,
@@ -2281,7 +2305,7 @@ async def register_project_webhook(
     broken webhook" action if that Redis-only index was ever lost.
     """
     tenant_id = _get_tenant_id(request)
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
 
     if not settings.GITHUB_WEBHOOK_SECRET:
         raise HTTPException(
@@ -2419,7 +2443,7 @@ async def generate_pipeline_via_ai(
     error rather than silently handing back something invalid.
     """
     tenant_id = _get_tenant_id(request)
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
     if not project.get("pipeline_id"):
         raise HTTPException(status_code=409, detail="Project has no linked pipeline to edit")
 
@@ -2481,7 +2505,7 @@ async def ask_project_question(
     to the same service.
     """
     tenant_id = _get_tenant_id(request)
-    await _load_project(db, project_id, tenant_id)
+    await _load_project(db, project_id, tenant_id, request)
 
     try:
         async with httpx.AsyncClient(timeout=35.0) as client:
@@ -2510,7 +2534,7 @@ async def analyze_project_log_hygiene(
     generates a clean unified diff patch ready for one-click review and application.
     """
     tenant_id = _get_tenant_id(request)
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
 
     code_files = dict(body.code_files)
     cw_logs = list(body.cloudwatch_logs)
@@ -2582,7 +2606,7 @@ async def score_project_predictive_risk(
     touched to output a 0-100 risk score, risk factors, and adaptive canary ramp steps.
     """
     tenant_id = _get_tenant_id(request)
-    await _load_project(db, project_id, tenant_id)
+    await _load_project(db, project_id, tenant_id, request)
     try:
         async with httpx.AsyncClient(timeout=35.0) as client:
             resp = await client.post(
@@ -2609,7 +2633,7 @@ async def list_project_runs(
 ):
     """Run history for one project — strictly filtered by project_id."""
     tenant_id = _get_tenant_id(request)
-    await _load_project(db, project_id, tenant_id)
+    await _load_project(db, project_id, tenant_id, request)
 
     result = await db.execute(
         text(
@@ -2667,7 +2691,7 @@ async def get_project_cost_history(
     must render "not enough usage data yet" for a null value, not invent one.
     """
     tenant_id = _get_tenant_id(request)
-    await _load_project(db, project_id, tenant_id)
+    await _load_project(db, project_id, tenant_id, request)
 
     result = await db.execute(
         text(
@@ -3124,7 +3148,7 @@ async def report_gate1_result(project_id: str, body: dict, request: Request, db:
         return {"status": "BLOCKED", "project_id": project_id}
 
     await db.execute(text("SELECT set_config('app.active_tenant_id', :tid, true)"), {"tid": tenant_id})
-    project = await _load_project(db, project_id, tenant_id)
+    project = await _load_project(db, project_id, tenant_id, request)
     run_id = await _trigger_rollout_internal(
         db=db,
         redis_client=redis_client,
@@ -3163,7 +3187,7 @@ async def project_audit(project_id: str, request: Request, db: AsyncSession = De
     project via a join on pipeline_executions.project_id.
     """
     tenant_id = _get_tenant_id(request)
-    await _load_project(db, project_id, tenant_id)
+    await _load_project(db, project_id, tenant_id, request)
 
     result = await db.execute(
         text(
