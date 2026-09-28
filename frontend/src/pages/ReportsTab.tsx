@@ -24,7 +24,6 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity, AlertTriangle, Clock, DollarSign, GitCommit, Sparkles, TrendingDown, TrendingUp, Minus,
 } from "lucide-react";
-import { AreaChart, Area, ResponsiveContainer, YAxis } from "recharts";
 import { useAppContext } from "@/hooks/useAppContext";
 import { getDeliveryHealthDigest, getDeploymentReport } from "@/api/reports";
 import { getCostHistory } from "@/api/reports";
@@ -32,6 +31,7 @@ import { listProjectRuns } from "@/api/projects";
 import { VerdictBadge } from "@/components/verification/VerdictBadge";
 import { ConfidenceGauge } from "@/components/charts/ConfidenceGauge";
 import { MetricEvidenceCard } from "@/components/verification/MetricEvidenceCard";
+import { StatTile, type Health } from "@/components/dashboard/StatTile";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
@@ -44,70 +44,6 @@ const TREND_STYLE: Record<string, { icon: typeof TrendingUp; className: string; 
   stable: { icon: Minus, className: "text-muted-foreground", border: "border-l-muted-foreground/40", label: "Stable" },
   degrading: { icon: TrendingDown, className: "text-destructive", border: "border-l-destructive", label: "Degrading" },
 };
-
-type Health = "good" | "warn" | "bad" | "neutral";
-
-const HEALTH_STYLE: Record<Health, { text: string; ring: string; icon: string }> = {
-  good: { text: "text-success", ring: "ring-success/15", icon: "bg-success/10 text-success" },
-  warn: { text: "text-warning", ring: "ring-warning/15", icon: "bg-warning/10 text-warning" },
-  bad: { text: "text-destructive", ring: "ring-destructive/15", icon: "bg-destructive/10 text-destructive" },
-  neutral: { text: "text-foreground", ring: "ring-border", icon: "bg-muted text-muted-foreground" },
-};
-
-/** A tiny trend line with no axes/legend — shows shape, not precision, same pattern as every stat-tile
- * sparkline in modern delivery dashboards (Vercel/Linear-style). Real cost-history data, oldest to newest. */
-function Sparkline({ points, color }: { points: number[]; color: string }) {
-  if (points.length < 2) return null;
-  const data = points.map((v, i) => ({ i, v }));
-  return (
-    <ResponsiveContainer width="100%" height={28}>
-      <AreaChart data={data} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
-        <YAxis hide domain={["dataMin", "dataMax"]} />
-        <defs>
-          <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={color} stopOpacity={0.35} />
-            <stop offset="100%" stopColor={color} stopOpacity={0} />
-          </linearGradient>
-        </defs>
-        <Area type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} fill="url(#sparkFill)" dot={false} isAnimationActive={false} />
-      </AreaChart>
-    </ResponsiveContainer>
-  );
-}
-
-function StatCard({
-  label, value, sub, icon: Icon, health = "neutral", sparkline,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  icon: typeof Activity;
-  health?: Health;
-  sparkline?: number[];
-}) {
-  const style = HEALTH_STYLE[health];
-  return (
-    <Card className={cn("ring-1", style.ring)}>
-      <CardContent className="p-4">
-        <div className="flex items-start justify-between">
-          <div>
-            <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</span>
-            <div className={cn("text-stat text-2xl font-semibold", style.text)}>{value}</div>
-            {sub && <span className="text-code text-[11px] text-muted-foreground">{sub}</span>}
-          </div>
-          <div className={cn("rounded-md p-1.5", style.icon)}>
-            <Icon className="h-4 w-4" />
-          </div>
-        </div>
-        {sparkline && sparkline.length >= 2 && (
-          <div className="mt-2 -mb-1">
-            <Sparkline points={sparkline} color={health === "bad" ? "hsl(var(--destructive))" : health === "warn" ? "hsl(var(--warning))" : "hsl(var(--success))"} />
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
 
 function successRateHealth(pct: number): Health {
   return pct >= 95 ? "good" : pct >= 80 ? "warn" : "bad";
@@ -265,26 +201,26 @@ export function ReportsTab() {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
+        <StatTile
           label="Success rate (7d)"
           value={digest ? `${digest.pipeline_success_rate_percent}%` : "—"}
           sub={digest ? `${digest.total_deployments} deployment(s)` : undefined}
           icon={Activity}
           health={digest ? successRateHealth(digest.pipeline_success_rate_percent) : "neutral"}
         />
-        <StatCard
+        <StatTile
           label="Rollback rate"
           value={digest ? `${digest.rollback_rate_percent}%` : "—"}
           sub={digest ? `${digest.rollback_count} rollback(s)` : undefined}
           icon={TrendingDown}
           health={digest ? rollbackRateHealth(digest.rollback_rate_percent) : "neutral"}
         />
-        <StatCard
+        <StatTile
           label="Mean time to verify"
           value={digest?.mean_time_to_verify_seconds != null ? `${Math.round(digest.mean_time_to_verify_seconds)}s` : "—"}
           icon={Clock}
         />
-        <StatCard
+        <StatTile
           label="Avg cost delta"
           value={digest ? `${digest.avg_cost_delta_percent > 0 ? "+" : ""}${digest.avg_cost_delta_percent}%` : "—"}
           sub={costDeltaSpark && costDeltaSpark.length >= 2 ? `last ${costDeltaSpark.length} runs` : undefined}
