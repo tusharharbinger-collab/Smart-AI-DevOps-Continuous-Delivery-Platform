@@ -15,21 +15,30 @@ import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/com
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
+import { apiClient } from "@/api/client";
 
+/**
+ * Real bug found live: this used to be a bare `fetch("/api/v1/...")` (a relative path, hitting the Vite dev
+ * server on :3000 instead of the api-gateway on :8000, with no Authorization header either) — every scan 404'd
+ * silently before it ever reached the backend. Routed through apiClient (real base URL + auth) instead.
+ *
+ * These field names/types match explainability-service's real LogHygieneReport/DetectedLogIssue schema
+ * (log_hygiene_analyzer.py) exactly — they previously didn't (`file` vs. the real `file_path`, a per-issue
+ * `estimated_monthly_cost_usd` that the backend never sends, a `total_log_statements_found` that doesn't exist),
+ * so a successful scan crashed the render the instant `.toFixed()` was called on an undefined per-issue cost.
+ */
 export interface LogHygieneIssue {
-  file: string;
-  line_number: number;
+  file_path: string;
+  line_number: number | null;
   statement: string;
-  issue_type: "NOISY_DEBUG" | "SENSITIVE_LEAK_RISK" | "HIGH_FREQUENCY_SPAM";
+  issue_type: "DEBUG_NOISE" | "SENSITIVE_LEAK_RISK" | "HIGH_VOLUME_SPAM";
   reason: string;
-  estimated_monthly_cost_usd: number;
 }
 
 export interface LogHygieneReport {
+  summary: string;
   detected_issues: LogHygieneIssue[];
-  total_log_statements_found: number;
   estimated_monthly_savings_usd: number;
-  annual_projected_savings_usd: number;
   recommended_best_practices: string[];
   suggested_patch?: string | null;
 }
@@ -47,15 +56,10 @@ export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initi
   const fetchHygieneAnalysis = async () => {
     setLoading(true);
     try {
-      const resp = await fetch(`/api/v1/projects/${projectId}/log-hygiene`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code_files: {}, cloudwatch_logs: [] }),
+      const data = await apiClient.post<LogHygieneReport>(`/api/v1/projects/${projectId}/log-hygiene`, {
+        code_files: {},
+        cloudwatch_logs: [],
       });
-      if (!resp.ok) {
-        throw new Error(`Scan failed: ${resp.statusText}`);
-      }
-      const data = await resp.json();
       setReport(data);
       toast.success("AI Log Hygiene scan complete");
     } catch (err: any) {
@@ -163,6 +167,11 @@ export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initi
 
         {report && (
           <>
+            {report.summary && (
+              <p className="rounded-lg border border-border/50 bg-muted/20 p-3 text-xs text-muted-foreground leading-relaxed">
+                {report.summary}
+              </p>
+            )}
             {/* KPI Cards */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="rounded-lg border border-border/50 bg-background/50 p-3 flex items-center gap-3">
@@ -172,7 +181,7 @@ export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initi
                 <div>
                   <div className="text-xs text-muted-foreground">Log Statements</div>
                   <div className="text-lg font-bold text-foreground">
-                    {report.total_log_statements_found}
+                    {report.detected_issues.length}
                   </div>
                 </div>
               </div>
@@ -226,13 +235,15 @@ export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initi
                     <div key={idx} className="p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-muted/10 transition-colors">
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
-                          <span className="font-mono text-foreground font-medium">{issue.file}:{issue.line_number}</span>
-                          <Badge 
-                            variant="outline" 
+                          <span className="font-mono text-foreground font-medium">
+                            {issue.file_path}{issue.line_number != null ? `:${issue.line_number}` : ""}
+                          </span>
+                          <Badge
+                            variant="outline"
                             className={`text-[10px] px-1.5 py-0 ${
-                              issue.issue_type === "SENSITIVE_LEAK_RISK" 
-                                ? "border-rose-500/30 text-rose-400 bg-rose-500/10" 
-                                : issue.issue_type === "HIGH_FREQUENCY_SPAM" 
+                              issue.issue_type === "SENSITIVE_LEAK_RISK"
+                                ? "border-rose-500/30 text-rose-400 bg-rose-500/10"
+                                : issue.issue_type === "HIGH_VOLUME_SPAM"
                                   ? "border-amber-500/30 text-amber-400 bg-amber-500/10"
                                   : "border-slate-500/30 text-slate-400"
                             }`}
@@ -244,13 +255,6 @@ export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initi
                           {issue.statement}
                         </p>
                         <p className="text-muted-foreground text-[11px]">{issue.reason}</p>
-                      </div>
-
-                      <div className="shrink-0 text-right">
-                        <span className="text-emerald-500 font-mono text-xs font-medium">
-                          +${issue.estimated_monthly_cost_usd.toFixed(2)}/mo
-                        </span>
-                        <div className="text-[10px] text-muted-foreground">ingestion cost</div>
                       </div>
                     </div>
                   ))}
