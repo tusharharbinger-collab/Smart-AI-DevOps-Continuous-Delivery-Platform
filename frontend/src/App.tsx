@@ -10,6 +10,7 @@ import { ReportsTab } from "@/pages/ReportsTab";
 import { CostTab } from "@/pages/CostTab";
 import { AiHygieneTab } from "@/pages/AiHygieneTab";
 import { ProjectsOverview } from "@/pages/ProjectsOverview";
+import { SettingsPage } from "@/pages/SettingsPage";
 import { NewProject } from "@/pages/NewProject";
 import { ProjectWorkspace } from "@/pages/ProjectWorkspace";
 
@@ -26,6 +27,7 @@ export default function App() {
         <Route path="/projects" element={<ProjectsLayout />}>
           <Route index element={<ProjectsOverview />} />
           <Route path="new" element={<NewProject />} />
+          <Route path="settings" element={<SettingsPage />} />
           <Route path=":projectId" element={<ProjectWorkspace />}>
             <Route index element={<Navigate to="pipeline" replace />} />
             <Route path="pipeline" element={<PipelineDashboard />} />

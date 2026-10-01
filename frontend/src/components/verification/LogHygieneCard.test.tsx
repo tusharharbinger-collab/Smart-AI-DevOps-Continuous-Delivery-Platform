@@ -6,13 +6,26 @@
  * a real report set state. These tests exercise the fixed contract against the REAL backend field shapes
  * (log_hygiene_analyzer.py: file_path, no per-issue cost, no total_log_statements_found).
  */
+import type { ComponentProps } from "react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { apiClient } from "@/api/client";
 import { LogHygieneCard, type LogHygieneReport } from "./LogHygieneCard";
 
 vi.mock("@/api/client", () => ({ apiClient: { post: vi.fn() } }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+// The scan result is now kept in react-query's cache (keyed by projectId) so it survives a tab
+// unmount/remount, rather than plain useState — every render below needs a real QueryClient in the tree.
+function renderCard(props: ComponentProps<typeof LogHygieneCard>) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <LogHygieneCard {...props} />
+    </QueryClientProvider>
+  );
+}
 
 const REAL_SHAPE_REPORT: LogHygieneReport = {
   summary: "The audit uncovered two console.log statements.",
@@ -23,6 +36,7 @@ const REAL_SHAPE_REPORT: LogHygieneReport = {
       statement: "console.log('App starting on port ' + process.env.PORT);",
       issue_type: "DEBUG_NOISE",
       reason: "Generic startup log emitted via console.log.",
+      suggested_fix: "Replace with logger.info('App starting', { port: process.env.PORT }).",
     },
     {
       file_path: "src/index.js",
@@ -30,6 +44,7 @@ const REAL_SHAPE_REPORT: LogHygieneReport = {
       statement: "console.log('Health check received', req.ip);",
       issue_type: "SENSITIVE_LEAK_RISK",
       reason: "Logs client IP, potential PII.",
+      suggested_fix: "Mask or omit req.ip before logging, e.g. logger.info('Health check received').",
     },
   ],
   estimated_monthly_savings_usd: 8,
@@ -44,7 +59,7 @@ beforeEach(() => {
 describe("LogHygieneCard", () => {
   it("calls apiClient.post (real base URL + auth), never a bare relative fetch", async () => {
     vi.mocked(apiClient.post).mockResolvedValue(REAL_SHAPE_REPORT);
-    render(<LogHygieneCard projectId="proj-1" />);
+    renderCard({ projectId: "proj-1" });
     fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
     await waitFor(() => expect(apiClient.post).toHaveBeenCalledWith(
       "/api/v1/projects/proj-1/log-hygiene",
@@ -54,7 +69,7 @@ describe("LogHygieneCard", () => {
 
   it("renders a real-shaped report without crashing, using file_path and no per-issue cost", async () => {
     vi.mocked(apiClient.post).mockResolvedValue(REAL_SHAPE_REPORT);
-    render(<LogHygieneCard projectId="proj-1" />);
+    renderCard({ projectId: "proj-1" });
     fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
 
     expect(await screen.findByText(/src\/index\.js:3/)).toBeInTheDocument();
@@ -67,7 +82,7 @@ describe("LogHygieneCard", () => {
 
   it("counts SENSITIVE_LEAK_RISK issues as security leaks", async () => {
     vi.mocked(apiClient.post).mockResolvedValue(REAL_SHAPE_REPORT);
-    render(<LogHygieneCard projectId="proj-1" />);
+    renderCard({ projectId: "proj-1" });
     fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
     await screen.findByText(/src\/index\.js:3/);
     expect(screen.getByText("Security Warning: Sensitive Data Logged to CloudWatch")).toBeInTheDocument();
@@ -75,9 +90,29 @@ describe("LogHygieneCard", () => {
 
   it("shows an error toast and stays in the empty state when the API call fails", async () => {
     vi.mocked(apiClient.post).mockRejectedValue(new Error("API POST /api/v1/projects/proj-1/log-hygiene failed: 502"));
-    render(<LogHygieneCard projectId="proj-1" />);
+    renderCard({ projectId: "proj-1" });
     fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
     await waitFor(() => expect(screen.getByText("No Hygiene Scan Run Yet")).toBeInTheDocument());
+  });
+
+  it("shows a concrete, per-issue suggested fix for every detected issue, not just the combined patch", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue(REAL_SHAPE_REPORT);
+    renderCard({ projectId: "proj-1" });
+    fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
+
+    expect(await screen.findByText(/Replace with logger\.info\('App starting'/)).toBeInTheDocument();
+    expect(screen.getByText(/Mask or omit req\.ip before logging/)).toBeInTheDocument();
+  });
+
+  it("renders without crashing when an issue has no suggested_fix (an older/fallback report shape)", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({
+      ...REAL_SHAPE_REPORT,
+      detected_issues: [{ ...REAL_SHAPE_REPORT.detected_issues[0], suggested_fix: undefined }],
+    });
+    renderCard({ projectId: "proj-1" });
+    fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
+    expect(await screen.findByText(/src\/index\.js:3/)).toBeInTheDocument();
+    expect(screen.queryByText("Suggested fix:")).not.toBeInTheDocument();
   });
 
   it("handles a null line_number without crashing (a leak with no exact source line)", async () => {
@@ -85,7 +120,7 @@ describe("LogHygieneCard", () => {
       ...REAL_SHAPE_REPORT,
       detected_issues: [{ ...REAL_SHAPE_REPORT.detected_issues[0], line_number: null }],
     });
-    render(<LogHygieneCard projectId="proj-1" />);
+    renderCard({ projectId: "proj-1" });
     fireEvent.click(screen.getByText("Run Hygiene Scan Now"));
     expect(await screen.findByText("src/index.js")).toBeInTheDocument();
   });

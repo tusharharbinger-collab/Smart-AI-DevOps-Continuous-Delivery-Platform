@@ -408,6 +408,72 @@ async def get_head_commit(
     }
 
 
+async def compare_commits(request: Request, owner: str, repo: str, base: str, head: str) -> dict:
+    """
+    Real commit list + per-file diff between two SHAs via GitHub's compare API — this is the ground truth
+    both the "what changed in this deploy" changelog and the AI Pre-Flight Risk Assessment
+    (projects_router.py's /runs/{run_id}/risk-assessment) build on, never a guessed/fabricated diff.
+
+    Falls back to an anonymous (unauthenticated) request for a public repo when no user token is usable —
+    same rejected-token detection `_fetch_repo_tree_and_manifests` already uses, so a stale stored GitHub
+    token doesn't block this for a public repo either.
+    """
+    try:
+        token = await _resolve_token(request, None)
+        raw = await _github_get(f"/repos/{owner}/{repo}/compare/{base}...{head}", token)
+    except HTTPException as e:
+        stale_token = e.status_code == 502 and "rejected the stored token" in str(e.detail)
+        if e.status_code not in (400, 401) and not stale_token:
+            raise
+        logger.info("github_compare_falling_back_to_anonymous", owner=owner, repo=repo, reason=e.detail)
+        raw = await _github_get(f"/repos/{owner}/{repo}/compare/{base}...{head}", None)
+
+    files = raw.get("files") or []
+    commits_raw = raw.get("commits") or []
+    commits = [
+        {
+            "sha": c.get("sha"),
+            "short_sha": (c.get("sha") or "")[:7],
+            "message": ((c.get("commit") or {}).get("message") or "").split("\n", 1)[0],
+            "author": ((c.get("commit") or {}).get("author") or {}).get("name")
+            or (c.get("author") or {}).get("login"),
+            "date": ((c.get("commit") or {}).get("author") or {}).get("date"),
+            "url": c.get("html_url"),
+        }
+        for c in commits_raw
+    ]
+    # Real unified diff text (GitHub's own `patch` field per file), concatenated for the risk scorer —
+    # never fabricated. GitHub omits `patch` for binary files and very large diffs, which `.get()` handles.
+    diff_text = "\n".join(f"--- {f.get('filename')}\n{f['patch']}" for f in files if f.get("patch"))
+    return {
+        "commits": commits,
+        "files_changed": [f.get("filename") for f in files if f.get("filename")],
+        "diff_text": diff_text,
+        "stats": {
+            "additions": sum(f.get("additions", 0) for f in files),
+            "deletions": sum(f.get("deletions", 0) for f in files),
+            "changed_files": len(files),
+        },
+        "ahead_by": raw.get("ahead_by"),
+        "compare_url": raw.get("html_url"),
+    }
+
+
+async def _fetch_repo_file_content(owner: str, repo: str, ref: str, path: str, token: str | None) -> str | None:
+    """Fetches one file's real text content (base64-decoded) - shared by manifest fetching
+    (_fetch_repo_tree_and_manifests) and the Phase D code-evidence scan (detect_build_config), so both go
+    through the exact same GitHub call shape and failure handling."""
+    try:
+        contents_raw = await _github_get(f"/repos/{owner}/{repo}/contents/{path}", token, params={"ref": ref})
+        import base64
+
+        if contents_raw.get("encoding") == "base64":
+            return base64.b64decode(contents_raw["content"]).decode("utf-8")
+    except Exception as e:
+        logger.warning("repo_file_fetch_failed", owner=owner, repo=repo, path=path, error=str(e))
+    return None
+
+
 async def _fetch_repo_tree_and_manifests(
     request: Request,
     owner: str,
@@ -435,15 +501,7 @@ async def _fetch_repo_tree_and_manifests(
     file_paths = [e["path"] for e in tree if e.get("type") == "blob"]
 
     async def _fetch_text_file(path: str) -> str | None:
-        try:
-            contents_raw = await _github_get(f"/repos/{owner}/{repo}/contents/{path}", token, params={"ref": ref})
-            import base64
-
-            if contents_raw.get("encoding") == "base64":
-                return base64.b64decode(contents_raw["content"]).decode("utf-8")
-        except Exception as e:
-            logger.warning("manifest_fetch_failed", owner=owner, repo=repo, path=path, error=str(e))
-        return None
+        return await _fetch_repo_file_content(owner, repo, ref, path, token)
 
     yaml_manifest_content = None
     yaml_manifest_path: str | None = None
@@ -483,6 +541,9 @@ async def _fetch_repo_tree_and_manifests(
         "yaml_manifest_content": yaml_manifest_content,
         "yaml_manifest_path": yaml_manifest_path,
         "truncated": bool(tree_raw.get("truncated")),
+        # Threaded through so a caller (detect_build_config's Phase D code-evidence scan) can fetch
+        # additional file content without re-resolving the token or re-fetching the tree.
+        "token": token,
     }
 
 
@@ -498,7 +559,15 @@ async def detect_build_config(
     Real onboarding-flow gap this closes: looks at the repo file tree and manifests
     first to propose build method, commands, and networking suggestions.
     """
-    from shared.repo_scanner import detect_build_method, suggest_networking_defaults
+    from shared.repo_scanner import (
+        apply_code_evidence,
+        detect_build_method,
+        infer_scan_language,
+        match_golden_path_archetype,
+        scan_source_evidence,
+        select_files_for_code_scan,
+        suggest_networking_defaults,
+    )
 
     fetch_res = await _fetch_repo_tree_and_manifests(request, owner, repo, ref, x_github_token)
     file_paths = fetch_res["file_paths"]
@@ -512,6 +581,31 @@ async def detect_build_config(
         procfile_content=fetch_res.get("procfile_content"),
     )
     infra = detection.infra_signals
+
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.1 (Phase D) - deep code-evidence scan. Manifest
+    # dependency names alone (above) can't tell "boto3 is listed" apart from "boto3 is actually called" -
+    # this reads a bounded, real set of source files for actual SDK call sites. Additive only: a signal
+    # the manifest already found keeps its manifest-derived hint; a signal ONLY code evidence found gets
+    # turned on for the first time, and the archetype is re-derived off the same real precedence rules
+    # since a newly-discovered signal can change which golden path actually fits.
+    if infra is not None:
+        # Real bug found live testing this end-to-end: `detection.language` is only ever set on the
+        # "synthesized" build path — it stays None whenever a Dockerfile exists (the MOST common real
+        # case, checked first), which made the code scan silently never run for the overwhelming
+        # majority of repos. infer_scan_language re-derives it from the same manifest-presence signal,
+        # independent of which build method was actually chosen.
+        scan_paths = select_files_for_code_scan(file_paths, infer_scan_language(file_paths))
+        if scan_paths:
+            contents: dict[str, str] = {}
+            for path in scan_paths:
+                content = await _fetch_repo_file_content(owner, repo, ref, path, fetch_res["token"])
+                if content is not None:
+                    contents[path] = content
+            evidence = scan_source_evidence(contents)
+            if evidence:
+                apply_code_evidence(infra, evidence)
+                detection.archetype = match_golden_path_archetype(detection, file_paths, fetch_res.get("procfile_content"))
+
     return {
         "method": detection.method,
         "dockerfile_path": detection.dockerfile_path,
@@ -534,6 +628,12 @@ async def detect_build_config(
             "needs_object_storage": infra.needs_object_storage,
             "storage_hint": infra.storage_hint,
             "is_static_site": infra.is_static_site,
+            # Phase D — real, cited evidence from source content, shown so a human can verify WHY a
+            # signal fired instead of taking a bare boolean on faith.
+            "code_evidence": [
+                {"file_path": e.file_path, "line_number": e.line_number, "snippet": e.snippet, "category": e.category}
+                for e in infra.code_evidence
+            ],
         } if infra else None,
         **suggest_networking_defaults(detection),
     }

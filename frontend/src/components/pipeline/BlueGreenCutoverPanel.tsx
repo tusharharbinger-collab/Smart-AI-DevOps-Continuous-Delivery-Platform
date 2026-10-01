@@ -30,11 +30,29 @@ const OUTCOME: Record<BlueGreenOutcome, { label: string; variant: "default" | "s
   failed: { label: "Failed", variant: "destructive" },
 };
 
-function Lane({ name, sub, percent, tone }: { name: string; sub: string; percent: number; tone: "blue" | "green" }) {
+function Lane({
+  name, version, sub, percent, tone,
+}: {
+  name: string;
+  /** The real image/version tag currently running on this side (project.active_production_tag / canary_tag)
+   * — ground truth polled live from the project record, never guessed from log text, so a user always knows
+   * exactly which version they're looking at. */
+  version?: string | null;
+  sub: string;
+  percent: number;
+  tone: "blue" | "green";
+}) {
   return (
     <div className="flex-1 rounded-md border p-3" data-testid={`bg-lane-${tone}`}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-sm font-medium">{name}</span>
+        <span className="text-sm font-medium">
+          {name}
+          {version && (
+            <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 text-code text-[11px] font-normal text-foreground">
+              {version}
+            </span>
+          )}
+        </span>
         <span className="text-code text-xs text-muted-foreground" data-testid={`bg-traffic-${tone}`}>{percent}% of traffic</span>
       </div>
       <p className="mt-0.5 text-[11px] text-muted-foreground">{sub}</p>
@@ -48,9 +66,21 @@ function Lane({ name, sub, percent, tone }: { name: string; sub: string; percent
   );
 }
 
-export function BlueGreenCutoverPanel({ logLines, status }: { logLines: string[]; status?: string }) {
+export function BlueGreenCutoverPanel({
+  logLines, status, baselineVersion, greenVersion,
+}: {
+  logLines: string[];
+  status?: string;
+  /** `projects.active_production_tag` — the version blue ran BEFORE this rollout started. */
+  baselineVersion?: string | null;
+  /** `projects.canary_tag` — the new version this rollout is cutting green over to. */
+  greenVersion?: string | null;
+}) {
   const state = deriveBlueGreenCutover(logLines, status);
   const outcome = OUTCOME[state.outcome];
+  // Once graduated, blue is literally running the promoted (green) image — shown immediately from the log
+  // state rather than waiting on the next 5s project-record poll to catch up with `active_production_tag`.
+  const blueVersion = state.blueRuns === "new" ? greenVersion : baselineVersion;
 
   return (
     <Card data-testid="blue-green-panel">
@@ -62,12 +92,14 @@ export function BlueGreenCutoverPanel({ logLines, status }: { logLines: string[]
         <div className="flex flex-col gap-3 sm:flex-row">
           <Lane
             name="Blue — baseline"
+            version={blueVersion}
             sub={state.blueRuns === "new" ? "Now runs the new version" : "The previous, currently-live version"}
             percent={state.traffic.blue}
             tone="blue"
           />
           <Lane
             name="Green — new version"
+            version={greenVersion}
             sub={state.traffic.green > 0 ? "Serving all traffic" : "Started, stabilizing and health-checked before any traffic"}
             percent={state.traffic.green}
             tone="green"

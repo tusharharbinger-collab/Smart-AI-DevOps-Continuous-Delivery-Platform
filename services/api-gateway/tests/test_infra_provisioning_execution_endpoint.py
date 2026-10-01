@@ -301,3 +301,31 @@ def test_status_still_in_progress_leaves_status_unchanged(monkeypatch):
     result = asyncio.run(projects_router.get_infra_provisioning_status("11111111-1111-1111-1111-111111111111", FakeRequest(), db=db))
 
     assert result["status"] == "INFRA_PROVISIONING"
+
+
+def test_status_in_progress_includes_real_per_resource_events(monkeypatch):
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7.4.1 - Phase F's live build view needs the real
+    # per-resource events pipeline-worker's status route now returns, threaded straight through here.
+    events = [{"resource": "OrdersDb", "type": "AWS::RDS::DBInstance", "status": "CREATE_IN_PROGRESS", "reason": None, "timestamp": "t"}]
+    fake_client = _FakeAsyncClient(
+        _FakeHttpResponse(200, {
+            "status": "CREATE_IN_PROGRESS", "is_terminal": False, "succeeded": False, "outputs": {},
+            "status_reason": None, "resource_events": events,
+        })
+    )
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", lambda **kw: fake_client)
+    db = FakeDB(_base_row(status="INFRA_PROVISIONING", stack_name="smartcd-infra-11111111-1111-1111-1111-111111111111"))
+
+    result = asyncio.run(projects_router.get_infra_provisioning_status("11111111-1111-1111-1111-111111111111", FakeRequest(), db=db))
+
+    assert result["resource_events"] == events
+
+
+def test_status_not_provisioning_returns_empty_resource_events_without_calling_aws(monkeypatch):
+    fake_client = _FakeAsyncClient(exc=AssertionError("must not call AWS when not INFRA_PROVISIONING"))
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", lambda **kw: fake_client)
+    db = FakeDB(_base_row(status="INFRA_PROVISIONED"))
+
+    result = asyncio.run(projects_router.get_infra_provisioning_status("11111111-1111-1111-1111-111111111111", FakeRequest(), db=db))
+
+    assert result["resource_events"] == []

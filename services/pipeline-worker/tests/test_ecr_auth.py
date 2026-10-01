@@ -120,3 +120,72 @@ def test_ensure_ecr_repository_exists_extracts_the_repo_name_from_the_full_uri(m
     ecr_auth.ensure_ecr_repository_exists("236087863083.dkr.ecr.us-east-1.amazonaws.com/cicd-test", "us-east-1")
 
     assert fake.create_calls == ["cicd-test"]
+
+
+# ───────── delete_ecr_repository (project-deletion teardown) ─────────
+
+
+class _RepositoryNotFoundException(Exception):
+    pass
+
+
+class _FakeECRClientForRepoDeletion:
+    """Real gap found live: a deleted project's build image was left in ECR forever, still billing
+    storage. Mirrors the real client's `.exceptions.RepositoryNotFoundException` attribute-access pattern,
+    same as `_FakeECRClientForRepoCreation` does for its own exception."""
+
+    exceptions = type("Exceptions", (), {"RepositoryNotFoundException": _RepositoryNotFoundException})
+
+    def __init__(self, already_deleted: bool = False):
+        self.already_deleted = already_deleted
+        self.delete_calls = []
+
+    def delete_repository(self, repositoryName, force=False):
+        self.delete_calls.append((repositoryName, force))
+        if self.already_deleted:
+            raise self.exceptions.RepositoryNotFoundException()
+
+
+def test_delete_ecr_repository_force_deletes_by_name(monkeypatch):
+    fake = _FakeECRClientForRepoDeletion()
+    monkeypatch.setattr(ecr_auth.boto3, "client", lambda service, region_name=None: fake)
+
+    result = ecr_auth.delete_ecr_repository("123456789012.dkr.ecr.us-east-1.amazonaws.com/payments", "us-east-1")
+
+    assert fake.delete_calls == [("payments", True)]
+    assert result == {"status": "deleted", "repository": "payments"}
+
+
+def test_delete_ecr_repository_strips_a_tag_if_one_was_passed(monkeypatch):
+    fake = _FakeECRClientForRepoDeletion()
+    monkeypatch.setattr(ecr_auth.boto3, "client", lambda service, region_name=None: fake)
+
+    ecr_auth.delete_ecr_repository("123456789012.dkr.ecr.us-east-1.amazonaws.com/payments:v1.1.0", "us-east-1")
+
+    assert fake.delete_calls == [("payments", True)]
+
+
+def test_delete_ecr_repository_already_gone_is_a_no_op_not_an_error(monkeypatch):
+    fake = _FakeECRClientForRepoDeletion(already_deleted=True)
+    monkeypatch.setattr(ecr_auth.boto3, "client", lambda service, region_name=None: fake)
+
+    result = ecr_auth.delete_ecr_repository("123456789012.dkr.ecr.us-east-1.amazonaws.com/payments", "us-east-1")
+
+    assert result == {"status": "already_deleted", "repository": "payments"}
+
+
+def test_delete_ecr_repository_on_a_non_ecr_image_is_a_no_op(monkeypatch):
+    # A project's container_image on a registry the platform never created (or a legacy non-ECR project)
+    # has nothing for this to delete - must never attempt a boto3 call against a name that isn't an ECR repo.
+    called = False
+
+    def _fail_if_called(*a, **kw):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(ecr_auth.boto3, "client", _fail_if_called)
+
+    result = ecr_auth.delete_ecr_repository("registry.internal/orders-api", "us-east-1")
+
+    assert result == {"status": "not_an_ecr_image"}
+    assert called is False

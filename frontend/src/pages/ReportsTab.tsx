@@ -129,7 +129,7 @@ function DeploymentReportView({ runId, deployMode }: { runId: string; deployMode
             <span className="text-[11px] uppercase tracking-wide text-muted-foreground">Cost delta for this run</span>
             <div className="mt-1 flex items-center gap-4 text-sm">
               <span>Baseline: <span className="text-code">${data.cost_analysis.baseline_cost.toFixed(4)}/hr</span></span>
-              <span>Canary: <span className="text-code">${data.cost_analysis.canary_cost.toFixed(4)}/hr</span></span>
+              <span>{deployMode === "blue_green" ? "Green" : "Canary"}: <span className="text-code">${data.cost_analysis.canary_cost.toFixed(4)}/hr</span></span>
               <Badge variant={data.cost_analysis.delta_percent > 15 ? "destructive" : "secondary"}>
                 {data.cost_analysis.delta_percent > 0 ? "+" : ""}
                 {data.cost_analysis.delta_percent.toFixed(1)}%

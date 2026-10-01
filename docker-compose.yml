@@ -444,8 +444,18 @@ services:
     environment:
       <<: *common-env
       SERVICE_NAME: explainability-service
+      # LLM provider failover chain (shared/llm_router.py, AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md
+      # §3.5) - Gemini (primary) -> Groq (secondary) -> OpenRouter (tertiary) -> Mistral (quaternary). A
+      # provider with no key set here is silently skipped, never attempted with an empty credential -
+      # setting only GROQ_API_KEY (the previous, still-common case) preserves exactly today's behavior.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemma-4-26b-a4b-it:free}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-codestral-latest}
       # Real gap found live: this dev machine's corporate network runs all
       # egress through a Netskope TLS-inspecting proxy — outbound HTTPS to
       # api.groq.com (a public SaaS API, unlike the container-to-container

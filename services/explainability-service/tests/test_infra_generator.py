@@ -734,5 +734,24 @@ def test_the_prompt_forbids_the_platforms_own_resources_and_carries_the_real_net
     assert "ONLY from the VPC CIDR" in text
 
 
+def test_an_empty_template_is_rejected_even_when_no_platform_owned_resource_is_present():
+    # Real bug found live: the model sometimes returned Resources:{} for a real addition (given a thin
+    # shape hint) instead of the requested resource - a silent no-op that must feed back into the
+    # corrective retry loop, exactly like the edit-produced-no-change guard already does for edits.
+    with _pytest.raises(_Err) as e:
+        _require_only_additions(_tpl(), [{"kind": "object_storage"}])
+    assert "no resources at all" in str(e.value) and "object_storage" in str(e.value)
+
+
+def test_the_structured_pickers_s3_bucket_resource_type_resolves_to_the_same_rich_hint_as_object_storage():
+    # The "Add a component" picker sends the catalog's exact resource_type ("s3_bucket"), which must alias
+    # to the well-tested "object_storage" shape hint rather than the catalog's much thinner generic
+    # description ("An object storage bucket.") - too weak a hint for the model in practice (found live).
+    s3_text = _extras_only_instruction([{"kind": "s3_bucket"}], None)
+    object_storage_text = _extras_only_instruction([{"kind": "object_storage"}], None)
+    assert s3_text == object_storage_text
+    assert "AWS::S3::Bucket" in s3_text and "PublicAccessBlockConfiguration" in s3_text
+
+
 def test_the_prompt_for_a_worker_does_not_forbid_its_own_service():
     assert "nor an ECS service or task definition" not in _extras_only_instruction([{"kind": "worker_service"}], _CTX)

@@ -111,6 +111,11 @@ class InfraSignals:
     # nginx with no running application process, the deciding signal for
     # the "static site" golden-path archetype vs. "stateless web service".
     is_static_site: bool = False
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md Phase D — real, cited evidence from actually reading
+    # source file content (never an LLM guess — see scan_source_evidence below), one CodeEvidence per
+    # category that code-level scanning ADDED beyond what the manifest dependency check above already
+    # found. Empty when no source scan ran, or every category was already covered by a manifest match.
+    code_evidence: list["CodeEvidence"] = field(default_factory=list)
 
 
 def _parse_requirements_txt_names(requirements_txt_content: str) -> set[str]:
@@ -174,6 +179,147 @@ def detect_infra_signals(
             signals.needs_cache, signals.cache_hint = True, hit
         if hit := next((n for n in PYTHON_STORAGE_PACKAGES if n in req_names), None):
             signals.needs_object_storage, signals.storage_hint = True, hit
+
+    return signals
+
+
+# ─────────────── Deep code-evidence scan (AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.1, Phase D) ───────────────
+#
+# `detect_infra_signals` above only ever looked at manifest DEPENDENCY NAMES (package.json/requirements.txt)
+# — a real gap: "boto3 is in requirements.txt" doesn't distinguish a repo that actually calls S3 from one
+# that imported it once and never used it. This scans actual source file CONTENT for real SDK call-site
+# patterns instead — still pure regex/heuristic matching, no AI, no guessing (the same "never guess beyond
+# a real signal" rule this module's docstring states as a permanent design choice) — just a richer signal
+# than a bare dependency name, with a citation (file:line + the matched line itself) a human can verify.
+#
+# Deliberately bounded: this module does no network I/O itself (same as every other function here) — a
+# caller (github_router.py's detect_build_config) selects which files to fetch via
+# select_files_for_code_scan, fetches their content itself, and hands the resulting {path: content} dict
+# to scan_source_evidence.
+
+import re
+
+MAX_CODE_SCAN_FILES = 15
+MAX_CODE_SCAN_FILE_BYTES = 20_000
+
+# Extensions worth reading for evidence, per detected language — deliberately narrow (source files only,
+# never lockfiles/binaries/minified bundles) so a bounded scan stays meaningful.
+_SCANNABLE_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "python": (".py",),
+    "node": (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"),
+}
+
+# Directories never worth scanning for evidence of what a repo's OWN code does — vendored/generated/test
+# fixture content would produce false-positive "evidence" the human never actually wrote.
+_SKIP_PATH_SUBSTRINGS = ("node_modules/", "vendor/", "dist/", "build/", ".venv/", "site-packages/", "/test/", "/tests/", "__pycache__/")
+
+
+@dataclass(frozen=True)
+class CodeEvidence:
+    """One real, cited signal from actually reading a source file — never a bare boolean. `category`
+    matches InfraSignals' fields (database/cache/object_storage/background_worker) so it slots directly
+    into the same infra-need reasoning the manifest-based signals already feed."""
+    file_path: str
+    line_number: int
+    snippet: str
+    category: str
+
+
+# (category, compiled pattern) — checked against actual source lines. Ordered by category the same way
+# InfraSignals groups them. Deliberately call-SITE patterns (an actual client/connection construction),
+# never a bare import line, since importing a package proves less than a dependency name already does.
+_CODE_EVIDENCE_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("object_storage", re.compile(r"boto3\.(client|resource)\(\s*[\"']s3[\"']")),
+    ("object_storage", re.compile(r"\bMinioClient\(|new\s+Minio\(")),
+    ("object_storage", re.compile(r"new\s+S3Client\(|new\s+AWS\.S3\(")),
+    ("database", re.compile(r"psycopg2\.connect\(|create_engine\(|MongoClient\(|mysql\.connector\.connect\(")),
+    ("database", re.compile(r"new\s+(Pool|Client)\(.*pg|mongoose\.connect\(|createConnection\(")),
+    ("cache", re.compile(r"redis\.Redis\(|aioredis\.from_url\(|StrictRedis\(")),
+    ("cache", re.compile(r"new\s+Redis\(|createClient\(\s*\{[^}]*redis")),
+    ("background_worker", re.compile(r"celery\.Celery\(|@shared_task|@celery_app\.task")),
+    ("background_worker", re.compile(r"\bcron\.schedule\(|node-cron|BullQueue\(|new\s+Queue\(")),
+)
+
+
+def infer_scan_language(file_paths: list[str]) -> str | None:
+    """
+    Real bug found live testing Phase D end-to-end: `BuildDetection.language` is ONLY ever set on the
+    "synthesized" (no Dockerfile, language-manifest inferred) path — `_detect_build_method_core` returns
+    immediately with `language=None` the instant a Dockerfile exists, since a Dockerfile means language
+    inference is irrelevant to HOW the repo gets built. But a Dockerfile is the MOST common real case (it's
+    checked first, before any language-manifest fallback), which meant the code-evidence scan below almost
+    never ran in practice — silently correct (bounded/no-op is always safe), but silently useless for the
+    overwhelming majority of real repos. This re-derives "what language is this repo's OWN source code
+    written in" independently of build method, from the exact same manifest-presence signal
+    `_detect_build_method_core` already uses (first match in `LANGUAGE_MANIFESTS` wins) — deciding what to
+    scan for evidence is a genuinely different question from deciding how to build.
+    """
+    for manifest_name, language in LANGUAGE_MANIFESTS:
+        if any(p.rsplit("/", 1)[-1] == manifest_name and p.count("/") <= 2 for p in file_paths):
+            return language
+    return None
+
+
+def select_files_for_code_scan(file_paths: list[str], language: str | None) -> list[str]:
+    """
+    Deterministic, bounded selection: only real source files matching the detected language's extensions,
+    outside vendored/generated/test directories, capped at MAX_CODE_SCAN_FILES so a caller's fetch cost
+    stays small and predictable regardless of repo size. Preserves the tree's own ordering (no sorting by
+    size/recency — GitHub's tree API gives no reliable size signal for this purpose) rather than sampling
+    randomly, so the same repo always selects the same files.
+    """
+    extensions = _SCANNABLE_EXTENSIONS.get(language or "", ())
+    if not extensions:
+        return []
+    selected = [
+        p for p in file_paths
+        if p.endswith(extensions) and not any(skip in f"/{p}" for skip in _SKIP_PATH_SUBSTRINGS)
+    ]
+    return selected[:MAX_CODE_SCAN_FILES]
+
+
+def scan_source_evidence(file_contents: dict[str, str]) -> list[CodeEvidence]:
+    """
+    Pure, deterministic regex scan over already-fetched {path: content} — no I/O, no AI. Each file is
+    capped at MAX_CODE_SCAN_FILE_BYTES (a huge generated/minified file truncated rather than skipped
+    entirely, so evidence near the top of a large file is still found). Returns every match, not just the
+    first per category — a caller decides how to fold multiple hits into one signal.
+    """
+    evidence: list[CodeEvidence] = []
+    for path, content in file_contents.items():
+        truncated = content[:MAX_CODE_SCAN_FILE_BYTES]
+        for lineno, line in enumerate(truncated.splitlines(), start=1):
+            for category, pattern in _CODE_EVIDENCE_PATTERNS:
+                if pattern.search(line):
+                    evidence.append(CodeEvidence(file_path=path, line_number=lineno, snippet=line.strip()[:200], category=category))
+    return evidence
+
+
+def apply_code_evidence(signals: InfraSignals, evidence: list[CodeEvidence]) -> InfraSignals:
+    """
+    Folds real code-evidence into an already-manifest-derived InfraSignals — additive only, never
+    overrides or removes a manifest-based hint. A category the manifest already flagged keeps its
+    original hint (the dependency name) as the primary signal but gains the code evidence as
+    corroboration; a category the manifest MISSED but code evidence found gets turned on for the first
+    time, with the evidence itself as the hint (there's no dependency name to cite instead).
+    """
+    signals.code_evidence = list(evidence)
+    by_category: dict[str, CodeEvidence] = {}
+    for e in evidence:
+        by_category.setdefault(e.category, e)
+
+    if "object_storage" in by_category and not signals.needs_object_storage:
+        e = by_category["object_storage"]
+        signals.needs_object_storage = True
+        signals.storage_hint = f"{e.file_path}:{e.line_number} — {e.snippet}"
+    if "database" in by_category and not signals.needs_database:
+        e = by_category["database"]
+        signals.needs_database = True
+        signals.database_hint = f"{e.file_path}:{e.line_number} — {e.snippet}"
+    if "cache" in by_category and not signals.needs_cache:
+        e = by_category["cache"]
+        signals.needs_cache = True
+        signals.cache_hint = f"{e.file_path}:{e.line_number} — {e.snippet}"
 
     return signals
 

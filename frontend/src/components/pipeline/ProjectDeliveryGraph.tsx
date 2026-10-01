@@ -22,30 +22,16 @@
 import { useMemo } from "react";
 import dagre from "dagre";
 import {
-  ReactFlow, Background, Controls, type Edge, type Node, Position,
+  ReactFlow, Background, BackgroundVariant, Controls, MarkerType, type Edge, type Node, Position,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { CheckCircle2, CircleDot, Database, GitBranch, Globe, HardDrive, Layers, Server, XCircle, Zap } from "lucide-react";
+import { CheckCircle2, CircleDot, GitBranch, XCircle } from "lucide-react";
+import { flowNodeTypes, infraAccentFor, TINT_HEX, type FlowCardData, type NodeTint } from "@/components/pipeline/FlowNode";
 import type { InfraTopology } from "@/api/infraDrafts";
 import type { StageRowStatus } from "@/lib/pipelineStageSteps";
 
 const NODE_WIDTH = 190;
-const NODE_HEIGHT = 56;
-
-const INFRA_TYPE_ICON: Record<string, typeof Server> = {
-  alb: Globe,
-  httproute: Globe,
-  ecs_service: Server,
-  deployment: Server,
-  rds: Database,
-  elasticache: Zap,
-  s3: HardDrive,
-};
-
-function infraIconFor(type: string) {
-  const Icon = INFRA_TYPE_ICON[type.toLowerCase()] ?? Layers;
-  return <Icon className="h-3.5 w-3.5" />;
-}
+const NODE_HEIGHT = 60;
 
 const STAGE_ROW_ICON: Record<StageRowStatus, typeof CheckCircle2> = {
   pending: GitBranch,
@@ -54,11 +40,13 @@ const STAGE_ROW_ICON: Record<StageRowStatus, typeof CheckCircle2> = {
   failed: XCircle,
 };
 
-const STAGE_ROW_COLOR: Record<StageRowStatus, string> = {
-  pending: "var(--muted-foreground, #888)",
-  active: "var(--primary, #6366f1)",
-  done: "var(--success, #22c55e)",
-  failed: "var(--destructive, #ef4444)",
+/** Stage status maps onto the same tint vocabulary the infra nodes use, so "active"/"done"/"failed" read as
+ * consistently colored states across the whole connected graph, not a second unrelated color language. */
+const STAGE_ROW_TINT: Record<StageRowStatus, NodeTint> = {
+  pending: "muted",
+  active: "primary",
+  done: "success",
+  failed: "destructive",
 };
 
 export interface ProjectDeliveryGraphProps {
@@ -131,86 +119,70 @@ function buildGraph(
   const nodes: Node[] = [
     ...infraNodes.map((n) => {
       const pos = g.node(`infra:${n.id}`);
+      const { icon, tint } = infraAccentFor(n.type);
       return {
         id: `infra:${n.id}`,
+        type: "card",
         position: { x: pos.x - NODE_WIDTH / 2, y: pos.y - NODE_HEIGHT / 2 },
-        data: {
-          label: (
-            <div className="flex items-center gap-2 text-xs">
-              {infraIconFor(n.type)}
-              <div>
-                <div className="font-medium">{n.label}</div>
-                <div className="text-[10px] uppercase text-muted-foreground">{n.type}</div>
-              </div>
-            </div>
-          ),
-        },
+        data: { icon, title: n.label, subtitle: n.type, tint } satisfies FlowCardData,
         sourcePosition: Position.Bottom,
         targetPosition: Position.Top,
-        style: {
-          width: NODE_WIDTH,
-          border: "1px solid var(--border, #333)",
-          borderRadius: 8,
-          padding: 8,
-          background: "var(--card, #1a1a1a)",
-        },
+        style: { width: NODE_WIDTH },
       };
     }),
     ...stages.map((stageName) => {
       const pos = g.node(`stage:${stageName}`);
       const rowStatus = stageRowStatus(stageName, stages, currentStage, status);
-      const Icon = STAGE_ROW_ICON[rowStatus];
-      const color = STAGE_ROW_COLOR[rowStatus];
       return {
         id: `stage:${stageName}`,
+        type: "card",
         position: { x: pos.x - NODE_WIDTH / 2, y: pos.y - NODE_HEIGHT / 2 },
         data: {
-          label: (
-            <div className="flex items-center gap-2 text-xs">
-              <Icon className={rowStatus === "active" ? "h-3.5 w-3.5 animate-pulse" : "h-3.5 w-3.5"} style={{ color }} />
-              <div>
-                <div className="font-medium" style={{ color: rowStatus === "pending" ? undefined : color }}>
-                  {stageName}
-                </div>
-                <div className="text-[10px] uppercase text-muted-foreground">{rowStatus}</div>
-              </div>
-            </div>
-          ),
-        },
+          icon: STAGE_ROW_ICON[rowStatus], title: stageName, subtitle: rowStatus,
+          tint: STAGE_ROW_TINT[rowStatus], pulse: rowStatus === "active",
+        } satisfies FlowCardData,
         sourcePosition: Position.Bottom,
         targetPosition: Position.Top,
-        style: {
-          width: NODE_WIDTH,
-          border: `1px solid ${rowStatus === "pending" ? "var(--border, #333)" : color}`,
-          borderRadius: 8,
-          padding: 8,
-          background: "var(--card, #1a1a1a)",
-        },
+        style: { width: NODE_WIDTH },
       };
     }),
   ];
 
   const edges: Edge[] = [
-    ...infraEdges.map((e) => ({
-      id: `infra:${e.source}-infra:${e.target}`,
-      source: `infra:${e.source}`,
-      target: `infra:${e.target}`,
-      animated: false,
-    })),
-    ...stages.slice(0, -1).map((stageName, i) => ({
-      id: `stage:${stageName}-stage:${stages[i + 1]}`,
-      source: `stage:${stageName}`,
-      target: `stage:${stages[i + 1]}`,
-      animated: stageRowStatus(stages[i + 1], stages, currentStage, status) === "active",
-    })),
+    ...infraEdges.map((e) => {
+      const color = TINT_HEX[infraAccentFor(infraNodes.find((n) => n.id === e.source)?.type ?? "").tint];
+      return {
+        id: `infra:${e.source}-infra:${e.target}`,
+        source: `infra:${e.source}`,
+        target: `infra:${e.target}`,
+        animated: true,
+        style: { stroke: color },
+        markerEnd: { type: MarkerType.ArrowClosed, color },
+      };
+    }),
+    ...stages.slice(0, -1).map((stageName, i) => {
+      const nextStatus = stageRowStatus(stages[i + 1], stages, currentStage, status);
+      const color = TINT_HEX[STAGE_ROW_TINT[nextStatus]];
+      return {
+        id: `stage:${stageName}-stage:${stages[i + 1]}`,
+        source: `stage:${stageName}`,
+        target: `stage:${stages[i + 1]}`,
+        animated: nextStatus === "active",
+        style: { stroke: color },
+        markerEnd: { type: MarkerType.ArrowClosed, color },
+      };
+    }),
   ];
   if (infraNodes.length > 0 && stages.length > 0) {
     const computeNode = findComputeNode();
+    const color = TINT_HEX[infraAccentFor(computeNode.type).tint];
     edges.push({
       id: `infra:${computeNode.id}-stage:${stages[0]}`,
       source: `infra:${computeNode.id}`,
       target: `stage:${stages[0]}`,
-      animated: false,
+      animated: true,
+      style: { stroke: color },
+      markerEnd: { type: MarkerType.ArrowClosed, color },
     });
   }
 
@@ -231,10 +203,11 @@ export function ProjectDeliveryGraph({ infraTopology, stages, currentStage, stat
   }
 
   return (
-    <div style={{ height: Math.max(260, nodes.length * 90) }} className="rounded-md border">
+    <div style={{ height: Math.max(260, nodes.length * 90) }} className="flow-canvas overflow-hidden rounded-xl border">
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        nodeTypes={flowNodeTypes}
         fitView
         nodesDraggable={false}
         nodesConnectable={false}
@@ -242,7 +215,7 @@ export function ProjectDeliveryGraph({ infraTopology, stages, currentStage, stat
         elementsSelectable={false}
         proOptions={{ hideAttribution: true }}
       >
-        <Background gap={16} />
+        <Background variant={BackgroundVariant.Dots} gap={18} size={1.2} className="opacity-40" />
         <Controls showInteractive={false} />
       </ReactFlow>
     </div>

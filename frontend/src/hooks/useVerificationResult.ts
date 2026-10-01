@@ -36,12 +36,27 @@ interface VerificationHistoryRecord {
   timestamp_utc: string;
 }
 
+// Real bug found live: `refetchInterval: 5000` with no stop condition polled
+// FOREVER for as long as the tab stayed open — including a blue-green run,
+// which never produces a verdict at all (a permanent 404, see
+// VerificationInspector.tsx's dedicated branch for it) and a long-finished
+// canary run whose verdict will never change again. `retry` only bounds
+// retries WITHIN one fetch attempt; it does nothing to stop `refetchInterval`
+// from firing a brand new attempt every 5s indefinitely. Visible as the
+// Verification Inspector tab continuously re-rendering/flickering the longer
+// it stayed open — capped here at a definitive error (never changes without
+// switching runs) or ~2.5 minutes of unchanging data (long enough to watch a
+// live rollout settle, not long enough to hammer the backend for a tab left
+// open on an old run overnight).
+const MAX_POLL_ATTEMPTS = 30;
+
 export function useVerificationResult(pipelineRunId: string) {
   const { data, isLoading, error } = useQuery({
     queryKey: ["verification", pipelineRunId],
     queryFn: () => apiClient.get<Verdict>(`/api/v1/verification/${pipelineRunId}`),
     enabled: Boolean(pipelineRunId),
-    refetchInterval: 5000,
+    refetchInterval: (query) =>
+      query.state.status === "error" || query.state.dataUpdateCount >= MAX_POLL_ATTEMPTS ? false : 5000,
     retry: (failureCount, err) => (err instanceof ApiError && err.status === 404 ? false : failureCount < 3),
   });
 
@@ -52,10 +67,14 @@ export function useVerificationResult(pipelineRunId: string) {
     enabled: Boolean(pipelineRunId) && Boolean(data),
     // RCA generation is async and can take a few seconds (Groq call, or its
     // fallback) after the verdict itself already exists — keep polling
-    // until a summary shows up, same cadence as the verdict poll above.
+    // until a summary shows up, same cadence as the verdict poll above, but
+    // give up after the same bound rather than polling forever if
+    // explainability-service never produces one (e.g. it's down).
     refetchInterval: (query) => {
       const latest = query.state.data?.records?.[0];
-      return latest?.rca_summary ? false : 5000;
+      if (latest?.rca_summary) return false;
+      if (query.state.dataUpdateCount >= MAX_POLL_ATTEMPTS) return false;
+      return 5000;
     },
   });
 

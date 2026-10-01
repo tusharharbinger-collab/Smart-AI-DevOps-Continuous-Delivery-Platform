@@ -19,6 +19,7 @@ import json
 import os
 import re
 import uuid
+from typing import Literal
 from datetime import datetime, timezone
 
 import httpx
@@ -35,13 +36,13 @@ from shared import redis_streams as streams
 from shared.deployment_readiness import evaluate_deployment_readiness
 from shared.intent_spec import FARGATE_TIER_DEFAULTS, EnvironmentTier, IntentSpec, apply_tier_defaults
 from shared.live_url_builder import build_live_url
-from shared.infra_needs import analyze_infra_needs, build_standard_only_proposal
+from shared.infra_needs import analyze_infra_needs, build_standard_only_proposal, infer_addition_kind_from_text
 from src import webhook_registry
 from src.auth.rbac import require_role
 from src.config import settings
 from src.infra_cost import apply_independent_cost
 from src.infra_policy import apply_policy_to_proposal, blocking_messages, evaluate_infra_policy
-from src.db.session import get_db, get_request_db
+from src.db.session import get_db, get_request_db, AsyncSessionLocal
 from src.routers.github_router import _resolve_token
 from src.routers.aws_connections_router import load_provisioning_connection
 
@@ -948,61 +949,73 @@ async def create_project(
 
     pipeline_id = str(uuid.uuid4())
     project_id = str(uuid.uuid4())
+    # Real bug found live (2026-09-30): this used to `await db.commit()` right after the INSERTs below to
+    # surface a duplicate-name IntegrityError as a clean 409 - but `db` here is the REQUEST-scoped session
+    # auth/middleware.py already wraps in one `session.begin()` for the whole request (see CLAUDE.md's "a
+    # route handler must never call db.commit()/db.rollback() itself" invariant). That explicit commit ended
+    # the request's transaction early, so every db.execute() AFTER it — the infra_draft_id link a few lines
+    # down, most visibly — started failing with `Can't operate on closed transaction`, silently swallowed by
+    # that block's own `except Exception: logger.warning(...)`. Net effect: `infra_build_state.project_id`
+    # was NEVER actually set by this path, so a project's linked AI-provisioned infrastructure (a real S3
+    # bucket, database, …) had no way to be found again — not by the persistent topology view, and not by
+    # delete_project's real teardown, which left it running (and billing) forever. `begin_nested()` (a real
+    # SQL SAVEPOINT) catches the same IntegrityError WITHOUT closing the outer request transaction, so
+    # everything after this block - the infra_draft_id link, cluster provisioning, webhook registration -
+    # keeps working, and the outer transaction commits normally when the request completes.
     try:
-        await db.execute(
-            text(
-                """
-                INSERT INTO pipelines (pipeline_id, tenant_id, name, policy_yaml)
-                VALUES (:pipeline_id, :tenant_id, :name, :policy_yaml)
-                """
-            ),
-            {
-                "pipeline_id": pipeline_id,
-                "tenant_id": tenant_id,
-                "name": f"{body.name}-rollout",
-                "policy_yaml": policy_yaml,
-            },
-        )
-        await db.execute(
-            text(
-                """
-                INSERT INTO projects (
-                    project_id, tenant_id, pipeline_id, name, repo_url, branch, root_directory,
-                    dockerfile_path, language, start_command, manifest_path,
-                    test_command, container_image, active_production_tag,
-                    canary_tag, path_prefix, deploy_target, deploy_mode, status
-                ) VALUES (
-                    :project_id, :tenant_id, :pipeline_id, :name, :repo_url, :branch, :root_directory,
-                    :dockerfile_path, :language, :start_command, :manifest_path,
-                    :test_command, :container_image, :active_production_tag,
-                    :canary_tag, :path_prefix, :deploy_target, :deploy_mode, 'IDLE'
-                )
-                """
-            ),
-            {
-                "project_id": project_id,
-                "tenant_id": tenant_id,
-                "pipeline_id": pipeline_id,
-                "name": body.name,
-                "repo_url": body.repo_url,
-                "branch": body.branch,
-                "root_directory": body.root_directory,
-                "dockerfile_path": body.dockerfile_path,
-                "language": body.language,
-                "start_command": body.start_command,
-                "manifest_path": body.manifest_path,
-                "test_command": body.test_command,
-                "container_image": body.container_image,
-                "active_production_tag": body.active_production_tag,
-                "canary_tag": body.canary_tag,
-                "path_prefix": effective_path_prefix,
-                "deploy_target": body.deploy_target,
-                "deploy_mode": body.deploy_policy.deploy_mode,
-            },
-        )
-        await db.commit()
+        async with db.begin_nested():
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO pipelines (pipeline_id, tenant_id, name, policy_yaml)
+                    VALUES (:pipeline_id, :tenant_id, :name, :policy_yaml)
+                    """
+                ),
+                {
+                    "pipeline_id": pipeline_id,
+                    "tenant_id": tenant_id,
+                    "name": f"{body.name}-rollout",
+                    "policy_yaml": policy_yaml,
+                },
+            )
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO projects (
+                        project_id, tenant_id, pipeline_id, name, repo_url, branch, root_directory,
+                        dockerfile_path, language, start_command, manifest_path,
+                        test_command, container_image, active_production_tag,
+                        canary_tag, path_prefix, deploy_target, deploy_mode, status
+                    ) VALUES (
+                        :project_id, :tenant_id, :pipeline_id, :name, :repo_url, :branch, :root_directory,
+                        :dockerfile_path, :language, :start_command, :manifest_path,
+                        :test_command, :container_image, :active_production_tag,
+                        :canary_tag, :path_prefix, :deploy_target, :deploy_mode, 'IDLE'
+                    )
+                    """
+                ),
+                {
+                    "project_id": project_id,
+                    "tenant_id": tenant_id,
+                    "pipeline_id": pipeline_id,
+                    "name": body.name,
+                    "repo_url": body.repo_url,
+                    "branch": body.branch,
+                    "root_directory": body.root_directory,
+                    "dockerfile_path": body.dockerfile_path,
+                    "language": body.language,
+                    "start_command": body.start_command,
+                    "manifest_path": body.manifest_path,
+                    "test_command": body.test_command,
+                    "container_image": body.container_image,
+                    "active_production_tag": body.active_production_tag,
+                    "canary_tag": body.canary_tag,
+                    "path_prefix": effective_path_prefix,
+                    "deploy_target": body.deploy_target,
+                    "deploy_mode": body.deploy_policy.deploy_mode,
+                },
+            )
     except IntegrityError:
-        await db.rollback()
         raise HTTPException(
             status_code=409,
             detail=f"A project named '{body.name}' already exists for this tenant.",
@@ -1023,7 +1036,6 @@ async def create_project(
                 ),
                 {"project_id": project_id, "draft_id": body.infra_draft_id, "tenant_id": tenant_id},
             )
-            await db.commit()
         except Exception as e:
             logger.warning("infra_draft_project_link_failed", project_id=project_id, error=str(e))
 
@@ -1366,6 +1378,24 @@ async def discover_existing_infra(
         raise HTTPException(status_code=502, detail=f"Could not discover existing AWS resources: {str(e) or type(e).__name__}")
 
 
+@router.get("/infra-drafts/component-catalog")
+async def get_infra_component_catalog():
+    """
+    AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.2 (Phase C) - the full "Add a component" catalog
+    (shared/component_catalog.py), grouped by category on the frontend. No AI call, no tenant/draft
+    scoping needed - this is a static catalog. Registered before /infra-drafts/{draft_id} for the same
+    reason discover-existing is (a static path segment must never be captured as a draft id).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{EXPLAINABILITY_SERVICE_URL}/component-catalog")
+        if resp.status_code >= 400:
+            raise httpx.HTTPStatusError(resp.text, request=resp.request, response=resp)
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Could not load component catalog: {str(e) or type(e).__name__}")
+
+
 @router.post("/infra-drafts")
 async def create_infra_draft(body: InfraDraftRequest, request: Request, db: AsyncSession = Depends(get_request_db)):
     """
@@ -1475,6 +1505,15 @@ async def create_infra_draft(body: InfraDraftRequest, request: Request, db: Asyn
 
 class InfraDraftEditRequest(BaseModel):
     instruction: str = Field(min_length=3, max_length=1000)
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7 - a structured "Add a component" pick names its exact
+    # catalog resource_type directly, so the extras-only bootstrap path (below) never has to re-parse free
+    # text - and works for the FULL catalog, not just the three keyword-matched kinds free text supports.
+    resource_type: str | None = None
+    # "add" (default): extend whatever proposal already exists, or bootstrap a fresh one from scratch if
+    # the draft is currently standard-only (there's nothing yet to extend). "replace": always start a fresh
+    # proposal containing ONLY this addition, discarding whatever the draft already had - the explicit
+    # "delete and start over" escape hatch, instead of additions always silently accumulating forever.
+    mode: Literal["add", "replace"] = "add"
 
 
 _INFRA_DRAFT_NOT_EDITABLE = {"INFRA_DRAFTING", "INFRA_CHANGE_SET_CREATING", "INFRA_PROVISIONING"}
@@ -1508,21 +1547,52 @@ async def edit_infra_draft(
         raise HTTPException(status_code=409, detail=f"Draft is in status {row['status']} and cannot be edited right now.")
     if not row["infra_proposal"]:
         raise HTTPException(status_code=409, detail="This draft has no proposal to edit yet.")
-    if (row["infra_proposal"] or {}).get("no_additional_infrastructure"):
-        raise HTTPException(
-            status_code=409,
-            detail="This app needs no extra infrastructure, so there is nothing to edit. To add a database, cache or "
-            "object storage, turn it on in the Requirements above and generate the proposal again.",
-        )
+    is_standard_only = (row["infra_proposal"] or {}).get("no_additional_infrastructure", False)
 
-    new_proposal = await _call_generate_infra(
-        {
-            "intent_spec": row["intent_spec"],
-            "archetype": row["archetype"],
-            "existing_resources": row["existing_resources"] or None,
-            "edit": {"current_proposal": row["infra_proposal"], "instruction": body.instruction},
-        }
-    )
+    if body.mode == "replace" or is_standard_only:
+        # Real bug found live (AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7): a standard-only draft has
+        # no template to EDIT, so this used to unconditionally 409 for it - correct as far as it went, but
+        # a dead end for a genuine first-ever addition ("add an S3 bucket") typed straight into the chat
+        # interface, which is supposed to let exactly this kind of request just work. This bootstraps a
+        # fresh extras-only proposal instead - the SAME code path create_infra_draft uses when
+        # analyze_infra_needs finds a real addition, never editing "nothing". `mode == "replace"` reaches
+        # this same path even when a real proposal ALREADY exists - the explicit "delete and start over
+        # with just this" escape hatch, instead of every addition silently accumulating forever.
+        #
+        # The structured "Add a component" picker names its exact catalog resource_type directly
+        # (works for the full catalog); free text only resolves the three keyword-matched kinds
+        # (database/cache/object_storage) - anything else still 409s with guidance, since there's no
+        # template to build from without knowing which real resource type to design.
+        kind = body.resource_type or infer_addition_kind_from_text(body.instruction)
+        if kind is None:
+            raise HTTPException(
+                status_code=409,
+                detail="I couldn't tell which resource you want from that text. Try naming it directly (e.g. "
+                "\"add a database\", \"add a cache\", \"add an S3 bucket\"), or use \"Add a component\" for "
+                "anything else.",
+            )
+        additions = [{"kind": kind, "reason": body.instruction}]
+        connection = await load_provisioning_connection(db, tenant_id, row.get("aws_connection_id"))
+        platform_context = await _platform_network_context(row["intent_spec"].get("aws_region", "us-east-1"), connection)
+        new_proposal = await _call_generate_infra(
+            {
+                "intent_spec": row["intent_spec"],
+                "archetype": row["archetype"],
+                "existing_resources": row["existing_resources"] or None,
+                "additions": additions,
+                "platform_context": platform_context,
+            }
+        )
+        new_proposal.update(no_additional_infrastructure=False, additions=additions, needs_summary=body.instruction)
+    else:
+        new_proposal = await _call_generate_infra(
+            {
+                "intent_spec": row["intent_spec"],
+                "archetype": row["archetype"],
+                "existing_resources": row["existing_resources"] or None,
+                "edit": {"current_proposal": row["infra_proposal"], "instruction": body.instruction},
+            }
+        )
     new_proposal = await apply_independent_cost(new_proposal, row["intent_spec"].get("aws_region", "us-east-1"))
     new_proposal = apply_policy_to_proposal(
         new_proposal, await evaluate_infra_policy(new_proposal, row["intent_spec"], row["existing_resources"])
@@ -1561,6 +1631,56 @@ async def edit_infra_draft(
         )
     ).mappings().first()
     return _infra_draft_row_to_dict(new_row)
+
+
+class CheckComponentRequest(BaseModel):
+    resource_type: str = Field(min_length=1)
+    params: dict = Field(default_factory=dict)
+
+
+@router.post("/infra-drafts/{draft_id}/check-component")
+async def check_infra_component(
+    draft_id: str, body: CheckComponentRequest, request: Request, db: AsyncSession = Depends(get_request_db)
+):
+    """
+    AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.2 (Phase C) - the pre-flight "can this be added, and
+    how" check shown BEFORE a full proposal regeneration. Deliberately separate from /edit: this never
+    creates a new infra_build_state row and never counts against the edit-regeneration budget - "just
+    checking" is free to click as many times as needed. On confirm, the frontend calls the EXISTING /edit
+    endpoint with an instruction built from this same resource_type/params (shared/component_catalog.py's
+    build_add_component_instruction) - one prompt contract, two front doors, no new generation path.
+    """
+    _require_valid_uuid_or_404(draft_id, "infra draft")
+    tenant_id = _get_tenant_id(request)
+    row = (
+        await db.execute(
+            text("SELECT * FROM infra_build_state WHERE draft_id = :draft_id AND tenant_id = :tenant_id"),
+            {"draft_id": draft_id, "tenant_id": tenant_id},
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Infra draft not found")
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                f"{EXPLAINABILITY_SERVICE_URL}/check-component",
+                json={
+                    "resource_type": body.resource_type,
+                    "params": body.params,
+                    "archetype": row["archetype"],
+                    # Per the platform's own 2026-09-16 scope decision (PROJECT_STATUS.md), AWS ECS
+                    # Fargate is the sole deploy target the onboarding wizard offers for new work - every
+                    # real infra draft going through this flow targets it.
+                    "deploy_target": "aws_ecs",
+                    "intent_spec": row["intent_spec"],
+                },
+            )
+        if resp.status_code >= 400:
+            raise httpx.HTTPStatusError(resp.text, request=resp.request, response=resp)
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Compatibility check failed: {str(e) or type(e).__name__}")
 
 
 @router.get("/infra-drafts/{draft_id}")
@@ -1863,7 +1983,7 @@ async def get_infra_provisioning_status(draft_id: str, request: Request, db: Asy
         raise HTTPException(status_code=404, detail="Infra draft not found")
 
     if row["status"] != "INFRA_PROVISIONING":
-        return _infra_draft_row_to_dict(row)
+        return {**_infra_draft_row_to_dict(row), "resource_events": []}
 
     intent_spec = row["intent_spec"] or {}
     region = intent_spec.get("aws_region", "us-east-1")
@@ -1912,7 +2032,11 @@ async def get_infra_provisioning_status(draft_id: str, request: Request, db: Asy
             )
         ).mappings().first()
 
-    return _infra_draft_row_to_dict(row)
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7.4.1 — real per-resource CloudFormation events for
+    # the live build view (Phase F, Stage C), ephemeral by design: never persisted to `infra_build_state`
+    # (there's no reason to store a point-in-time AWS snapshot the next poll will refresh anyway), always
+    # freshly attached to whatever DB row is being returned this request.
+    return {**_infra_draft_row_to_dict(row), "resource_events": result.get("resource_events", [])}
 
 
 class PipelinePreviewGenerateRequest(BaseModel):
@@ -2033,93 +2157,130 @@ async def get_project(project_id: str, request: Request, db: AsyncSession = Depe
     return project
 
 
+_DELETE_JOB_TTL_SECONDS = 3600  # generous: a stuck/slow AWS call must not make the job vanish mid-poll
+
+
+def _delete_job_key(job_id: str) -> str:
+    return f"project_delete_job:{job_id}"
+
+
+async def _save_delete_job(redis_client, job_id: str, job: dict) -> None:
+    await redis_client.set(_delete_job_key(job_id), json.dumps(job), ex=_DELETE_JOB_TTL_SECONDS)
+
+
+async def _load_delete_job(redis_client, job_id: str) -> dict | None:
+    raw = await redis_client.get(_delete_job_key(job_id))
+    return json.loads(raw) if raw else None
+
+
 @router.delete("/{project_id}", dependencies=[Depends(require_role("lead-sre"))])
 async def delete_project(project_id: str, request: Request, db: AsyncSession = Depends(get_request_db)):
     """
-    Removes the project. Its runs cascade (pipeline_executions.project_id is
-    ON DELETE CASCADE), and with them stage_logs. The generated `pipelines`
-    row is removed too — it exists solely to back this project.
-
-    Real gap found live (2026-09-15): this used to only ever touch the
-    database — the real Deployments/Services/HTTPRoute create_project's
-    onboarding call applied to the cluster were left running forever. A
-    project later recreated with the same name hit onboard_service's own
-    409-then-PATCH idempotency path against these orphaned objects instead
-    of a clean create, silently merging old and new config (a real
-    config-drift bug: a stale containerPort survived alongside a freshly
-    declared one, caught live while proving the live_url feature end to
-    end). Deprovisioning is best-effort, mirroring create_project's own
-    best-effort provisioning — a Kind cluster that isn't running right now
-    must not block deleting the project record.
+    Real gap found live (2026-09-30): deleting a project used to run synchronously and only ever tore down
+    the DB row plus the project's own ECS/Kubernetes objects — an AI-provisioned draft's real extra
+    resources (an S3 bucket, a database, …) and the build's ECR image had no teardown path anywhere and
+    outlived the project forever, still billing. This now runs as a background job so the UI can show real
+    step-by-step progress (a CloudFormation/ECS call can take several seconds) instead of one opaque spinner,
+    and tears down, in order: the running service (stops cost immediately), every linked infra draft's real
+    stack, the ECR image, the webhook mapping, and finally the database records — deliberately LAST, so a
+    failure in any earlier step still leaves the project visible and the job's failure detail readable
+    rather than silently vanishing along with the evidence of what didn't get cleaned up.
     """
     tenant_id = _get_tenant_id(request)
     project = await _load_project(db, project_id, tenant_id, request)
 
-    # Symmetric with create_project's registration — an orphaned mapping
-    # would otherwise let a push to this repo silently trigger a rollout
-    # against a project_id/pipeline_id that no longer exists once someone
-    # recreates a DIFFERENT project pointed at the same repo.
-    repo_full_name = webhook_registry.parse_full_name(project.get("repo_url"))
-    if repo_full_name:
-        try:
-            await webhook_registry.unregister(request.app.state.redis, repo_full_name)
-        except Exception as e:
-            logger.warning("webhook_repo_mapping_unregister_failed", project_id=project_id, error=str(e))
+    # Every infra_build_state row this project ever linked (normally 0 or 1) that reached a real stack —
+    # a draft that never got past INFRA_PENDING_APPROVAL has `stack_name IS NULL` and nothing to tear down.
+    infra_rows = [
+        dict(r)
+        for r in (
+            await db.execute(
+                text(
+                    "SELECT draft_id, stack_name FROM infra_build_state "
+                    "WHERE project_id = :pid AND tenant_id = :tid AND stack_name IS NOT NULL"
+                ),
+                {"pid": project_id, "tid": tenant_id},
+            )
+        ).mappings().all()
+    ]
 
-    await db.execute(
-        text("DELETE FROM projects WHERE project_id = :project_id AND tenant_id = :tenant_id"),
-        {"project_id": project_id, "tenant_id": tenant_id},
+    steps: list[dict] = []
+    has_real_deployment = bool(project.get("container_image") or project.get("repo_url"))
+    if project.get("deploy_target") == "aws_ecs" and has_real_deployment:
+        steps.append({"key": "cluster", "label": "Stopping AWS ECS services and load balancer routing", "status": "pending", "detail": None})
+    elif has_real_deployment:
+        steps.append({"key": "cluster", "label": "Removing Kubernetes Deployments, Service and HTTPRoute", "status": "pending", "detail": None})
+    for row in infra_rows:
+        steps.append({
+            "key": f"infra:{row['draft_id']}",
+            "label": "Deleting AI-provisioned infrastructure (CloudFormation stack)",
+            "status": "pending", "detail": None,
+        })
+    if project.get("container_image") and ".dkr.ecr." in project["container_image"]:
+        steps.append({"key": "ecr", "label": "Deleting the container image from ECR", "status": "pending", "detail": None})
+    steps.append({"key": "webhook", "label": "Unregistering repository webhook", "status": "pending", "detail": None})
+    steps.append({"key": "records", "label": "Removing project, pipeline and run history", "status": "pending", "detail": None})
+
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id": job_id, "project_id": project_id, "tenant_id": tenant_id, "project_name": project["name"],
+        "status": "RUNNING", "steps": steps, "pipeline_retained": False,
+    }
+    await _save_delete_job(request.app.state.redis, job_id, job)
+
+    asyncio.create_task(
+        _run_project_deletion_job(job_id, project_id, tenant_id, project, infra_rows, request.app.state.redis)
     )
-    pipeline_retained = False
-    if project.get("pipeline_id"):
-        # Real bug found live (2026-09-24): a pipeline that somehow has other
-        # executions attached (a run triggered directly against it before it
-        # was linked to a project — those pipeline_executions rows have a
-        # NULL project_id, so the projects-cascade above never touches them)
-        # makes this DELETE fail with an FK violation. The previous fix for
-        # that used a bare `await db.rollback()` — but with no SAVEPOINT,
-        # that rolls back the ENTIRE transaction, silently undoing the
-        # `DELETE FROM projects` above too, while still returning HTTP 200
-        # with `"deleted": project_id`. Caught live: a project deleted
-        # through this exact path stayed fully intact in Postgres despite a
-        # "success" response. `begin_nested()` scopes the rollback to just
-        # this one statement (a real SQL SAVEPOINT) so the projects DELETE
-        # already staged in the outer transaction survives and is what
-        # `await db.commit()` below actually commits.
-        try:
-            async with db.begin_nested():
-                await db.execute(
-                    text("DELETE FROM pipelines WHERE pipeline_id = :pid AND tenant_id = :tid"),
-                    {"pid": str(project["pipeline_id"]), "tid": tenant_id},
-                )
-        except IntegrityError:
-            pipeline_retained = True
-            logger.warning("project_pipeline_retained", project_id=project_id)
-    await db.commit()
-    # Cluster/cloud deprovisioning below now always runs regardless of
-    # pipeline_retained — the project genuinely IS gone at this point (see
-    # the SAVEPOINT above), so its real infra should be torn down same as
-    # any other successful deletion; only the shared `pipelines` row survives.
 
-    cluster_deprovisioning: dict = {"attempted": False, "succeeded": False, "detail": None}
-    if project.get("container_image") or project.get("repo_url"):
-        # Only projects that ever went through real onboarding (a
-        # hand-registered/adopted pipeline with neither has nothing in the
-        # cluster to remove — see the "No repository connected" note on
-        # `repo_url`'s own nullability).
-        service_name = _k8s_name(project["name"])
-        cluster_deprovisioning["attempted"] = True
+    logger.info("project_deletion_job_started", project_id=project_id, job_id=job_id)
+    return {"job_id": job_id, "steps": steps}
+
+
+@router.get("/{project_id}/delete-status/{job_id}")
+async def get_delete_job_status(project_id: str, job_id: str, request: Request):
+    """Polled by the frontend's delete-progress UI. Redis-only by design (see `_run_project_deletion_job`'s
+    own docstring) — the project row this job is deleting may be gone from Postgres before polling stops."""
+    tenant_id = _get_tenant_id(request)
+    job = await _load_delete_job(request.app.state.redis, job_id)
+    if job is None or job.get("project_id") != project_id or job.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="Delete job not found (it may have expired)")
+    return job
+
+
+async def _run_project_deletion_job(
+    job_id: str, project_id: str, tenant_id: str, project: dict, infra_rows: list[dict], redis_client,
+) -> None:
+    """
+    Runs detached from the request (kicked off via `asyncio.create_task`, never awaited by the route
+    handler) — the request-scoped `db` session `delete_project` used is already closed by the time this
+    runs, so this opens its OWN session via `AsyncSessionLocal` and sets the RLS tenant context on it
+    exactly the way `graduate_pipeline_run`/`report_gate1_result` (this file's other non-request-scoped
+    writers) already do, rather than through `get_request_db`'s request-lifecycle-bound path.
+    """
+    job = await _load_delete_job(redis_client, job_id)
+    if job is None:
+        logger.error("project_deletion_job_missing_at_start", job_id=job_id)
+        return
+
+    async def _mark(key: str, status: str, detail: str | None = None) -> None:
+        for s in job["steps"]:
+            if s["key"] == key:
+                s["status"] = status
+                s["detail"] = detail
+        await _save_delete_job(redis_client, job_id, job)
+
+    service_name = _k8s_name(project["name"])
+    region = "us-east-1"  # not persisted on `projects` (see _load_project) — every AWS call in this codebase already defaults the same way
+
+    cluster_step = next((s for s in job["steps"] if s["key"] == "cluster"), None)
+    if cluster_step is not None:
+        await _mark("cluster", "running")
         try:
             async with httpx.AsyncClient(timeout=300.0) as http_client:
                 if project.get("deploy_target") == "aws_ecs":
-                    # Module 8 — real gap found live: this branch didn't exist
-                    # at all until now, so every deleted "aws_ecs" project left
-                    # its real, billable ECS services/target groups/listener
-                    # rule running in AWS forever. Mirrors the kubernetes
-                    # branch's own best-effort semantics exactly.
                     resp = await http_client.post(
                         f"{PIPELINE_WORKER_URL}/services/deprovision-aws",
-                        json={"service_name": service_name, "path_prefix": project.get("path_prefix")},
+                        json={"service_name": service_name, "path_prefix": project.get("path_prefix"), "region": region},
                     )
                 else:
                     namespace = f"tenant-{tenant_id.split('-')[0]}"
@@ -2127,22 +2288,87 @@ async def delete_project(project_id: str, request: Request, db: AsyncSession = D
                         f"{PIPELINE_WORKER_URL}/services/deprovision",
                         json={"service_name": service_name, "namespace": namespace},
                     )
-            cluster_deprovisioning["succeeded"] = resp.status_code == 200
-            if resp.status_code != 200:
-                cluster_deprovisioning["detail"] = f"pipeline-worker returned {resp.status_code}: {resp.text[:300]}"
+            if resp.status_code == 200:
+                await _mark("cluster", "done")
+            else:
+                await _mark("cluster", "failed", f"pipeline-worker returned {resp.status_code}: {resp.text[:300]}")
         except httpx.RequestError as e:
-            cluster_deprovisioning["detail"] = f"pipeline-worker unreachable: {str(e) or type(e).__name__}"
-        if not cluster_deprovisioning["succeeded"]:
-            logger.warning(
-                "project_cluster_deprovisioning_failed", project_id=project_id, detail=cluster_deprovisioning["detail"]
-            )
+            await _mark("cluster", "failed", f"pipeline-worker unreachable: {str(e) or type(e).__name__}")
 
-    logger.info("project_deleted", project_id=project_id)
-    return {
-        "deleted": project_id,
-        "pipeline_retained": pipeline_retained,
-        "cluster_deprovisioning": cluster_deprovisioning,
-    }
+    for row in infra_rows:
+        key = f"infra:{row['draft_id']}"
+        await _mark(key, "running")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as http_client:
+                resp = await http_client.post(
+                    f"{PIPELINE_WORKER_URL}/infra-provisioning/delete-stack",
+                    json={"stack_name": row["stack_name"], "region": region},
+                )
+            if resp.status_code == 200:
+                await _mark(key, "done", resp.json().get("status"))
+            else:
+                await _mark(key, "failed", f"pipeline-worker returned {resp.status_code}: {resp.text[:300]}")
+        except httpx.RequestError as e:
+            await _mark(key, "failed", f"pipeline-worker unreachable: {str(e) or type(e).__name__}")
+
+    if any(s["key"] == "ecr" for s in job["steps"]):
+        await _mark("ecr", "running")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as http_client:
+                resp = await http_client.post(
+                    f"{PIPELINE_WORKER_URL}/services/delete-image",
+                    json={"image_name": project["container_image"], "region": region},
+                )
+            if resp.status_code == 200:
+                await _mark("ecr", "done", resp.json().get("status"))
+            else:
+                await _mark("ecr", "failed", f"pipeline-worker returned {resp.status_code}: {resp.text[:300]}")
+        except httpx.RequestError as e:
+            await _mark("ecr", "failed", f"pipeline-worker unreachable: {str(e) or type(e).__name__}")
+
+    await _mark("webhook", "running")
+    repo_full_name = webhook_registry.parse_full_name(project.get("repo_url"))
+    if repo_full_name:
+        try:
+            await webhook_registry.unregister(redis_client, repo_full_name)
+            await _mark("webhook", "done")
+        except Exception as e:
+            await _mark("webhook", "failed", str(e))
+    else:
+        await _mark("webhook", "done", "No repository connected")
+
+    await _mark("records", "running")
+    pipeline_retained = False
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT set_config('app.active_tenant_id', :tid, true)"), {"tid": tenant_id})
+            await session.execute(
+                text("DELETE FROM projects WHERE project_id = :project_id AND tenant_id = :tenant_id"),
+                {"project_id": project_id, "tenant_id": tenant_id},
+            )
+            if project.get("pipeline_id"):
+                # See the original synchronous delete_project's own note (preserved below): a pipeline with
+                # other real executions attached (NULL project_id ones the projects-cascade never reaches)
+                # makes this fail with an FK violation — begin_nested() scopes that failure to a SAVEPOINT
+                # so the projects DELETE staged above still survives the eventual commit.
+                try:
+                    async with session.begin_nested():
+                        await session.execute(
+                            text("DELETE FROM pipelines WHERE pipeline_id = :pid AND tenant_id = :tid"),
+                            {"pid": str(project["pipeline_id"]), "tid": tenant_id},
+                        )
+                except IntegrityError:
+                    pipeline_retained = True
+                    logger.warning("project_pipeline_retained", project_id=project_id)
+            await session.commit()
+        await _mark("records", "done", "Pipeline retained (has other run history)" if pipeline_retained else None)
+    except Exception as e:
+        await _mark("records", "failed", str(e))
+
+    job["pipeline_retained"] = pipeline_retained
+    job["status"] = "FAILED" if any(s["status"] == "failed" for s in job["steps"]) else "COMPLETED"
+    await _save_delete_job(redis_client, job_id, job)
+    logger.info("project_deletion_job_finished", job_id=job_id, project_id=project_id, status=job["status"])
 
 
 # ─────────────────────────── execution ───────────────────────────
@@ -2622,6 +2848,92 @@ async def score_project_predictive_risk(
     except Exception as e:
         logger.error("predictive_risk_proxy_failed", project_id=project_id, error=str(e))
         raise HTTPException(status_code=502, detail=f"Predictive risk scorer failed: {e}")
+
+
+@router.get("/{project_id}/runs/{run_id}/risk-assessment")
+async def get_run_risk_assessment(
+    project_id: str,
+    run_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_request_db),
+):
+    """
+    AI Deployment Risk Assessment for one specific, already-shipped run — the real gap this closes:
+    `score_project_predictive_risk` above (and `predictive_risk_scorer.py` behind it) has existed since an
+    earlier phase but nothing has EVER called it with a real commit diff — no frontend code fetches one, so
+    the scorer was fully built and fully untested against real data. This assembles that real input (the
+    actual GitHub diff between this run's commit and the previously-deployed commit, via
+    github_router.compare_commits) and feeds it to the same unmodified scorer, then hands back both the raw
+    evidence (real commit list, real files changed) and the AI's risk read on it — never a fabricated score.
+
+    Deliberately retrospective rather than pre-flight: this answers "how risky was what actually shipped in
+    this run", which is what a real user looking at a completed run's Verification Inspector wants to know,
+    without requiring a second, separate pre-trigger flow.
+    """
+    tenant_id = _get_tenant_id(request)
+    project = await _load_project(db, project_id, tenant_id, request)
+    run = await _assert_run_belongs_to_project(db, run_id, project_id, tenant_id)
+
+    repo_full_name = webhook_registry.parse_full_name(project.get("repo_url"))
+    if not repo_full_name:
+        return {"available": False, "reason": "no_repo", "message": "This project has no connected GitHub repository, so there's no commit diff to assess."}
+
+    head_sha = run.get("commit_sha")
+    if not head_sha:
+        return {"available": False, "reason": "no_commit_recorded", "message": "No commit SHA was recorded for this run — it may have been triggered manually with a plain image tag rather than from a git ref."}
+
+    prev_result = await db.execute(
+        text(
+            """
+            SELECT commit_sha FROM pipeline_executions
+            WHERE project_id = :project_id AND tenant_id = :tenant_id
+              AND started_at < :started_at AND commit_sha IS NOT NULL
+            ORDER BY started_at DESC LIMIT 1
+            """
+        ),
+        {"project_id": project_id, "tenant_id": tenant_id, "started_at": run["started_at"]},
+    )
+    base_row = prev_result.mappings().first()
+    if base_row is None:
+        return {"available": False, "reason": "first_tracked_deploy", "message": "This is the earliest tracked deployment with a recorded commit for this project — there's no prior version to diff it against."}
+    base_sha = base_row["commit_sha"]
+
+    if base_sha == head_sha:
+        return {"available": False, "reason": "same_commit", "message": "This run redeployed the exact same commit as the previous one — there's no code change to assess."}
+
+    owner, repo = repo_full_name.split("/", 1)
+    from src.routers.github_router import compare_commits
+
+    try:
+        compare = await compare_commits(request, owner, repo, base_sha, head_sha)
+    except HTTPException as e:
+        return {"available": False, "reason": "github_error", "message": str(e.detail)}
+
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            resp = await client.post(
+                f"{EXPLAINABILITY_SERVICE_URL}/predictive-risk",
+                json={
+                    "commit_diff": compare["diff_text"],
+                    "commit_message": run.get("commit_message") or "",
+                    "files_changed": compare["files_changed"],
+                },
+            )
+            resp.raise_for_status()
+            risk = resp.json()
+    except Exception as e:
+        logger.error("run_risk_assessment_scorer_failed", project_id=project_id, run_id=run_id, error=str(e))
+        return {"available": False, "reason": "scorer_unavailable", "message": f"The risk scorer is unavailable right now: {e}"}
+
+    return {
+        "available": True,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "compare_url": compare["compare_url"],
+        "stats": compare["stats"],
+        "commits": compare["commits"],
+        "risk": risk,
+    }
 
 
 @router.get("/{project_id}/runs")

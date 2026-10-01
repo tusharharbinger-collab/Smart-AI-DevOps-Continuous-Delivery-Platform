@@ -13,8 +13,9 @@ import { toast } from "sonner";
 import {
   GitBranch, FolderGit2, Plus, Rocket, Search, Timer, Trash2, TrendingUp,
 } from "lucide-react";
-import { deleteProject, listProjects, triggerRollout, type ProjectSummary } from "@/api/projects";
+import { deleteProject, listProjects, triggerRollout, type DeleteJobStatus, type ProjectSummary } from "@/api/projects";
 import { LiveUrlBadge } from "@/components/LiveUrlBadge";
+import { ProjectDeleteProgress } from "@/components/ProjectDeleteProgress";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -152,14 +153,19 @@ function ProjectCard({
                   <AlertDialogTitle>Permanently delete {project.name}?</AlertDialogTitle>
                   <AlertDialogDescription asChild>
                     <div className="space-y-2">
-                      <p>This cannot be undone. This removes:</p>
+                      <p>This cannot be undone. This removes, in order:</p>
                       <ul className="list-inside list-disc space-y-0.5">
-                        <li>The project record and its entire run/audit history</li>
                         <li>
-                          Its real Kubernetes objects — Deployments, Services, and the HTTPRoute — so it stops
-                          serving traffic immediately
+                          Its real running service{" "}
+                          {project.deploy_target === "aws_ecs"
+                            ? "— ECS tasks, target groups and load-balancer routing — so AWS billing for it stops immediately"
+                            : "— Kubernetes Deployments, Services, and the HTTPRoute — so it stops serving traffic immediately"}
                         </li>
+                        <li>Any AI-provisioned infrastructure it created (e.g. a database or S3 bucket)</li>
+                        <li>Its container image in ECR, if one was built</li>
+                        <li>The project record and its entire run/audit history</li>
                       </ul>
+                      <p className="text-xs">You'll see real progress for each step as it happens.</p>
                     </div>
                   </AlertDialogDescription>
                 </AlertDialogHeader>
@@ -220,6 +226,7 @@ export function ProjectsOverview() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
+  const [deleteJob, setDeleteJob] = useState<{ projectId: string; jobId: string; projectName: string } | null>(null);
 
   const { data, isLoading } = useQuery({
     queryKey: ["projects"],
@@ -247,31 +254,31 @@ export function ProjectsOverview() {
   async function handleDelete(project: ProjectSummary) {
     try {
       const res = await deleteProject(project.project_id);
-      // Real bug found live: `pipeline_retained: true` means the backend hit
-      // a foreign-key violation trying to remove the underlying pipeline
-      // (it still has real historical run/audit rows attached) and rolled
-      // back the ENTIRE delete to avoid silently destroying that history —
-      // nothing was actually deleted. This used to fall through to the
-      // generic success toast below, lying to the user that the project was
-      // gone right before it reappeared on the next refetch. Must be
-      // checked first and reported honestly instead.
-      if (res.pipeline_retained) {
-        toast.error(`${project.name} could not be deleted`, {
-          description:
-            "Its pipeline still has real run/audit history attached, so nothing was removed. " +
-            "This protects that history from being silently destroyed.",
-        });
-      } else if (res.cluster_deprovisioning.attempted && !res.cluster_deprovisioning.succeeded) {
-        toast.warning(`${project.name} deleted, but its cluster objects may still be running`, {
-          description: res.cluster_deprovisioning.detail ?? "pipeline-worker could not reach the cluster.",
+      // Real gap found live: deletion now runs as a background job (a CloudFormation/ECS teardown call
+      // can take several seconds) - this only STARTS it. ProjectDeleteProgress polls the job and reports
+      // real per-step results; the project list is invalidated once it reaches a terminal state below.
+      setDeleteJob({ projectId: project.project_id, jobId: res.job_id, projectName: project.name });
+    } catch (err) {
+      toast.error("Could not start deletion", { description: (err as Error).message });
+    }
+  }
+
+  function handleDeleteJobDone(job: DeleteJobStatus) {
+    if (job.status === "COMPLETED") {
+      if (job.pipeline_retained) {
+        toast.warning(`${job.project_name} deleted`, {
+          description: "Its pipeline was kept — it still has other real run/audit history attached.",
         });
       } else {
-        toast.success(`${project.name} deleted`);
+        toast.success(`${job.project_name} deleted — real infrastructure and cost torn down`);
       }
-      queryClient.invalidateQueries({ queryKey: ["projects"] });
-    } catch (err) {
-      toast.error("Could not delete service", { description: (err as Error).message });
+    } else {
+      const failed = job.steps.filter((s) => s.status === "failed");
+      toast.error(`${job.project_name}: deletion finished with errors`, {
+        description: failed.map((s) => `${s.label}: ${s.detail ?? "failed"}`).join("; "),
+      });
     }
+    queryClient.invalidateQueries({ queryKey: ["projects"] });
   }
 
   return (
@@ -347,6 +354,16 @@ export function ProjectsOverview() {
             />
           ))}
         </div>
+      )}
+
+      {deleteJob && (
+        <ProjectDeleteProgress
+          projectId={deleteJob.projectId}
+          jobId={deleteJob.jobId}
+          projectName={deleteJob.projectName}
+          onDone={handleDeleteJobDone}
+          onClose={() => setDeleteJob(null)}
+        />
       )}
     </div>
   );

@@ -16,6 +16,32 @@
 // marker convention.
 export const STAGE_MARKER_RE = /^--- Stage: (.+?) \((.+?)\) ---$/;
 
+/**
+ * A project's `canary_verify` stage runs one of two real, mutually exclusive
+ * code paths depending on `deploy_mode` (see BLUE_GREEN_STEPS vs. the ramp
+ * catalogs below) — a blue-green rollout never actually ramps traffic
+ * percentage by percentage, it does one atomic cutover. Showing "Progressive
+ * Canary" / "Canary Deploy" for a blue-green run is simply wrong, not just
+ * inconsistent phrasing, so every place that renders a stage's display name
+ * must go through this instead of a hardcoded label map.
+ */
+const STAGE_DISPLAY_NAMES: Record<string, string> = {
+  build: "Build",
+  test: "Test",
+  canary_deploy: "Deploy",
+  canary_verify: "Progressive Canary",
+};
+
+const BLUE_GREEN_STAGE_DISPLAY_NAMES: Record<string, string> = {
+  ...STAGE_DISPLAY_NAMES,
+  canary_verify: "Blue-Green Cutover",
+};
+
+export function getStageDisplayName(stageName: string, deployMode?: string | null): string {
+  const labels = deployMode === "blue_green" ? BLUE_GREEN_STAGE_DISPLAY_NAMES : STAGE_DISPLAY_NAMES;
+  return labels[stageName] ?? stageName;
+}
+
 /** Used by the "click a stage chip to filter the log panel" feature — unchanged
  * from its original home in PipelineDashboard.tsx, just moved here. */
 export function filterLogsForStage(logLines: string[], selectedStage: string | null): string[] {

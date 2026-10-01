@@ -17,27 +17,14 @@
 import { useMemo } from "react";
 import dagre from "dagre";
 import {
-  ReactFlow, Background, Controls, type Edge, type Node, Position,
+  ReactFlow, Background, BackgroundVariant, Controls, MarkerType, type Edge, type Node, Position,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Database, Globe, HardDrive, Layers, Server, Zap } from "lucide-react";
+import { flowNodeTypes, infraAccentFor, TINT_HEX, type FlowCardData } from "@/components/pipeline/FlowNode";
 import type { InfraTopology } from "@/api/infraDrafts";
 
-const NODE_WIDTH = 180;
-const NODE_HEIGHT = 56;
-
-const TYPE_ICON: Record<string, typeof Server> = {
-  alb: Globe,
-  ecs_service: Server,
-  rds: Database,
-  elasticache: Zap,
-  s3: HardDrive,
-};
-
-function iconFor(type: string) {
-  const Icon = TYPE_ICON[type.toLowerCase()] ?? Layers;
-  return <Icon className="h-3.5 w-3.5" />;
-}
+const NODE_WIDTH = 190;
+const NODE_HEIGHT = 60;
 
 /**
  * dagre computes layout in its own graph object, then we read positions
@@ -59,41 +46,32 @@ function layoutWithDagre(topology: InfraTopology): { nodes: Node[]; edges: Edge[
 
   const nodes: Node[] = topology.nodes.map((n) => {
     const pos = g.node(n.id);
+    const { icon, tint } = infraAccentFor(n.type);
     return {
       id: n.id,
+      type: "card",
       // dagre gives the CENTER of the node; React Flow positions from the
       // top-left corner — convert or every node renders offset from where
       // dagre actually intended it.
       position: { x: pos.x - NODE_WIDTH / 2, y: pos.y - NODE_HEIGHT / 2 },
-      data: {
-        label: (
-          <div className="flex items-center gap-2 text-xs">
-            {iconFor(n.type)}
-            <div>
-              <div className="font-medium">{n.label}</div>
-              <div className="text-[10px] uppercase text-muted-foreground">{n.type}</div>
-            </div>
-          </div>
-        ),
-      },
+      data: { icon, title: n.label, subtitle: n.type, tint } satisfies FlowCardData,
       sourcePosition: Position.Bottom,
       targetPosition: Position.Top,
-      style: {
-        width: NODE_WIDTH,
-        border: "1px solid var(--border, #333)",
-        borderRadius: 8,
-        padding: 8,
-        background: "var(--card, #1a1a1a)",
-      },
+      style: { width: NODE_WIDTH },
     };
   });
 
-  const edges: Edge[] = topology.edges.map((e) => ({
-    id: `${e.source}-${e.target}`,
-    source: e.source,
-    target: e.target,
-    animated: false,
-  }));
+  const edges: Edge[] = topology.edges.map((e) => {
+    const color = TINT_HEX[infraAccentFor(topology.nodes.find((n) => n.id === e.source)?.type ?? "").tint];
+    return {
+      id: `${e.source}-${e.target}`,
+      source: e.source,
+      target: e.target,
+      animated: true,
+      style: { stroke: color },
+      markerEnd: { type: MarkerType.ArrowClosed, color },
+    };
+  });
 
   return { nodes, edges };
 }
@@ -110,10 +88,11 @@ export function InfraTopologyGraph({ topology }: InfraTopologyGraphProps) {
   }
 
   return (
-    <div style={{ height: Math.max(220, topology.nodes.length * 90) }} className="rounded-md border">
+    <div style={{ height: Math.max(220, topology.nodes.length * 90) }} className="flow-canvas overflow-hidden rounded-xl border">
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        nodeTypes={flowNodeTypes}
         fitView
         nodesDraggable={false}
         nodesConnectable={false}
@@ -121,7 +100,7 @@ export function InfraTopologyGraph({ topology }: InfraTopologyGraphProps) {
         elementsSelectable={false}
         proOptions={{ hideAttribution: true }}
       >
-        <Background gap={16} />
+        <Background variant={BackgroundVariant.Dots} gap={18} size={1.2} className="opacity-40" />
         <Controls showInteractive={false} />
       </ReactFlow>
     </div>

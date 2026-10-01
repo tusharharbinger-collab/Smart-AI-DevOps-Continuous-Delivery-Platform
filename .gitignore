@@ -22,6 +22,7 @@ frontend/dist/
 frontend/playwright-report/
 frontend/test-results/
 frontend/tsconfig.tsbuildinfo
+frontend/.vite/
 
 # Env / secrets
 .env

@@ -108,6 +108,38 @@
   }
 }
 
+/* n8n/Make.com-style canvas skin for the infra/pipeline React Flow graphs (InfraTopologyGraph.tsx,
+   ProjectDeliveryGraph.tsx) — purely visual, scoped to `.flow-canvas` so it never touches any other UI. */
+.flow-canvas {
+  background: radial-gradient(circle at 20% 0%, hsl(var(--primary) / 0.06), transparent 55%),
+    hsl(var(--background));
+}
+.flow-canvas .react-flow__controls {
+  border-radius: 0.75rem;
+  overflow: hidden;
+  box-shadow: 0 4px 16px hsl(var(--background) / 0.4);
+  border: 1px solid hsl(var(--border));
+}
+.flow-canvas .react-flow__controls-button {
+  background: hsl(var(--card));
+  border-bottom: 1px solid hsl(var(--border));
+  color: hsl(var(--foreground));
+}
+.flow-canvas .react-flow__controls-button:hover {
+  background: hsl(var(--accent));
+}
+.flow-canvas .react-flow__edge-path {
+  stroke-width: 2;
+}
+.flow-canvas .react-flow__edge.animated .react-flow__edge-path {
+  stroke-dasharray: 5 3;
+}
+.flow-canvas .react-flow__minimap {
+  border-radius: 0.75rem;
+  border: 1px solid hsl(var(--border));
+  overflow: hidden;
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

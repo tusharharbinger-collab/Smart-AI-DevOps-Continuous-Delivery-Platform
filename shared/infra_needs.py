@@ -23,6 +23,30 @@ PLATFORM_PROVIDES = [
 
 _DB_ENGINE = {"mysql": "MySQL", "postgres": "PostgreSQL", "postgresql": "PostgreSQL"}
 
+# AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7 - real bug found live: a standard-only draft
+# (no_additional_infrastructure=true) has no template to EDIT, so a genuine first-ever addition like "add an
+# S3 bucket" 409'd with "turn it on in the Requirements above and generate again" - correct advice, but a
+# dead end inside a chat interface that's supposed to let exactly this kind of request just work. This is a
+# small, bounded, deterministic keyword match against only the THREE addition kinds this platform already
+# knows how to design in isolation (database/cache/object_storage - see _ADDITION_SHAPES in
+# infra_generator.py) - never a guess beyond a real, recognized keyword, and never covers the full open-ended
+# "Add a component" catalog (EC2/Lambda/SQS/etc.), which still needs a real proposal to edit against.
+_ADDITION_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("database", ("database", "postgres", "postgresql", "mysql", "rds", "db ", "a db")),
+    ("cache", ("cache", "redis", "elasticache", "memcache")),
+    ("object_storage", ("s3", "bucket", "object storage", "blob storage", "file storage")),
+]
+
+
+def infer_addition_kind_from_text(text: str) -> str | None:
+    """Returns one of "database"/"cache"/"object_storage" if the free-text instruction clearly names it,
+    else None (never guesses ambiguous or unrecognized text)."""
+    lowered = f" {text.lower()} "
+    for kind, keywords in _ADDITION_KEYWORDS:
+        if any(kw in lowered for kw in keywords):
+            return kind
+    return None
+
 
 def analyze_infra_needs(intent_spec: dict, archetype: str, existing_resources: dict | None = None) -> dict:
     """

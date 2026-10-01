@@ -65,3 +65,26 @@ def ensure_ecr_repository_exists(image_name: str, region: str) -> None:
         logger.info("ecr_repository_created", repository=repo_name, region=region)
     except client.exceptions.RepositoryAlreadyExistsException:
         pass
+
+
+def delete_ecr_repository(image_name: str, region: str) -> dict:
+    """
+    Real gap found live: a deleted project's build image (pushed here by `ensure_ecr_repository_exists` +
+    the build stage) was left in ECR forever, still billing storage. `force=True` removes every image
+    tag/layer in the repository too, not just the (now-orphaned) repository record — mirrors
+    `deprovision_ecs_service`'s `force=True` on `delete_service` for the same reason: this repository
+    existed for exactly this one project and nothing else references it. Idempotent: a non-ECR image name
+    (a registry never created through this platform) or an already-deleted repository is reported as a
+    no-op, never an error.
+    """
+    if not is_ecr_image(image_name):
+        return {"status": "not_an_ecr_image"}
+    repo_name = image_name.split("/", 1)[1] if "/" in image_name else image_name
+    repo_name = repo_name.split(":", 1)[0]  # strip a tag, if the caller passed one
+    client = boto3.client("ecr", region_name=region)
+    try:
+        client.delete_repository(repositoryName=repo_name, force=True)
+        logger.info("ecr_repository_deleted", repository=repo_name, region=region)
+        return {"status": "deleted", "repository": repo_name}
+    except client.exceptions.RepositoryNotFoundException:
+        return {"status": "already_deleted", "repository": repo_name}

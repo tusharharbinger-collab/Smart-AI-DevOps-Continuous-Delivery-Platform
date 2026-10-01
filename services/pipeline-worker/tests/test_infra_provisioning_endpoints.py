@@ -89,6 +89,67 @@ def test_execute_change_set_provisioner_error_is_502(monkeypatch):
     assert exc_info.value.status_code == 502
 
 
+# ───────── delete-stack / delete-image (project-deletion teardown) ─────────
+
+
+def test_delete_infra_stack_returns_the_real_result(monkeypatch):
+    monkeypatch.setattr(
+        main, "cfn_delete_stack",
+        lambda stack_name, region, connection=None: {"status": "delete_requested", "stack_name": stack_name},
+    )
+
+    result = asyncio.run(main.delete_infra_stack({"stack_name": "smartcd-infra-draft-1", "region": "us-east-1"}))
+
+    assert result == {"status": "delete_requested", "stack_name": "smartcd-infra-draft-1"}
+
+
+def test_delete_infra_stack_missing_field_is_422():
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main.delete_infra_stack({}))
+    assert exc_info.value.status_code == 422
+
+
+def test_delete_infra_stack_provisioner_error_is_502(monkeypatch):
+    def _raise(*a, **kw):
+        raise RuntimeError("boto3 exploded")
+
+    monkeypatch.setattr(main, "cfn_delete_stack", _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main.delete_infra_stack({"stack_name": "x"}))
+    assert exc_info.value.status_code == 502
+
+
+def test_delete_service_image_returns_the_real_result(monkeypatch):
+    monkeypatch.setattr(
+        main, "delete_ecr_repository",
+        lambda image_name, region: {"status": "deleted", "repository": "testing-2"},
+    )
+
+    result = asyncio.run(main.delete_service_image({
+        "image_name": "236087863083.dkr.ecr.us-east-1.amazonaws.com/testing-2", "region": "us-east-1",
+    }))
+
+    assert result == {"status": "deleted", "repository": "testing-2"}
+
+
+def test_delete_service_image_missing_field_is_422():
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main.delete_service_image({}))
+    assert exc_info.value.status_code == 422
+
+
+def test_delete_service_image_ecr_error_is_502(monkeypatch):
+    def _raise(*a, **kw):
+        raise RuntimeError("boto3 exploded")
+
+    monkeypatch.setattr(main, "delete_ecr_repository", _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(main.delete_service_image({"image_name": "x"}))
+    assert exc_info.value.status_code == 502
+
+
 def test_get_status_returns_real_outputs(monkeypatch):
     monkeypatch.setattr(
         main,
@@ -97,11 +158,32 @@ def test_get_status_returns_real_outputs(monkeypatch):
             status="UPDATE_COMPLETE", is_terminal=True, succeeded=True, outputs={"DbEndpoint": "db.example.com"}
         ),
     )
+    monkeypatch.setattr(main, "cfn_fetch_failure_events", lambda stack_name, region, connection=None: [])
 
     result = asyncio.run(main.get_infra_provisioning_status("smartcd-infra-draft-1", "us-east-1"))
 
     assert result["succeeded"] is True
     assert result["outputs"]["DbEndpoint"] == "db.example.com"
+
+
+def test_get_status_includes_real_per_resource_events(monkeypatch):
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7.4.1 - the live build view (Phase F, Stage C) needs
+    # real per-resource events during an IN-PROGRESS poll, not just after a terminal failure.
+    monkeypatch.setattr(
+        main, "cfn_check_status",
+        lambda stack_name, region, connection=None: ProvisioningStatus(
+            status="CREATE_IN_PROGRESS", is_terminal=False, succeeded=False, outputs={}
+        ),
+    )
+    events = [
+        {"resource": "OrdersDb", "type": "AWS::RDS::DBInstance", "status": "CREATE_IN_PROGRESS", "reason": None, "timestamp": "2026-09-29T00:00:00"},
+        {"resource": "CacheCluster", "type": "AWS::ElastiCache::CacheCluster", "status": "CREATE_COMPLETE", "reason": None, "timestamp": "2026-09-29T00:00:01"},
+    ]
+    monkeypatch.setattr(main, "cfn_fetch_failure_events", lambda stack_name, region, connection=None: events)
+
+    result = asyncio.run(main.get_infra_provisioning_status("smartcd-infra-draft-1", "us-east-1"))
+
+    assert result["resource_events"] == events
 
 
 def test_create_change_set_threads_import_and_stack_name_to_the_provisioner(monkeypatch):

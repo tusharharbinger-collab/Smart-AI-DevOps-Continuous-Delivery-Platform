@@ -13,7 +13,7 @@
 import type { ReactNode } from "react";
 import { CheckCircle2, Circle, CircleDot, Loader2, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { deriveSubSteps, splitLogsByStage, type StageRowStatus, type SubStep } from "@/lib/pipelineStageSteps";
+import { deriveSubSteps, getStageDisplayName, splitLogsByStage, type StageRowStatus, type SubStep } from "@/lib/pipelineStageSteps";
 import { TrafficWeightChart, type WeightPoint } from "@/components/pipeline/TrafficWeightChart";
 import { Badge } from "@/components/ui/badge";
 
@@ -29,6 +29,10 @@ export interface StageTimelineProps {
    * dropped, since StageTimeline replaces PipelineDAG in PipelineDashboard.tsx). */
   selectedStage?: string | null;
   onSelectStage?: (stage: string | null) => void;
+  /** "blue_green" vs. "canary" (or undefined) — decides whether stage names
+   * read as "Blue-Green Cutover" or "Progressive Canary", since they're two
+   * genuinely different code paths, not a wording preference. */
+  deployMode?: string | null;
 }
 
 const STAGE_ROW_ICON: Record<StageRowStatus, ReactNode> = {
@@ -53,7 +57,7 @@ const ROW_TEXT_CLASS: Record<StageRowStatus, string> = {
 };
 
 export function StageTimeline({
-  stages, currentStage, status, logLines, trafficWeight, weightHistory, selectedStage, onSelectStage,
+  stages, currentStage, status, logLines, trafficWeight, weightHistory, selectedStage, onSelectStage, deployMode,
 }: StageTimelineProps) {
   if (!stages || stages.length === 0) {
     return <p className="text-sm text-muted-foreground">Waiting for pipeline DAG…</p>;
@@ -102,7 +106,7 @@ export function StageTimeline({
                     selectedStage === stageName && "underline"
                   )}
                 >
-                  {stageName}
+                  {getStageDisplayName(stageName, deployMode)}
                 </button>
                 {isCanaryVerify && (isCurrent || isDone) && (
                   <Badge variant={isFailed ? "destructive" : "secondary"} className="text-[10px]">

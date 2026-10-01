@@ -216,18 +216,37 @@ export const getProject = (projectId: string) =>
 export const createProject = (input: CreateProjectInput) =>
   apiClient.post<CreateProjectResult>("/api/v1/projects", input);
 
+export type DeleteStepStatus = "pending" | "running" | "done" | "failed";
+
+export interface DeleteStep {
+  key: string;
+  label: string;
+  status: DeleteStepStatus;
+  detail: string | null;
+}
+
+export interface DeleteJobStatus {
+  job_id: string;
+  project_id: string;
+  project_name: string;
+  status: "RUNNING" | "COMPLETED" | "FAILED";
+  steps: DeleteStep[];
+  pipeline_retained: boolean;
+}
+
+/**
+ * Real gap found live (2026-09-30): deleting a project used to run synchronously and only ever removed the
+ * DB row plus the project's own ECS/Kubernetes objects — an AI-provisioned draft's real extra resources (an
+ * S3 bucket, a database, …) and the build's ECR image had no teardown path anywhere and outlived the
+ * project forever, still billing. Now runs as a background job (a CloudFormation/ECS call can take several
+ * seconds) — this call only STARTS it; poll `getDeleteJobStatus` with the returned `job_id` for real
+ * step-by-step progress, mirroring the same poll-a-job-id pattern `getInfraProvisioningStatus` already uses.
+ */
 export const deleteProject = (projectId: string) =>
-  apiClient.del<{
-    deleted: string;
-    pipeline_retained: boolean;
-    /**
-     * Real gap found live: deleting a project used to only remove the DB
-     * row — the real Deployments/Services/HTTPRoute it onboarded were left
-     * running in the cluster forever. Best-effort, mirroring create's own
-     * cluster_provisioning shape.
-     */
-    cluster_deprovisioning: { attempted: boolean; succeeded: boolean; detail: string | null };
-  }>(`/api/v1/projects/${projectId}`);
+  apiClient.del<{ job_id: string; steps: DeleteStep[] }>(`/api/v1/projects/${projectId}`);
+
+export const getDeleteJobStatus = (projectId: string, jobId: string) =>
+  apiClient.get<DeleteJobStatus>(`/api/v1/projects/${projectId}/delete-status/${jobId}`);
 
 export const listProjectRuns = (projectId: string) =>
   apiClient.get<{ runs: ProjectRun[] }>(`/api/v1/projects/${projectId}/runs`);
@@ -289,6 +308,56 @@ export const getRunFailureAnalysis = (projectId: string, runId: string) =>
   apiClient.get<{ failure_analysis: StageFailureAnalysis | null }>(
     `/api/v1/projects/${projectId}/runs/${runId}/failure-analysis`
   );
+
+/**
+ * AI Deployment Risk Assessment — the real gap this closes: the backend's
+ * predictive-risk scorer (services/explainability-service/src/predictive_risk_scorer.py)
+ * has existed since an earlier phase but no frontend code ever fed it a real
+ * commit diff, so it was fully built and never actually exercised against
+ * real data. This is a genuinely retrospective read (never available for
+ * a project with no connected repo, no recorded commit, or no prior
+ * deployment to diff against) — `available: false` always carries an honest
+ * `reason`/`message` rather than a fabricated score.
+ */
+export interface RiskFactor {
+  category: string;
+  description: string;
+  severity: "LOW" | "MEDIUM" | "HIGH";
+}
+export interface CanaryStepRecommendation {
+  weight: number;
+  min_duration_seconds: number;
+}
+export interface RiskReport {
+  risk_score: number;
+  risk_level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  summary: string;
+  risk_factors: RiskFactor[];
+  recommended_canary_steps: CanaryStepRecommendation[];
+  prescriptive_pre_deploy_checks: string[];
+}
+export interface RunRiskCommit {
+  sha: string;
+  short_sha: string;
+  message: string;
+  author: string | null;
+  date: string | null;
+  url: string | null;
+}
+export type RunRiskAssessment =
+  | { available: false; reason: string; message: string }
+  | {
+      available: true;
+      base_sha: string;
+      head_sha: string;
+      compare_url: string | null;
+      stats: { additions: number; deletions: number; changed_files: number };
+      commits: RunRiskCommit[];
+      risk: RiskReport;
+    };
+
+export const getRunRiskAssessment = (projectId: string, runId: string) =>
+  apiClient.get<RunRiskAssessment>(`/api/v1/projects/${projectId}/runs/${runId}/risk-assessment`);
 
 /**
  * Build-only dry run (services/pipeline-worker/src/build_preview.py) — runs

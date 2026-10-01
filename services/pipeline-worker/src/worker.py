@@ -74,7 +74,14 @@ def _resolve_alb_base_url(region: str, redis_client=None) -> str | None:
     resolved = dns_name or AWS_ALB_BASE_URL
     if dns_name and redis_client is not None:
         try:
-            redis_client.set(f"platform:alb_dns_name:{region}", dns_name, ex=3600)
+            # Real bug found live (2026-09-30): a 1-hour TTL made every project's "Live · verified" badge on
+            # the Overview grid silently disappear an hour after its last deploy — the ALB itself never
+            # stopped serving traffic, only this cached copy of its DNS name expired, so api-gateway's
+            # boto3-free `_live_url()` fell back to the always-empty static env var and got None. The shared
+            # ALB's DNS name does not change between ordinary deploys (only a deliberate ALB recreation
+            # changes it, which re-runs this exact function and overwrites this key immediately) — a long
+            # TTL is a safety net against a permanently abandoned/torn-down ALB, not a real staleness risk.
+            redis_client.set(f"platform:alb_dns_name:{region}", dns_name, ex=604800)
         except Exception as e:
             logger.warning("alb_dns_publish_to_redis_failed", region=region, error=str(e))
     return resolved

@@ -8,21 +8,19 @@ Analyzes commit diffs, modified file types, and architectural touchpoints to:
 3. Recommend an adaptive progressive canary ramp schedule tailored to risk.
 4. Output prescriptive pre-deploy checks.
 
-Runs with Groq LLM for deep semantic reasoning, with a deterministic heuristic fallback.
+Runs through shared/llm_router.py's Gemini -> Groq -> OpenRouter -> Mistral failover chain for deep
+semantic reasoning, with a deterministic heuristic fallback if every configured provider fails.
 """
 import json
-import os
 import re
 from typing import Any
 
-import httpx
 import structlog
 from pydantic import BaseModel, Field
 
-logger = structlog.get_logger(__name__)
+from shared.llm_router import AllProvidersFailedError, call_llm
 
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+logger = structlog.get_logger(__name__)
 
 _RISK_SCORER_SYSTEM_PROMPT = (
     "You are an expert AI Principal Site Reliability Engineer (AI SRE). "
@@ -64,7 +62,7 @@ class PredictiveRiskReport(BaseModel):
 
 def _heuristic_risk_assessment(commit_diff: str | None, commit_message: str | None, files_changed: list[str] | None) -> dict[str, Any]:
     """
-    Deterministic fallback when Groq is unreachable or GROQ_API_KEY is not set.
+    Deterministic fallback when every configured LLM provider is unreachable, or none is configured at all.
     """
     score = 15
     factors: list[RiskFactor] = []
@@ -143,17 +141,20 @@ async def score_deployment_risk(
     commit_message: str | None = None,
     files_changed: list[str] | None = None,
     timeout_seconds: float = 30.0,
+    redis_client=None,
 ) -> dict[str, Any]:
     """
     Computes pre-flight deployment risk score and recommended canary ramp schedule.
+
+    Routed through shared/llm_router.py's Gemini -> Groq -> OpenRouter -> Mistral failover chain (see
+    AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.5) instead of calling Groq directly - behavior is
+    unchanged for a deployment with only GROQ_API_KEY set (the previous and still-common case), since an
+    unconfigured provider is silently skipped by the router. `_heuristic_risk_assessment` remains the final,
+    deterministic fallback when EVERY configured provider fails (or none are configured at all) - this
+    router never invents a fallback of its own.
     """
     diff_text = commit_diff or ""
     files = files_changed or []
-    
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
-        logger.info("predictive_risk_using_heuristic_fallback_no_api_key")
-        return _heuristic_risk_assessment(commit_diff, commit_message, files)
 
     analysis_input = {
         "commit_message": commit_message,
@@ -167,28 +168,21 @@ async def score_deployment_risk(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(
-                GROQ_API_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": GROQ_MODEL,
-                    "temperature": 0.0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": _RISK_SCORER_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-
-        parsed = PredictiveRiskReport.model_validate_json(content)
+        result = await call_llm(
+            messages=[
+                {"role": "system", "content": _RISK_SCORER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            timeout_seconds=timeout_seconds,
+            redis_client=redis_client,
+        )
+        parsed = PredictiveRiskReport.model_validate_json(result["content"])
         return parsed.model_dump()
-    except httpx.TimeoutException:
-        logger.warning("predictive_risk_groq_timeout", timeout_seconds=timeout_seconds)
+    except AllProvidersFailedError as exc:
+        logger.info("predictive_risk_using_heuristic_fallback", reason=str(exc))
         return _heuristic_risk_assessment(commit_diff, commit_message, files)
     except Exception as exc:
-        logger.error("predictive_risk_groq_failed", error=str(exc))
+        logger.error("predictive_risk_llm_response_invalid", error=str(exc))
         return _heuristic_risk_assessment(commit_diff, commit_message, files)

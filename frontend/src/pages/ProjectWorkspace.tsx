@@ -21,6 +21,7 @@ import {
   approveRun, getProject, getRunRolloutState, getRunStages, listProjectRuns, rollbackRun, triggerRollout,
 } from "@/api/projects";
 import { pausePipeline, resumePipeline } from "@/api/pipeline";
+import { getStageDisplayName } from "@/lib/pipelineStageSteps";
 import { useAuthStore } from "@/lib/auth-store";
 import type { AppContext } from "@/types/app-context";
 import { LiveUrlBadge } from "@/components/LiveUrlBadge";
@@ -47,13 +48,7 @@ const TABS = [
   { to: "cost", label: "Cost" },
 ];
 
-const STAGE_LABELS: Record<string, string> = {
-  build: "Build",
-  test: "Test",
-  canary_verify: "Progressive Canary",
-};
-
-function StageStepper({ projectId, runId }: { projectId: string; runId: string }) {
+function StageStepper({ projectId, runId, deployMode }: { projectId: string; runId: string; deployMode?: string | null }) {
   const { data } = useQuery({
     queryKey: ["project-stages", projectId, runId],
     queryFn: () => getRunStages(projectId, runId),
@@ -83,7 +78,7 @@ function StageStepper({ projectId, runId }: { projectId: string; runId: string }
               }`}
             >
               <span className="opacity-60">{i + 1}.</span>
-              {STAGE_LABELS[stage.name] ?? stage.name}
+              {getStageDisplayName(stage.name, deployMode)}
               <span className="opacity-70">
                 {stage.name === "canary_verify" && data.current_traffic_weight != null && isRunning
                   ? `${data.current_traffic_weight}%`
@@ -240,7 +235,9 @@ export function ProjectWorkspace() {
               <h1 className="text-lg font-semibold tracking-tight">{project.name}</h1>
               <Badge variant="secondary" className="text-code">{project.active_production_tag}</Badge>
               {project.canary_tag && (
-                <Badge variant="outline" className="text-code">canary {project.canary_tag}</Badge>
+                <Badge variant="outline" className="text-code">
+                  {project.deploy_mode === "blue_green" ? "green" : "canary"} {project.canary_tag}
+                </Badge>
               )}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-2 text-code text-[11px] text-muted-foreground">
@@ -292,9 +289,9 @@ export function ProjectWorkspace() {
                   <AlertDialogDescription asChild>
                     <div className="space-y-2">
                       <p>
-                        The version below is what gets built and deployed as the new canary. Leave it
-                        unchanged to re-test the current canary tag, or enter a new one to test a real code
-                        change.
+                        {project.deploy_mode === "blue_green"
+                          ? "The version below is what gets built and deployed as the new (green) version. Leave it unchanged to re-test the current version, or enter a new one to test a real code change."
+                          : "The version below is what gets built and deployed as the new canary. Leave it unchanged to re-test the current canary tag, or enter a new one to test a real code change."}
                       </p>
                       <div className="space-y-1">
                         <Label htmlFor="rollout-target-version">Version / image tag</Label>
@@ -383,9 +380,14 @@ export function ProjectWorkspace() {
                 <AlertDialogHeader>
                   <AlertDialogTitle>Roll back {project.name}?</AlertDialogTitle>
                   <AlertDialogDescription>
-                    This requests an immediate traffic cut to 0% for this run. It still goes through HMAC
-                    verification and OPA policy evaluation before anything is actuated — exactly like an
-                    autonomous rollback — but it cannot be undone once policy authorizes it.
+                    This requests an immediate traffic cut to 0% for this run, returning all traffic to{" "}
+                    <span className="font-medium text-foreground">
+                      {project.active_production_tag ?? "the current baseline"}
+                    </span>{" "}
+                    — the version already live on baseline, which never stops running during a rollout. It
+                    still goes through HMAC verification and OPA policy evaluation before anything is
+                    actuated — exactly like an autonomous rollback — but it cannot be undone once policy
+                    authorizes it.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -399,10 +401,11 @@ export function ProjectWorkspace() {
 
         <div className="flex flex-wrap items-center justify-between gap-3">
           {selectedRunId ? (
-            <StageStepper projectId={projectId} runId={selectedRunId} />
+            <StageStepper projectId={projectId} runId={selectedRunId} deployMode={project.deploy_mode} />
           ) : (
             <span className="text-xs italic text-muted-foreground">
-              No runs yet — trigger one to start the build → test → canary sequence.
+              No runs yet — trigger one to start the build → test →{" "}
+              {project.deploy_mode === "blue_green" ? "blue-green cutover" : "canary"} sequence.
             </span>
           )}
 
@@ -460,6 +463,8 @@ export function ProjectWorkspace() {
             deployMode: project.deploy_mode,
             deployTarget: project.deploy_target,
             projectName: project.name,
+            activeProductionTag: project.active_production_tag,
+            canaryTag: project.canary_tag,
           } satisfies AppContext
         }
       />

@@ -114,6 +114,13 @@ export interface BuildDetection {
     needs_object_storage: boolean;
     storage_hint: string | null;
     is_static_site: boolean;
+    /**
+     * AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.1 (Phase D) — real, cited matches from actually
+     * reading a bounded set of source files (real SDK call sites like `boto3.client("s3")`), not just
+     * manifest dependency names. A `*_hint` above may already BE one of these citations (when code
+     * evidence is what first turned a signal on) — this list is the full, raw evidence set for display.
+     */
+    code_evidence: { file_path: string; line_number: number; snippet: string; category: string }[];
   } | null;
   /**
    * One of the six golden-path archetypes (AI_AGENTIC_ORCHESTRATION_PLAN.md

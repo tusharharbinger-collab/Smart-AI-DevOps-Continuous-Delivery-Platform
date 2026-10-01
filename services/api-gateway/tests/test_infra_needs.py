@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
-from shared.infra_needs import analyze_infra_needs, build_standard_only_proposal
+from shared.infra_needs import analyze_infra_needs, build_standard_only_proposal, infer_addition_kind_from_text
 from src.routers import projects_router
 from src.routers.projects_router import InfraDraftRequest
 from tests.test_infra_import_and_edit_endpoints import DRAFT_ID, FakeDB, FakeRequest, PROPOSAL, _Client, _Resp, _row
@@ -64,6 +64,23 @@ def test_the_standard_only_proposal_has_no_template_no_cost_and_lists_what_the_p
     assert {n["id"] for n in p["topology"]["nodes"]} == {"alb", "baseline", "canary"}
 
 
+# ───────── free-text -> known addition kind (§7 chat interface) ─────────
+
+
+@pytest.mark.parametrize("text,kind", [
+    ("add a database", "database"), ("I need Postgres", "database"), ("add mysql", "database"),
+    ("add a cache", "cache"), ("we want Redis please", "cache"),
+    ("add an S3 bucket", "object_storage"), ("need object storage", "object_storage"),
+])
+def test_recognized_phrasings_resolve_to_the_real_kind(text, kind):
+    assert infer_addition_kind_from_text(text) == kind
+
+
+@pytest.mark.parametrize("text", ["add an EC2 instance", "make it faster", "add a queue"])
+def test_unrecognized_text_resolves_to_none_rather_than_guessing(text):
+    assert infer_addition_kind_from_text(text) is None
+
+
 # ───────── through the API ─────────
 
 
@@ -111,12 +128,104 @@ def _no_extras_db():
     return db
 
 
-def test_editing_a_draft_that_needs_nothing_says_how_to_add_something(monkeypatch):
+def test_editing_a_draft_that_needs_nothing_with_an_unrecognized_request_says_so(monkeypatch):
+    # Real bug found live: this used to 409 for EVERY instruction against a standard-only draft, including
+    # ones that clearly name a real, supported addition ("add a cache") - now only an instruction that
+    # doesn't name one of the three known kinds still 409s, with guidance instead of a dead end.
     from src.routers.projects_router import InfraDraftEditRequest
     monkeypatch.setattr(projects_router.httpx, "AsyncClient", _Client({}))
     with pytest.raises(HTTPException) as e:
-        run(projects_router.edit_infra_draft(DRAFT_ID, InfraDraftEditRequest(instruction="add a cache"), FakeRequest(), db=_no_extras_db()))
-    assert e.value.status_code == 409 and "Requirements" in e.value.detail
+        run(projects_router.edit_infra_draft(DRAFT_ID, InfraDraftEditRequest(instruction="add an EC2 instance"), FakeRequest(), db=_no_extras_db()))
+    assert e.value.status_code == 409 and "Add a component" in e.value.detail
+
+
+def test_editing_a_draft_that_needs_nothing_with_a_recognized_addition_generates_a_real_proposal(monkeypatch):
+    from src.routers.projects_router import InfraDraftEditRequest
+    client = _Client({"generate-infra": _Resp(200, PROPOSAL)})
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", client)
+
+    result = run(projects_router.edit_infra_draft(DRAFT_ID, InfraDraftEditRequest(instruction="add a cache"), FakeRequest(), db=_no_extras_db()))
+
+    sent = next(c for c in client.calls if "generate-infra" in c[1])[2]
+    assert [a["kind"] for a in sent["additions"]] == ["cache"]
+    assert sent["platform_context"]["vpc_id"] == "vpc-test"
+    assert "edit" not in sent  # a fresh extras-only generation, never an edit of an empty template
+    assert result["infra_proposal"]["no_additional_infrastructure"] is False
+    assert result["parent_draft_id"] == DRAFT_ID
+
+
+@pytest.mark.parametrize("instruction,kind", [
+    ("add a postgres database", "database"),
+    ("we need Redis", "cache"),
+    ("please add an S3 bucket", "object_storage"),
+])
+def test_a_range_of_recognized_addition_phrasings_all_resolve(monkeypatch, instruction, kind):
+    from src.routers.projects_router import InfraDraftEditRequest
+    client = _Client({"generate-infra": _Resp(200, PROPOSAL)})
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", client)
+
+    run(projects_router.edit_infra_draft(DRAFT_ID, InfraDraftEditRequest(instruction=instruction), FakeRequest(), db=_no_extras_db()))
+
+    sent = next(c for c in client.calls if "generate-infra" in c[1])[2]
+    assert [a["kind"] for a in sent["additions"]] == [kind]
+
+
+def _real_extras_db():
+    """A draft that already has a REAL proposal (not standard-only) - the normal case for mode='add'."""
+    db = FakeDB()
+    db.rows[DRAFT_ID] = _row(status="INFRA_PENDING_APPROVAL", infra_proposal=PROPOSAL)
+    return db
+
+
+def test_a_structured_component_pick_uses_its_exact_resource_type_not_keyword_guessing(monkeypatch):
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7 - the structured "Add a component" picker names its
+    # exact catalog resource_type, which must work for the FULL catalog (e.g. ec2_instance), not just the
+    # three keyword-matched kinds free text resolves.
+    from src.routers.projects_router import InfraDraftEditRequest
+    client = _Client({"generate-infra": _Resp(200, PROPOSAL)})
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", client)
+
+    run(projects_router.edit_infra_draft(
+        DRAFT_ID, InfraDraftEditRequest(instruction="Add an EC2 instance.", resource_type="ec2_instance"),
+        FakeRequest(), db=_no_extras_db(),
+    ))
+
+    sent = next(c for c in client.calls if "generate-infra" in c[1])[2]
+    assert [a["kind"] for a in sent["additions"]] == ["ec2_instance"]
+
+
+def test_mode_add_on_an_already_real_proposal_extends_it_via_normal_edit_never_regenerates_from_scratch(monkeypatch):
+    from src.routers.projects_router import InfraDraftEditRequest
+    client = _Client({"generate-infra": _Resp(200, PROPOSAL)})
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", client)
+
+    run(projects_router.edit_infra_draft(
+        DRAFT_ID, InfraDraftEditRequest(instruction="add a cache", resource_type="elasticache_node"),
+        FakeRequest(), db=_real_extras_db(),
+    ))
+
+    sent = next(c for c in client.calls if "generate-infra" in c[1])[2]
+    assert "edit" in sent and sent["edit"]["current_proposal"] == PROPOSAL
+    assert "additions" not in sent  # resource_type is only consulted for a fresh bootstrap, never here
+
+
+def test_mode_replace_discards_the_existing_real_proposal_and_starts_fresh(monkeypatch):
+    # The explicit "delete and start over with just this" escape hatch - additions no longer silently
+    # accumulate forever; the human can choose to replace instead of always extending.
+    from src.routers.projects_router import InfraDraftEditRequest
+    client = _Client({"generate-infra": _Resp(200, PROPOSAL)})
+    monkeypatch.setattr(projects_router.httpx, "AsyncClient", client)
+
+    result = run(projects_router.edit_infra_draft(
+        DRAFT_ID,
+        InfraDraftEditRequest(instruction="Add an S3 bucket.", resource_type="s3_bucket", mode="replace"),
+        FakeRequest(), db=_real_extras_db(),
+    ))
+
+    sent = next(c for c in client.calls if "generate-infra" in c[1])[2]
+    assert "edit" not in sent
+    assert [a["kind"] for a in sent["additions"]] == ["s3_bucket"]
+    assert result["infra_proposal"]["no_additional_infrastructure"] is False
 
 
 def test_there_is_no_change_set_to_preview_when_nothing_is_provisioned(monkeypatch):

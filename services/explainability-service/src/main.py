@@ -8,10 +8,14 @@ Delivery-Health Digest (§12.3).
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.component_catalog import build_add_component_instruction, check_component_compatibility, list_component_catalog
+from shared.llm_router import list_providers, set_provider_credential_override
+from shared.llm_router import test_provider_connection as check_provider_connection
 from shared.logging_config import configure_logging
 
 configure_logging("explainability-service")
@@ -245,8 +249,18 @@ async def post_log_hygiene(body: dict):
     return await analyze_code_and_log_hygiene(code_files, cloudwatch_logs)
 
 
+def _redis_or_none(request: Request):
+    """
+    `app.state.redis` is only set once the lifespan context manager has actually run - a TestClient used
+    without `with TestClient(app) as client:` (several existing tests in this suite predate this) never
+    triggers it. Every caller here treats a missing Redis client the same way shared/llm_router.py already
+    treats a Redis error: fall back to env-var-only credential resolution, never crash the request.
+    """
+    return getattr(request.app.state, "redis", None)
+
+
 @app.post("/predictive-risk")
-async def post_predictive_risk(body: dict):
+async def post_predictive_risk(body: dict, request: Request):
     """
     Performs pre-flight deployment risk assessment at Gate 1.
     body: {"commit_diff": str, "commit_message": str, "files_changed": list[str]}
@@ -255,6 +269,77 @@ async def post_predictive_risk(body: dict):
         commit_diff=body.get("commit_diff"),
         commit_message=body.get("commit_message"),
         files_changed=body.get("files_changed"),
+        redis_client=_redis_or_none(request),
     )
+
+
+# ─────────────────────────── LLM provider settings ───────────────────────────
+# AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.5 - the Gemini -> Groq -> OpenRouter -> Mistral failover
+# chain every AI call in this service goes through (shared/llm_router.py). This service owns the actual
+# provider credentials/config; api-gateway's settings_router.py is a thin, role-gated proxy in front of
+# these three endpoints, matching how every other AI-backed feature in this codebase is proxied.
+
+
+class SetLLMProviderCredentialRequest(BaseModel):
+    api_key: str
+
+
+@app.get("/llm-providers")
+async def get_llm_providers(request: Request):
+    return {"providers": await list_providers(_redis_or_none(request))}
+
+
+@app.post("/llm-providers/{name}/test")
+async def post_test_llm_provider(name: str, request: Request):
+    try:
+        return await check_provider_connection(name, _redis_or_none(request))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/llm-providers/{name}/credentials")
+async def post_set_llm_provider_credentials(name: str, body: SetLLMProviderCredentialRequest, request: Request):
+    redis_client = _redis_or_none(request)
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis is unavailable - cannot persist a credential override right now.")
+    try:
+        await set_provider_credential_override(name, body.api_key, redis_client)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"ok": True}
+
+
+# ─────────────────────────── "Add a component" catalog + compatibility check ───────────────────────────
+# AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.2 (Phase C) - shared/component_catalog.py's rule table
+# (LLM fallback only for a resource type outside the catalog). Deliberately a SEPARATE endpoint from
+# /generate-infra: "just checking" must never trigger a full proposal regeneration.
+
+
+@app.get("/component-catalog")
+async def get_component_catalog():
+    return {"catalog": list_component_catalog()}
+
+
+@app.post("/check-component")
+async def post_check_component(body: dict, request: Request):
+    """
+    body: {"resource_type": str, "params": dict, "archetype": str, "deploy_target": str, "intent_spec": dict}
+    """
+    try:
+        resource_type = body["resource_type"]
+        params = body.get("params") or {}
+        result = await check_component_compatibility(
+            resource_type=resource_type,
+            params=params,
+            archetype=body["archetype"],
+            deploy_target=body["deploy_target"],
+            intent_spec=body.get("intent_spec") or {},
+            redis_client=_redis_or_none(request),
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing field: {e}")
+    # The ready-to-send free-text instruction the frontend hands to the EXISTING /edit endpoint on confirm -
+    # computed here (not by the frontend) so there is exactly one place that knows how to phrase it.
+    return {**result, "instruction": build_add_component_instruction(resource_type, params)}
 
 

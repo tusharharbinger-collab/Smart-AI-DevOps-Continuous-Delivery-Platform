@@ -42,6 +42,7 @@ import { generateAiTunedPipeline, previewPipelineTemplate, type AiTunedPipelineR
 import { RequirementsForm } from "@/components/wizard/RequirementsForm";
 import type { InfraDraft } from "@/api/infraDrafts";
 import { suggestGuardrails } from "@/lib/guardrailSuggestions";
+import { computeInfraBlockReason } from "@/lib/infraContinueGate";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -626,11 +627,16 @@ export function NewProject() {
     (buildTab === "language" &&
       Boolean(form.language.trim() && (form.start_command.trim() || languageNeedsNoStartCommand)));
   const canContinueStep1 = Boolean(form.name.trim() && form.container_image.trim()) && hasBuildConfig;
+
+  // AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md Phase E — see lib/infraContinueGate.ts's docstring for
+  // the real gap this closes (Continue used to check ONLY environment_tier, never the infra draft's
+  // actual status).
+  const infraBlockReason = computeInfraBlockReason(infraDraft);
   // The Requirements Form only hard-requires a chosen environment tier —
   // every other field has a safe "unsure" default (see FARGATE_TIER_DEFAULTS
   // in shared/intent_spec.py), so this step never blocks someone who
   // genuinely doesn't know their sizing/budget answers yet.
-  const canContinueStep2 = Boolean(intentSpec.environment_tier);
+  const canContinueStep2 = Boolean(intentSpec.environment_tier) && infraBlockReason === null;
 
   // Auto-detect once per repo+branch combo the moment the user reaches
   // step 2, so the checklist is already there instead of an empty form —
@@ -1924,6 +1930,12 @@ export function NewProject() {
                 )}
               </div>
             </div>
+          )}
+
+          {step === 2 && infraBlockReason && (
+            <p className="rounded-md border border-warning/40 bg-warning/5 p-2 text-xs text-warning" data-testid="infra-block-reason">
+              {infraBlockReason}
+            </p>
           )}
 
           <div className="flex items-center justify-between border-t pt-4">

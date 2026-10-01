@@ -45,4 +45,13 @@ export interface AppContext {
   deployTarget?: string;
   /** The project's display name — used to label the synthesized infra boxes and slugged into real resource names (see projects_router.py's `_k8s_name`). */
   projectName?: string;
+  /**
+   * The version/image tag currently live on baseline (`projects.active_production_tag`) — the ground truth
+   * for "what's actually running", polled live from the project record, never derived from log text. Used
+   * to label the Blue-Green Cutover lanes, the infra topology's baseline node, and the rollback-target text
+   * so a user always knows which real version they're looking at / rolling back to.
+   */
+  activeProductionTag?: string | null;
+  /** The version/image tag currently deployed as canary/green (`projects.canary_tag`) — the "new version" side of a rollout. */
+  canaryTag?: string | null;
 }

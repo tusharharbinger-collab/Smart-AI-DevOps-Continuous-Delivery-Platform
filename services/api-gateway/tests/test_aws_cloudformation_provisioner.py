@@ -17,6 +17,7 @@ from botocore.exceptions import ClientError
 import shared.provisioning.aws_cloudformation as cfn_module
 from shared.provisioning.aws_cloudformation import (
     check_status,
+    delete_stack,
     execute_changes,
     preview_changes,
     stack_name_for_draft,
@@ -38,6 +39,7 @@ class _FakeCfnClient:
         change_set_statuses=None,
         change_set_changes=None,
         create_change_set_error=None,
+        stack_status="UPDATE_COMPLETE",
     ):
         self._stack_exists = stack_exists
         # A list consumed one call at a time by describe_change_set, so a
@@ -45,8 +47,10 @@ class _FakeCfnClient:
         self._change_set_statuses = list(change_set_statuses or ["CREATE_COMPLETE"])
         self._change_set_changes = change_set_changes or []
         self._create_change_set_error = create_change_set_error
+        self._stack_status = stack_status
         self.create_change_set_calls = []
         self.execute_change_set_calls = []
+        self.delete_stack_calls = []
 
     def describe_stacks(self, StackName):
         if not self._stack_exists:
@@ -58,12 +62,15 @@ class _FakeCfnClient:
             "Stacks": [
                 {
                     "StackId": "arn:aws:cloudformation:us-east-1:123456789012:stack/x/abc",
-                    "StackStatus": "UPDATE_COMPLETE",
+                    "StackStatus": self._stack_status,
                     "StackStatusReason": None,
                     "Outputs": [{"OutputKey": "DbEndpoint", "OutputValue": "db.example.com"}],
                 }
             ]
         }
+
+    def delete_stack(self, StackName):
+        self.delete_stack_calls.append(StackName)
 
     def create_change_set(self, **kwargs):
         if self._create_change_set_error:
@@ -207,3 +214,49 @@ def test_check_status_not_found_is_terminal_and_failed(monkeypatch):
     assert result.is_terminal is True
     assert result.succeeded is False
     assert result.status == "NOT_FOUND"
+
+
+# ───────── delete_stack (project-deletion teardown) ─────────
+
+
+def test_delete_stack_on_an_existing_stack_issues_the_real_delete(monkeypatch):
+    fake = _FakeCfnClient(stack_exists=True, stack_status="CREATE_COMPLETE")
+    _patch_client(monkeypatch, fake)
+
+    result = delete_stack("smartcd-infra-draft-1", "us-east-1")
+
+    assert fake.delete_stack_calls == ["smartcd-infra-draft-1"]
+    assert result == {"status": "delete_requested", "stack_name": "smartcd-infra-draft-1"}
+
+
+def test_delete_stack_on_a_missing_stack_is_a_no_op_not_an_error(monkeypatch):
+    # A project whose linked infra draft never got past INFRA_PENDING_APPROVAL has no real stack at all -
+    # this must be reported as already-deleted, never raised.
+    fake = _FakeCfnClient(stack_exists=False)
+    _patch_client(monkeypatch, fake)
+
+    result = delete_stack("smartcd-infra-nonexistent", "us-east-1")
+
+    assert result == {"status": "already_deleted", "stack_name": "smartcd-infra-nonexistent"}
+    assert fake.delete_stack_calls == []
+
+
+def test_delete_stack_already_deleting_is_reported_not_reissued(monkeypatch):
+    fake = _FakeCfnClient(stack_exists=True, stack_status="DELETE_IN_PROGRESS")
+    _patch_client(monkeypatch, fake)
+
+    result = delete_stack("smartcd-infra-draft-1", "us-east-1")
+
+    assert result == {"status": "delete_in_progress", "stack_name": "smartcd-infra-draft-1"}
+    assert fake.delete_stack_calls == []
+
+
+def test_delete_stack_already_deleted_is_a_no_op(monkeypatch):
+    fake = _FakeCfnClient(stack_exists=True, stack_status="DELETE_COMPLETE")
+    _patch_client(monkeypatch, fake)
+
+    result = delete_stack("smartcd-infra-draft-1", "us-east-1")
+
+    assert result == {"status": "already_deleted", "stack_name": "smartcd-infra-draft-1"}
+    assert fake.delete_stack_calls == []
+

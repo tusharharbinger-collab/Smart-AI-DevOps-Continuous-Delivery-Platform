@@ -8,7 +8,7 @@
  * and run from the project itself.
  */
 import { Link, Navigate, Outlet, useNavigate } from "react-router-dom";
-import { ChevronDown, LogOut, Plus, ShieldCheck, Sparkles } from "lucide-react";
+import { ChevronDown, LogOut, Plus, Settings, ShieldCheck, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
@@ -65,6 +65,9 @@ export function ProjectsLayout() {
             </Button>
             <Button size="sm" onClick={() => navigate("/projects/new")}>
               <Plus className="h-3.5 w-3.5" /> New Service
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => navigate("/projects/settings")} title="Settings">
+              <Settings className="h-3.5 w-3.5" />
             </Button>
             <HowItWorksDialog />
             <ThemeToggle />

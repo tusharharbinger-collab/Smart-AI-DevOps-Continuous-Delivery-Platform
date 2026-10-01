@@ -38,7 +38,11 @@ _LOG_HYGIENE_SYSTEM_PROMPT = (
     "redundant debug console logs or upgrades them to structured, sanitized logging without breaking business logic. "
     "Respond ONLY with a valid JSON object matching this schema: "
     "summary (string, brief executive summary of hygiene findings), "
-    "detected_issues (array of {file_path: string, line_number: integer or null, statement: string, issue_type: 'DEBUG_NOISE' | 'SENSITIVE_LEAK_RISK' | 'HIGH_VOLUME_SPAM', reason: string}), "
+    "detected_issues (array of {file_path: string, line_number: integer or null, statement: string, "
+    "issue_type: 'DEBUG_NOISE' | 'SENSITIVE_LEAK_RISK' | 'HIGH_VOLUME_SPAM', reason: string, "
+    "suggested_fix: string - a concrete, actionable fix for THIS SPECIFIC line, naming the exact replacement "
+    "(e.g. the real structured-logger call it should become, or exactly what to mask/remove) - never a generic "
+    "'use structured logging' platitude}), "
     "suggested_patch (string or null, valid unified diff: --- a/... +++ b/...), "
     "estimated_monthly_savings_usd (number, estimated CloudWatch savings), "
     "recommended_best_practices (array of strings, e.g. ESLint no-console rule, babel-plugin-transform-remove-console, pino/winston)."
@@ -51,6 +55,10 @@ class DetectedLogIssue(BaseModel):
     statement: str
     issue_type: str = "DEBUG_NOISE"
     reason: str
+    # Real gap found live: the UI only ever showed ONE combined unified diff for every issue together - a
+    # human reviewing a single issue in the list had no fix to act on without reading the whole patch and
+    # matching it back to this line themselves. Every issue now carries its OWN concrete, actionable fix.
+    suggested_fix: str = ""
 
 
 class LogHygieneReport(BaseModel):
@@ -59,6 +67,27 @@ class LogHygieneReport(BaseModel):
     suggested_patch: str | None = None
     estimated_monthly_savings_usd: float = 0.0
     recommended_best_practices: list[str] = Field(default_factory=list)
+
+
+def _suggested_fix_for(issue_type: str, is_py: bool, matched_stmt: str) -> str:
+    """
+    Deterministic, per-issue fix text for the fallback path — mirrors the same concreteness the LLM path is
+    prompted to produce (a real replacement call, not a generic "use structured logging" platitude), so the
+    two paths give the user parity regardless of whether Groq is reachable.
+    """
+    logger_call = "logging.getLogger(__name__)" if is_py else "logger"
+    if issue_type == "SENSITIVE_LEAK_RISK":
+        return (
+            f"Remove the sensitive value from the log line entirely, or mask it before logging — e.g. "
+            f"`{logger_call}.info(\"...\", extra={{'user_id': user_id}})` naming only a non-sensitive "
+            f"identifier, never the raw token/password/key itself."
+        )
+    if issue_type == "HIGH_VOLUME_SPAM":
+        return (
+            f"Replace with `{logger_call}.debug(...)` so it's off by default in production, or sample it "
+            f"(log only 1 in N calls) instead of logging on every invocation."
+        )
+    return f"Replace `{matched_stmt.split('(')[0].strip()}(...)` with `{logger_call}.info(...)` (a structured logger call) or delete it if it was left over from debugging."
 
 
 def _scan_code_for_console_logs(code_files: dict[str, str]) -> list[DetectedLogIssue]:
@@ -108,6 +137,7 @@ def _scan_code_for_console_logs(code_files: dict[str, str]) -> list[DetectedLogI
                         statement=matched_stmt,
                         issue_type=issue_type,
                         reason=reason,
+                        suggested_fix=_suggested_fix_for(issue_type, is_py, matched_stmt),
                     )
                 )
 

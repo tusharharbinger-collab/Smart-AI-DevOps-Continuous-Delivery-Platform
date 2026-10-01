@@ -380,8 +380,29 @@ def _platform_owned_types(additions: list[dict]) -> frozenset:
     return _PLATFORM_OWNED_TYPES
 
 
+# A few catalog resource_type values (shared/component_catalog.py) name the SAME concept one of the three
+# IntentSpec-backed kinds above already has a well-tested, specific shape hint for - a structured "Add a
+# component" pick sends the catalog's exact resource_type (e.g. "s3_bucket"), which must resolve to that
+# same rich hint rather than the catalog's much thinner generic description. Real bug found live: without
+# this, "s3_bucket" fell through to catalog_shape_hint's "An object storage bucket." - too weak a hint for
+# the model, which then generated a template with zero resources instead of the S3 bucket asked for.
+_CATALOG_KIND_ALIASES = {"s3_bucket": "object_storage"}
+
+
+def _shape_for_addition(kind: str) -> str | None:
+    """Falls back to the full "Add a component" catalog's own description (shared/component_catalog.py)
+    for any addition kind beyond the five fixed ones _ADDITION_SHAPES already knew - see
+    catalog_shape_hint's docstring for the real gap this closes."""
+    kind = _CATALOG_KIND_ALIASES.get(kind, kind)
+    if kind in _ADDITION_SHAPES:
+        return _ADDITION_SHAPES[kind]
+    from shared.component_catalog import catalog_shape_hint
+
+    return catalog_shape_hint(kind)
+
+
 def _extras_only_instruction(additions: list[dict], platform_context: dict | None) -> str:
-    shapes = "; ".join(_ADDITION_SHAPES[a["kind"]] for a in additions if a.get("kind") in _ADDITION_SHAPES)
+    shapes = "; ".join(hint for a in additions if (hint := _shape_for_addition(a.get("kind", ""))))
     text = (
         "EXTRAS-ONLY MODE. This platform ALREADY creates, for every project: the shared Application Load Balancer, "
         "the ECS cluster, the target groups and listener rule, and the baseline and canary Fargate services with their "
@@ -405,11 +426,21 @@ def _extras_only_instruction(additions: list[dict], platform_context: dict | Non
 def _require_only_additions(template_json: str, additions: list[dict]) -> None:
     """Deterministic guard, not just a prompt: a template that recreates platform-owned infrastructure is rejected."""
     owned = _platform_owned_types(additions)
-    duplicates = [f"{lid} ({r.get('Type')})" for lid, r in _template_resources(template_json).items() if r.get("Type") in owned]
+    resources = _template_resources(template_json)
+    duplicates = [f"{lid} ({r.get('Type')})" for lid, r in resources.items() if r.get("Type") in owned]
     if duplicates:
         raise InfraGenerationError(
             "The platform already provides the load balancer, cluster, target groups and web-service tasks. Remove these "
             f"resources and keep only the extras the app needs: {', '.join(duplicates)}."
+        )
+    if not resources:
+        # Real bug found live: given a thin shape hint, the model sometimes returns a template with an
+        # empty Resources block instead of the requested addition - a silent no-op that must feed back
+        # into the corrective retry rather than being accepted as "nothing to build".
+        kinds = ", ".join(a.get("kind", "?") for a in additions)
+        raise InfraGenerationError(
+            f"The template has no resources at all, but the app needs: {kinds}. Actually design and include the "
+            "resources for these extras - an empty template is not a valid answer here."
         )
 
 

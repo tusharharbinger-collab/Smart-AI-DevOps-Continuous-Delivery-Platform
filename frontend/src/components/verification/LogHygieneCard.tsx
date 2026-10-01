@@ -1,16 +1,18 @@
 import React, { useState } from "react";
-import { 
-  Sparkles, 
-  Trash2, 
-  DollarSign, 
-  ShieldAlert, 
-  FileCode, 
-  Check, 
-  Copy, 
+import {
+  Sparkles,
+  Trash2,
+  DollarSign,
+  ShieldAlert,
+  FileCode,
+  Check,
+  Copy,
   RefreshCw,
   AlertTriangle,
-  Flame
+  Flame,
+  Lightbulb
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -33,6 +35,10 @@ export interface LogHygieneIssue {
   statement: string;
   issue_type: "DEBUG_NOISE" | "SENSITIVE_LEAK_RISK" | "HIGH_VOLUME_SPAM";
   reason: string;
+  /** Real gap found live: previously only ONE combined patch covered every issue together - a human
+   * reviewing a single issue had nothing to act on without reading the whole diff and matching it back to
+   * this line themselves. Every issue now carries its own concrete, AI/deterministically-generated fix. */
+  suggested_fix?: string;
 }
 
 export interface LogHygieneReport {
@@ -49,23 +55,37 @@ interface LogHygieneCardProps {
 }
 
 export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initialReport }) => {
-  const [report, setReport] = useState<LogHygieneReport | null>(initialReport || null);
-  const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const fetchHygieneAnalysis = async () => {
-    setLoading(true);
-    try {
-      const data = await apiClient.post<LogHygieneReport>(`/api/v1/projects/${projectId}/log-hygiene`, {
+  // Real gap found live: this scan's result used to live in plain `useState`, which React Router throws
+  // away the instant the tab unmounts (switching to another tab, or back to Pipeline View, and back again) —
+  // a real scan the user just ran looked like it had never happened. Keyed by projectId and kept in
+  // react-query's cache instead (never auto-fetched — `enabled: false`, triggered only by the button, exactly
+  // like the old imperative call), which survives unmount/remount for as long as this project's workspace
+  // stays open in the tab, not just this one component's lifetime.
+  const {
+    data: report,
+    isFetching: loading,
+    refetch,
+  } = useQuery({
+    queryKey: ["log-hygiene", projectId],
+    queryFn: () =>
+      apiClient.post<LogHygieneReport>(`/api/v1/projects/${projectId}/log-hygiene`, {
         code_files: {},
         cloudwatch_logs: [],
-      });
-      setReport(data);
+      }),
+    enabled: false,
+    initialData: initialReport ?? undefined,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+
+  const fetchHygieneAnalysis = async () => {
+    const result = await refetch();
+    if (result.error) {
+      toast.error((result.error as Error).message || "Failed to run log hygiene analysis");
+    } else {
       toast.success("AI Log Hygiene scan complete");
-    } catch (err: any) {
-      toast.error(err.message || "Failed to run log hygiene analysis");
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -255,6 +275,14 @@ export const LogHygieneCard: React.FC<LogHygieneCardProps> = ({ projectId, initi
                           {issue.statement}
                         </p>
                         <p className="text-muted-foreground text-[11px]">{issue.reason}</p>
+                        {issue.suggested_fix && (
+                          <div className="flex items-start gap-1.5 rounded-md border border-primary/20 bg-primary/5 px-2 py-1.5 mt-1 max-w-xl">
+                            <Lightbulb className="h-3 w-3 text-primary shrink-0 mt-0.5" />
+                            <p className="text-primary/90 text-[11px] leading-relaxed">
+                              <span className="font-semibold">Suggested fix:</span> {issue.suggested_fix}
+                            </p>
+                          </div>
+                        )}
                       </div>
                     </div>
                   ))}

@@ -43,7 +43,12 @@ function latencyImpactHealth(pct: number | null | undefined): Health {
 
 /** A real baseline-vs-canary cost trend across recent runs — built from the exact rows the table below
  * renders (computed_at, baseline_cost, canary_cost), oldest to newest. No separate data source. */
-function CostTrendChart({ history }: { history: { computed_at: string; baseline_cost: number; canary_cost: number }[] }) {
+function CostTrendChart({
+  history, cohortLabel,
+}: {
+  history: { computed_at: string; baseline_cost: number; canary_cost: number }[];
+  cohortLabel: string;
+}) {
   const data = useMemo(
     () =>
       [...history]
@@ -64,11 +69,11 @@ function CostTrendChart({ history }: { history: { computed_at: string; baseline_
         <XAxis dataKey="label" tick={{ fontSize: 10 }} />
         <YAxis tick={{ fontSize: 10 }} width={56} tickFormatter={(v: number) => `$${v.toFixed(3)}`} />
         <Tooltip
-          formatter={(v: number, name: string) => [`$${v.toFixed(4)}/hr`, name === "baseline" ? "Baseline" : "Canary"]}
+          formatter={(v: number, name: string) => [`$${v.toFixed(4)}/hr`, name === "baseline" ? "Baseline" : cohortLabel]}
           contentStyle={{ fontSize: 12, borderRadius: 6 }}
         />
         <Legend
-          formatter={(v: string) => (v === "baseline" ? "Baseline" : "Canary")}
+          formatter={(v: string) => (v === "baseline" ? "Baseline" : cohortLabel)}
           wrapperStyle={{ fontSize: 11 }}
         />
         <defs>
@@ -107,7 +112,8 @@ function EfficiencyBar({ label, pct }: { label: string; pct: number }) {
 }
 
 export function CostTab() {
-  const { projectId } = useAppContext();
+  const { projectId, deployMode } = useAppContext();
+  const cohortLabel = deployMode === "blue_green" ? "Green" : "Canary";
   const { data, isLoading } = useQuery({
     queryKey: ["cost-history", projectId],
     queryFn: () => getCostHistory(projectId ?? ""),
@@ -136,7 +142,7 @@ export function CostTab() {
           sparkline={baselineSpark}
         />
         <StatTile
-          label="Canary cost (sum, $/hr)"
+          label={`${cohortLabel} cost (sum, $/hr)`}
           value={`$${(data?.total_canary_cost ?? 0).toFixed(4)}`}
           icon={DollarSign}
           sparkline={canarySpark}
@@ -169,7 +175,7 @@ export function CostTab() {
         <Card>
           <CardContent className="p-4">
             <h2 className="mb-2 text-sm font-semibold">Cost Trend</h2>
-            <CostTrendChart history={history} />
+            <CostTrendChart history={history} cohortLabel={cohortLabel} />
           </CardContent>
         </Card>
       )}
@@ -232,7 +238,7 @@ export function CostTab() {
                 <TableHead>Run</TableHead>
                 <TableHead>Trigger</TableHead>
                 <TableHead>Baseline</TableHead>
-                <TableHead>Canary</TableHead>
+                <TableHead>{cohortLabel}</TableHead>
                 <TableHead>Delta</TableHead>
                 <TableHead>Value Metric</TableHead>
               </TableRow>

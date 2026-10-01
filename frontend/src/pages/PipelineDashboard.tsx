@@ -15,7 +15,7 @@ import { ChatOpsPanel } from "@/components/pipeline/ChatOpsPanel";
 import { ProjectDeliveryGraph } from "@/components/pipeline/ProjectDeliveryGraph";
 import { BlueGreenCutoverPanel } from "@/components/pipeline/BlueGreenCutoverPanel";
 import { filterLogsForStage } from "@/lib/pipelineStageSteps";
-import { synthesizeRealInfraTopology } from "@/lib/syntheticInfraTopology";
+import { mergeInfraTopologies, synthesizeRealInfraTopology } from "@/lib/syntheticInfraTopology";
 import { getProjectInfraDraft, type InfraTopology } from "@/api/infraDrafts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -29,7 +29,10 @@ import { pausePipeline, resumePipeline, triggerRollback } from "@/api/pipeline";
 import { getRunFailureAnalysis, type StageFailureAnalysis } from "@/api/projects";
 
 export function PipelineDashboard() {
-  const { pipelineRunId, hideRunControls, projectId, deployTarget, projectName, deployMode } = useAppContext();
+  const {
+    pipelineRunId, hideRunControls, projectId, deployTarget, projectName, deployMode,
+    activeProductionTag, canaryTag,
+  } = useAppContext();
   const { stages, currentStage, trafficWeight, status, weightHistory } = usePipelineEvents(pipelineRunId);
   const { logLines } = useLiveLogs(pipelineRunId);
   const [selectedStage, setSelectedStage] = useState<string | null>(null);
@@ -230,7 +233,14 @@ export function PipelineDashboard() {
         </div>
       )}
 
-      {deployMode === "blue_green" && <BlueGreenCutoverPanel logLines={logLines} status={status} />}
+      {deployMode === "blue_green" && (
+        <BlueGreenCutoverPanel
+          logLines={logLines}
+          status={status}
+          baselineVersion={activeProductionTag}
+          greenVersion={canaryTag}
+        />
+      )}
 
       <Card>
         <CardHeader>
@@ -238,14 +248,21 @@ export function PipelineDashboard() {
         </CardHeader>
         <CardContent>
           <ProjectDeliveryGraph
-            infraTopology={infraTopology ?? (projectName ? synthesizeRealInfraTopology(projectName, deployTarget) : null)}
+            infraTopology={
+              projectName
+                ? mergeInfraTopologies(
+                    synthesizeRealInfraTopology(projectName, deployTarget, activeProductionTag, canaryTag),
+                    infraTopology,
+                  )
+                : infraTopology
+            }
             stages={stages}
             currentStage={currentStage}
             status={status}
           />
           <p className="mt-2 text-xs text-muted-foreground">
             {infraTopology
-              ? "AI-generated infrastructure proposal linked to this project."
+              ? "Real platform infrastructure plus the AI-provisioned extras linked to this project."
               : "Real infrastructure boxes derived from this project's deploy target — no AI-generated proposal is linked."}
           </p>
         </CardContent>
@@ -266,6 +283,7 @@ export function PipelineDashboard() {
               weightHistory={weightHistory}
               selectedStage={selectedStage}
               onSelectStage={setSelectedStage}
+              deployMode={deployMode}
             />
           </CardContent>
         </Card>

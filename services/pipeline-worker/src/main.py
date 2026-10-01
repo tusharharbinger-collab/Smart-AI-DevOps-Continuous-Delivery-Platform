@@ -71,7 +71,9 @@ from shared.provisioning.aws_cloudformation import (
     fetch_failure_events as cfn_fetch_failure_events,
     execute_changes as cfn_execute_changes,
     preview_changes as cfn_preview_changes,
+    delete_stack as cfn_delete_stack,
 )
+from src.tasks.ecr_auth import delete_ecr_repository
 
 logger = structlog.get_logger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -622,6 +624,51 @@ async def deprovision_service_aws_now(body: dict):
     return result
 
 
+@app.post("/infra-provisioning/delete-stack")
+async def delete_infra_stack(body: dict):
+    """
+    Real gap found live: a project's linked infra draft (an AI-provisioned S3 bucket, database, etc.) had no
+    teardown path — deleting the PROJECT never touched the draft's own CloudFormation stack, so its real,
+    billable resources outlived the project. Called by api-gateway's project-deletion job for every
+    infra_build_state row that has a real `stack_name` (i.e. one that ever reached create-change-set or
+    beyond) linked to the project being deleted. Fire-and-forget, same as `execute_changes` — AWS deletes
+    the stack's resources asynchronously regardless of whether this call waits for it.
+    """
+    try:
+        stack_name = body["stack_name"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+
+    connection = _connection_from(body)
+    try:
+        result = await asyncio.to_thread(cfn_delete_stack, stack_name, body.get("region", "us-east-1"), connection)
+    except Exception as e:
+        logger.error("cfn_delete_stack_failed", stack_name=stack_name, error=str(e))
+        raise HTTPException(status_code=502, detail=f"CloudFormation stack deletion failed: {e}")
+    return result
+
+
+@app.post("/services/delete-image")
+async def delete_service_image(body: dict):
+    """
+    Real gap found live: a deleted project's build image (pushed to ECR by the build stage's
+    `ensure_ecr_repository_exists`) was left in the registry forever, still billing storage. Called by
+    api-gateway's project-deletion job whenever the project's `container_image` is a real ECR URI. Idempotent
+    and safe on any other registry — see `delete_ecr_repository`'s own no-op-for-non-ECR handling.
+    """
+    try:
+        image_name = body["image_name"]
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=f"Missing required field: {e}")
+
+    try:
+        result = await asyncio.to_thread(delete_ecr_repository, image_name, body.get("region", "us-east-1"))
+    except Exception as e:
+        logger.error("ecr_delete_failed", image_name=image_name, error=str(e))
+        raise HTTPException(status_code=502, detail=f"ECR repository deletion failed: {e}")
+    return result
+
+
 @app.post("/infra-provisioning/change-set")
 async def create_infra_change_set(body: dict):
     """
@@ -783,12 +830,19 @@ async def post_infra_provisioning_status(body: dict):
 
 async def _status_response(stack_name: str, region: str, connection: dict | None):
     result = await asyncio.to_thread(cfn_check_status, stack_name, region, connection)
+    # AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7.4.1 — real gap this closes: `fetch_failure_events`
+    # already does the exact right AWS call (describe_stack_events, one entry per real resource event) but
+    # used to be called only after a TERMINAL failure, for the RCA panel. A live in-progress poll gets the
+    # same real per-resource events here too, so a build-in-progress view has something to show beyond one
+    # aggregate stack status — read-only, changes nothing about what CloudFormation does either way.
+    events = await asyncio.to_thread(cfn_fetch_failure_events, stack_name, region, connection)
     return {
         "status": result.status,
         "is_terminal": result.is_terminal,
         "succeeded": result.succeeded,
         "outputs": result.outputs,
         "status_reason": result.status_reason,
+        "resource_events": events,
     }
 
 

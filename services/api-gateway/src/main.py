@@ -36,6 +36,7 @@ from src.routers.registry_router import router as registry_router
 from src.routers.aws_connections_router import router as aws_connections_router
 from src.routers.reports_router import router as reports_router
 from src.routers.services_router import router as services_router
+from src.routers.settings_router import router as settings_router
 from src.routers.verification_router import router as verification_router
 from src.routers.webhooks_router import (
     router as webhooks_router,
@@ -127,6 +128,7 @@ app.include_router(copilot_router, prefix="/api/v1/copilot", tags=["copilot"])
 app.include_router(github_router, prefix="/api/v1/integrations/github", tags=["github"])
 app.include_router(registry_router, prefix="/api/v1/integrations/registry", tags=["registry"])
 app.include_router(aws_connections_router, prefix="/api/v1/integrations/aws", tags=["aws-connections"])
+app.include_router(settings_router, prefix="/api/v1/settings", tags=["settings"])
 
 # Phase 9.6 (P0 #1, 2026-09-16) — the real "git push -> cloud" trigger.
 # Deliberately unauthenticated (see auth/middleware.py's allowlist) — GitHub

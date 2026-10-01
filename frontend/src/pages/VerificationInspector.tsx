@@ -4,17 +4,58 @@
 import { AlertCircle, CheckCircle2, Clock, Rocket, ShieldAlert, Sparkles, XCircle } from "lucide-react";
 import { useVerificationResult } from "@/hooks/useVerificationResult";
 import { usePipelineEvents } from "@/hooks/usePipelineEvents";
+import { useLiveLogs } from "@/hooks/useLiveLogs";
 import { useAppContext } from "@/hooks/useAppContext";
 import { VerdictBadge } from "@/components/verification/VerdictBadge";
 import { EvidencePanel } from "@/components/verification/EvidencePanel";
 import { ConfidenceGauge } from "@/components/charts/ConfidenceGauge";
 import { TrafficGauge } from "@/components/pipeline/TrafficGauge";
 import { TrafficWeightChart } from "@/components/pipeline/TrafficWeightChart";
+import { deriveBlueGreenCutover } from "@/lib/blueGreenCutover";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { HelpTooltip } from "@/components/help-tooltip";
 import { RcaDiffViewer, StructuredRca } from "@/components/verification/RcaDiffViewer";
-import { LogHygieneCard } from "@/components/verification/LogHygieneCard";
+import { RiskAssessmentCard } from "@/components/verification/RiskAssessmentCard";
+
+// A blue-green run never produces a statistical verdict (see the 404 branch below), but it DOES produce a
+// real, evidenced outcome — the same cutover phases/traffic BlueGreenCutoverPanel already renders in
+// Pipeline View. Deriving a plain-language headline from that real outcome (never a static "no comparison"
+// placeholder) is what turns this from an empty state into an actual inspector for a blue-green run.
+function blueGreenPlainLanguageSummary(
+  outcome: ReturnType<typeof deriveBlueGreenCutover>["outcome"]
+): { icon: typeof CheckCircle2; classes: (typeof TONE_CLASSES)[keyof typeof TONE_CLASSES]; headline: string; body: string } {
+  switch (outcome) {
+    case "live":
+      return {
+        icon: CheckCircle2,
+        classes: TONE_CLASSES.success,
+        headline: "Cutover verified and live",
+        body: "The new version passed a real ALB health check and a real live-URL request after taking 100% of traffic, then was promoted onto baseline. There's no statistical comparison to show — blue-green verifies real infrastructure health instead of a baseline-vs-canary metric comparison — but every step below is a real, evidenced outcome.",
+      };
+    case "rolled_back":
+      return {
+        icon: XCircle,
+        classes: TONE_CLASSES.destructive,
+        headline: "Cutover failed — the platform rolled back automatically",
+        body: "The live-URL check after cutover didn't get a healthy response from the new version, so traffic was returned to blue (baseline) automatically. Baseline never stopped running during the cutover, so this rollback was instant.",
+      };
+    case "in_progress":
+      return {
+        icon: Clock,
+        classes: TONE_CLASSES.warning,
+        headline: "Cutover in progress",
+        body: "The new (green) version is being health-checked before it takes any real traffic. Follow the phases below as they complete live.",
+      };
+    default:
+      return {
+        icon: Rocket,
+        classes: TONE_CLASSES.warning,
+        headline: "Waiting for the cutover to start",
+        body: "This run hasn't reached the blue-green deploy stage yet.",
+      };
+  }
+}
 
 // Real gap found live (2026-09-18): a non-technical user looking at
 // "Composite score 100.0/100.0" sitting right next to a "DEGRADED" badge
@@ -78,6 +119,10 @@ export function VerificationInspector() {
   // back to the other screen to see what traffic level this verdict
   // actually corresponds to.
   const { currentStage, trafficWeight, weightHistory, status: pipelineStatus } = usePipelineEvents(pipelineRunId);
+  // A blue-green run has no verdict stream to read (see the 404 branch below) but DOES have the same real
+  // log lines Pipeline View's BlueGreenCutoverPanel already derives its evidence from — reused here so this
+  // screen shows real cutover evidence instead of a dead end.
+  const { logLines } = useLiveLogs(deployMode === "blue_green" ? pipelineRunId : "");
 
   let structuredRca: StructuredRca | null = null;
   let summaryText = rcaReport;
@@ -126,62 +171,65 @@ export function VerificationInspector() {
       // was the project's first-ever deployment," which is simply false.
       // The underlying "no verdict" behavior is correct either way; only
       // the explanation text needs to match the real reason.
+      // Blue-green never produces a verdict at all, regardless of run status, so it's handled once here
+      // up front rather than duplicated per status branch below (which exist only to distinguish
+      // "first deploy, no verdict" from "still running" for the CANARY case).
+      if (deployMode === "blue_green") {
+        const cutover = deriveBlueGreenCutover(logLines, pipelineStatus);
+        const plain = blueGreenPlainLanguageSummary(cutover.outcome);
+        const PlainIcon = plain.icon;
+        return (
+          <div className="space-y-4">
+            <Card className={plain.classes.card}>
+              <CardContent className="flex items-start gap-3 p-4">
+                <PlainIcon className={`mt-0.5 h-6 w-6 shrink-0 ${plain.classes.icon}`} />
+                <div>
+                  <p className={`font-semibold ${plain.classes.headline}`}>{plain.headline}</p>
+                  <p className="mt-1 text-sm text-muted-foreground">{plain.body}</p>
+                </div>
+              </CardContent>
+            </Card>
+
+            {projectId && <RiskAssessmentCard projectId={projectId} runId={pipelineRunId} />}
+          </div>
+        );
+      }
       if (pipelineStatus === "COMPLETED") {
-        const isBlueGreen = deployMode === "blue_green";
         return (
           <Card className="mx-auto mt-8 max-w-lg text-center">
             <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
               <Rocket className="h-8 w-8 text-muted-foreground/60" />
-              <p className="font-medium text-foreground">
-                {isBlueGreen ? "Blue-Green deployment — no statistical comparison" : "First deployment — no comparison to run yet"}
-              </p>
+              <p className="font-medium text-foreground">First deployment — no comparison to run yet</p>
               <p>
-                {isBlueGreen ? (
-                  <>
-                    This project uses Blue-Green deployment, which never runs statistical verification — it cuts
-                    over based on real infrastructure health (target-group health checks and a live URL check)
-                    instead of a baseline-vs-canary comparison. This is expected for every run on this project,
-                    not just the first.
-                  </>
-                ) : (
-                  <>
-                    This was the project's first-ever deployment, so there was no prior baseline version to compare
-                    it against. It shipped directly to 100% traffic with no canary step. Future deployments will run
-                    the full statistical verification and progressive traffic ramp.
-                  </>
-                )}
+                This was the project's first-ever deployment, so there was no prior baseline version to compare
+                it against. It shipped directly to 100% traffic with no canary step. Future deployments will run
+                the full statistical verification and progressive traffic ramp.
               </p>
             </CardContent>
           </Card>
         );
       }
       return (
-        <div className="space-y-4">
-          <Card className="mx-auto max-w-lg text-center">
-            <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
-              <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
-              <p className="font-medium text-foreground">Verification In Progress or Pending</p>
-              <p>No statistical verdict published yet for this run — verification is collecting telemetry or awaiting traffic.</p>
-            </CardContent>
-          </Card>
-          {projectId && <LogHygieneCard projectId={projectId} />}
-        </div>
+        <Card className="mx-auto max-w-lg text-center">
+          <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
+            <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
+            <p className="font-medium text-foreground">Verification In Progress or Pending</p>
+            <p>No statistical verdict published yet for this run — verification is collecting telemetry or awaiting traffic.</p>
+          </CardContent>
+        </Card>
       );
     }
     return <p className="text-sm text-destructive">Error: {error.message}</p>;
   }
   if (!verdict) {
     return (
-      <div className="space-y-4">
-        <Card className="mx-auto max-w-lg text-center">
-          <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
-            <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
-            <p className="font-medium text-foreground">No Verification Run Yet</p>
-            <p>Verification runs automatically during deployment canaries. Once traffic is evaluated, statistical verdicts, confidence gauges, and AI diagnostics will appear here.</p>
-          </CardContent>
-        </Card>
-        {projectId && <LogHygieneCard projectId={projectId} />}
-      </div>
+      <Card className="mx-auto max-w-lg text-center">
+        <CardContent className="flex flex-col items-center gap-2 p-8 text-sm text-muted-foreground">
+          <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
+          <p className="font-medium text-foreground">No Verification Run Yet</p>
+          <p>Verification runs automatically during deployment canaries. Once traffic is evaluated, statistical verdicts, confidence gauges, and AI diagnostics will appear here.</p>
+        </CardContent>
+      </Card>
     );
   }
 
@@ -301,7 +349,7 @@ export function VerificationInspector() {
         </Card>
       )}
 
-      {projectId && <LogHygieneCard projectId={projectId} />}
+      {projectId && <RiskAssessmentCard projectId={projectId} runId={pipelineRunId} />}
     </div>
   );
 }

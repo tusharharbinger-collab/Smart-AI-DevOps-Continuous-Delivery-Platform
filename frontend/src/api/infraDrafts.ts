@@ -160,6 +160,22 @@ export interface InfraDraft {
   aws_connection_id: string | null;
   created_at: string | null;
   updated_at: string | null;
+  /**
+   * AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §7.4.1 (Phase F) — real per-resource CloudFormation
+   * events (`describe_stack_events`). ONLY present on the response from `getInfraProvisioningStatus` —
+   * every other endpoint's real JSON response doesn't carry this key at all, so it's optional here rather
+   * than lying about a field that isn't actually always there. Ephemeral by design: never persisted,
+   * always a fresh live snapshot on each poll, empty while not `INFRA_PROVISIONING`.
+   */
+  resource_events?: ResourceEvent[];
+}
+
+export interface ResourceEvent {
+  resource: string | null;
+  type: string | null;
+  status: string | null;
+  reason: string | null;
+  timestamp: string;
 }
 
 /** Calls the real Groq-backed Infra Architect Agent (services/explainability-service) — never a mock/canned response. */
@@ -178,14 +194,63 @@ export const discoverExistingInfra = (archetype: string, region: string, connect
       (connectionId ? `&connection_id=${encodeURIComponent(connectionId)}` : "")
   );
 
+/** "add" extends the current proposal (default); "replace" discards it and starts fresh with only this addition. */
+export type InfraEditMode = "add" | "replace";
+
+export interface InfraEditOptions {
+  /** The catalog's exact resource_type (bypasses keyword guessing) - set when the edit came from a structured picker. */
+  resourceType?: string;
+  mode?: InfraEditMode;
+}
+
 /**
  * Prompt-driven edit. Returns a NEW draft (parent_draft_id -> draftId) that re-enters the approval gate -
  * an edit is never auto-applied, and can never remove an imported (Retain) resource.
  */
-export const editInfraDraft = (draftId: string, instruction: string) =>
-  apiClient.post<InfraDraft>(`/api/v1/projects/infra-drafts/${draftId}/edit`, { instruction });
+export const editInfraDraft = (draftId: string, instruction: string, options: InfraEditOptions = {}) =>
+  apiClient.post<InfraDraft>(`/api/v1/projects/infra-drafts/${draftId}/edit`, {
+    instruction,
+    resource_type: options.resourceType ?? null,
+    mode: options.mode ?? "add",
+  });
 
 export const getInfraDraft = (draftId: string) => apiClient.get<InfraDraft>(`/api/v1/projects/infra-drafts/${draftId}`);
+
+/**
+ * AI_INFRA_CONVERSATIONAL_PROVISIONING_PLAN.md §3.2 (Phase C) — the "Add a component" picker's full
+ * resource catalog (shared/component_catalog.py), and the pre-flight compatibility check shown BEFORE any
+ * full proposal regeneration. checkComponentCompatibility never mutates the draft — confirming its result
+ * calls editInfraDraft with the returned `instruction` string, reusing the existing edit pipeline.
+ */
+export interface ComponentCatalogParam {
+  name: string;
+  type: "string" | "integer" | "boolean";
+  description: string;
+  required: boolean;
+}
+export interface ComponentCatalogEntry {
+  resource_type: string;
+  display_name: string;
+  category: string;
+  description: string;
+  params: ComponentCatalogParam[];
+}
+export interface ComponentCompatibilityResult {
+  compatible: boolean;
+  explanation: string;
+  caveats: string[];
+  source: "rule_table" | "llm" | "unavailable";
+  instruction: string;
+}
+
+export const getComponentCatalog = () =>
+  apiClient.get<{ catalog: ComponentCatalogEntry[] }>(`/api/v1/projects/infra-drafts/component-catalog`);
+
+export const checkComponentCompatibility = (draftId: string, resourceType: string, params: Record<string, unknown>) =>
+  apiClient.post<ComponentCompatibilityResult>(`/api/v1/projects/infra-drafts/${draftId}/check-component`, {
+    resource_type: resourceType,
+    params,
+  });
 
 export const approveInfraDraft = (draftId: string) =>
   apiClient.post<InfraDraft>(`/api/v1/projects/infra-drafts/${draftId}/approve`);

@@ -119,6 +119,8 @@ Adversarial and e2e tests at the repo root (`tests/adversarial/`, `tests/e2e/`) 
 
 OPA policy tests: `opa test policies/ -v` (requires the `opa` binary — `bin/opa.exe` is vendored on Windows).
 
+Frontend (`cd frontend` first): `npm run test` (vitest, all specs) / `npm run lint` (eslint) / `npm run build` (`tsc -b && vite build`) / `npm run test:e2e` (Playwright, needs the full stack up). Running a single spec or the type-checker directly hits the same `&`-in-folder-name problem as `npm run dev` (see the Windows trap below) — `node node_modules/.bin/vitest` and `node node_modules/.bin/tsc` fail with a shell `SyntaxError` for the same reason `.cmd` shims do. Use the underlying entry point instead: `node node_modules/vitest/vitest.mjs run src/lib/infraChat.test.ts` (one file) or `node node_modules/typescript/bin/tsc -b` (type-check only, no bundling).
+
 On this Windows dev machine `make` and `kind` are **not on PATH** (`kubectl`/`docker` are, via Docker Desktop): call `./bin/kind.exe` directly and run the recipe bodies from the `Makefile` by hand (or `bash scripts/demo/*.sh`, which only need `kubectl`). Kind and Docker Desktop restart cleanly after machine sleep — Envoy Gateway pods showing dozens of restarts with `Exit Code: 0` is that, not a crash. The Kind cluster is `smartcd-local` (context `kind-smartcd-local`).
 
 Docker Compose in Git Bash quirks: `docker compose logs --since <time>` returns nothing here (use `--tail N` and grep), and `docker compose exec` python output is block-buffered when backgrounded. `curl` against the platform needs a JWT: `POST /api/v1/auth/login` with the seeded `demo@acme-corp.test` / `acme-demo-2026`.

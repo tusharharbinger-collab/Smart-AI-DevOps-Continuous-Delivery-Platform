@@ -191,6 +191,33 @@ def check_status(stack_name: str, region: str, connection: dict | None = None) -
     )
 
 
+def delete_stack(stack_name: str, region: str, connection: dict | None = None) -> dict:
+    """
+    Real gap found live: an AI-provisioned draft's real resources (an S3 bucket, a database, …) had no
+    teardown path anywhere in the platform — deleting the PROJECT that referenced the draft never touched
+    the draft's own CloudFormation stack, so its resources (and their cost) outlived the project forever.
+    Fire-and-forget like `execute_changes`: CloudFormation deletion is asynchronous on AWS's side regardless
+    of whether this call waits, so this only issues the request. Idempotent — a stack that's already gone,
+    already being deleted, or never existed is reported as such rather than raised as an error, matching
+    every other best-effort teardown call in this codebase.
+    """
+    cfn = aws_client("cloudformation", region, connection)
+    try:
+        desc = cfn.describe_stacks(StackName=stack_name)
+    except ClientError as e:
+        if "does not exist" in str(e):
+            return {"status": "already_deleted", "stack_name": stack_name}
+        raise
+    current_status = desc["Stacks"][0]["StackStatus"]
+    if current_status == "DELETE_IN_PROGRESS":
+        return {"status": "delete_in_progress", "stack_name": stack_name}
+    if current_status == "DELETE_COMPLETE":
+        return {"status": "already_deleted", "stack_name": stack_name}
+    cfn.delete_stack(StackName=stack_name)
+    logger.info("cfn_delete_stack_requested", stack_name=stack_name)
+    return {"status": "delete_requested", "stack_name": stack_name}
+
+
 def fetch_failure_events(stack_name: str, region: str, connection: dict | None = None, limit: int = 40) -> list[dict]:
     """
     Real CloudFormation stack events for the failure analyst (backlog #4). Returns only the fields the analysis
